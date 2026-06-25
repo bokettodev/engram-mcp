@@ -1,0 +1,283 @@
+"""Chunking: tree-sitter AST-aware for grammar languages, line-window fallback.
+
+Strategy (AST path):
+  * Walk top-level nodes. Consecutive non-definition nodes (imports, constants)
+    are clustered into a ``module`` chunk.
+  * Each definition (function/class/method/type/...) becomes a symbol chunk.
+    JS/TS ``export`` wrappers and ``const x = () => ...`` are unwrapped so they
+    are recognized as definitions, not anonymous module text.
+  * A definition over the token cap is split: a header chunk (signature +
+    decorators) is emitted, then we recurse into the body's nested definitions;
+    if there are none, the whole span is line-window split.
+
+Line numbers are 1-based inclusive and always refer to original file lines.
+Token counts are rough estimates (chars/4) used only for sizing.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+from engram_mcp import config
+from engram_mcp.indexing.languages import GRAMMAR_LANGS, get_parser
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class Chunk:
+    rel_path: str
+    language: str | None
+    symbol: str | None
+    symbol_kind: str | None
+    start_line: int  # 1-based inclusive
+    end_line: int  # 1-based inclusive
+    text: str
+    token_estimate: int
+
+
+def _est_tokens(text: str) -> int:
+    return max(1, len(text) // config.CHARS_PER_TOKEN)
+
+
+# Node types emitted as their own symbol chunk, per grammar language.
+DEFINITION_TYPES: dict[str, set[str]] = {
+    "python": {"function_definition", "class_definition", "decorated_definition"},
+    "javascript": {
+        "function_declaration", "generator_function_declaration",
+        "class_declaration", "method_definition",
+    },
+    "typescript": {
+        "function_declaration", "generator_function_declaration",
+        "class_declaration", "method_definition",
+        "interface_declaration", "type_alias_declaration",
+        "enum_declaration", "abstract_class_declaration",
+    },
+    "go": {"function_declaration", "method_declaration", "type_declaration"},
+    "rust": {
+        "function_item", "struct_item", "enum_item", "trait_item",
+        "impl_item", "mod_item", "macro_definition", "union_item",
+    },
+    "java": {
+        "class_declaration", "interface_declaration", "enum_declaration",
+        "record_declaration", "method_declaration", "constructor_declaration",
+    },
+    "c": {"function_definition", "struct_specifier", "enum_specifier", "union_specifier"},
+    "cpp": {
+        "function_definition", "class_specifier", "struct_specifier",
+        "enum_specifier", "union_specifier", "namespace_definition", "template_declaration",
+    },
+    "ruby": {"method", "singleton_method", "class", "module"},
+    "csharp": {
+        "class_declaration", "interface_declaration", "struct_declaration",
+        "enum_declaration", "record_declaration", "method_declaration",
+        "constructor_declaration", "namespace_declaration",
+    },
+}
+DEFINITION_TYPES["tsx"] = DEFINITION_TYPES["typescript"]
+
+# JS/TS values that make a `const x = <value>` declaration a definition.
+_FN_VALUE_TYPES = {
+    "arrow_function", "function", "function_expression",
+    "generator_function", "class", "class_expression",
+}
+
+_BODY_TYPES = {
+    "block", "class_body", "declaration_list", "field_declaration_list",
+    "statement_block", "enum_body", "interface_body",
+    "compound_statement", "body_statement", "namespace_body",
+}
+
+
+def chunk_file(rel_path: str, language: str | None, text: str) -> list[Chunk]:
+    """Chunk one file's text into a list of :class:`Chunk`."""
+    if language in GRAMMAR_LANGS:
+        parser = get_parser(language)
+        if parser is not None:
+            try:
+                chunks = _ast_chunks(rel_path, language, text, parser)
+                if chunks:
+                    return chunks
+            except Exception as exc:
+                logger.debug("AST chunking failed for %s (%s): %r", rel_path, language, exc)
+    lines = text.splitlines()
+    return _line_window_chunks(rel_path, language, lines, 1, None, "file")
+
+
+def _line_window_chunks(
+    rel_path: str,
+    language: str | None,
+    lines: list[str],
+    base_line: int,
+    symbol: str | None,
+    symbol_kind: str | None,
+) -> list[Chunk]:
+    """Split ``lines`` into overlapping char-budgeted windows.
+
+    A single line longer than the budget (minified blob) is hard char-split so
+    we never hand the embedder an oversized string that relies on truncation.
+    """
+    budget = config.CHUNK_MAX_TOKENS * config.CHARS_PER_TOKEN
+    overlap = config.CHUNK_OVERLAP_TOKENS * config.CHARS_PER_TOKEN
+    chunks: list[Chunk] = []
+    n = len(lines)
+    i = 0
+    while i < n:
+        if len(lines[i]) > budget:
+            line = lines[i]
+            step = max(1, budget - overlap)
+            pos = 0
+            while pos < len(line):
+                seg = line[pos : pos + budget]
+                if seg.strip():
+                    chunks.append(
+                        Chunk(rel_path, language, symbol, symbol_kind,
+                              base_line + i, base_line + i, seg, _est_tokens(seg))
+                    )
+                pos += step
+            i += 1
+            continue
+        cur = 0
+        j = i
+        while j < n and len(lines[j]) <= budget and (cur == 0 or cur + len(lines[j]) + 1 <= budget):
+            cur += len(lines[j]) + 1
+            j += 1
+        text = "\n".join(lines[i:j])
+        if text.strip():
+            chunks.append(
+                Chunk(rel_path, language, symbol, symbol_kind,
+                      base_line + i, base_line + j - 1, text, _est_tokens(text))
+            )
+        if j >= n:
+            break
+        back = 0
+        k = j
+        while k > i + 1 and back < overlap:
+            k -= 1
+            back += len(lines[k]) + 1
+        i = max(k, i + 1)
+    return chunks
+
+
+def _ast_chunks(rel_path: str, language: str, text: str, parser) -> list[Chunk]:
+    data = text.encode("utf-8")
+    tree = parser.parse(data)
+    lines = text.splitlines()
+    defs = DEFINITION_TYPES.get(language, set())
+    chunks: list[Chunk] = []
+
+    def text_of(node) -> str:
+        return data[node.start_byte : node.end_byte].decode("utf-8", errors="ignore")
+
+    def span(node) -> tuple[int, int]:
+        return node.start_point[0] + 1, node.end_point[0] + 1  # 1-based inclusive
+
+    def name_of(node) -> str | None:
+        if node is None:
+            return None
+        nm = node.child_by_field_name("name")
+        if nm is not None:
+            return text_of(nm)
+        # e.g. python decorated_definition wraps the real def
+        for c in node.named_children:
+            if c.type in defs:
+                inner = c.child_by_field_name("name")
+                if inner is not None:
+                    return text_of(inner)
+        # C/C++ store the identifier under a (possibly nested) declarator field.
+        decl = node.child_by_field_name("declarator")
+        depth = 0
+        while decl is not None and depth < 12:
+            if decl.type in ("identifier", "field_identifier", "type_identifier", "scoped_identifier"):
+                return text_of(decl)
+            decl = decl.child_by_field_name("declarator")
+            depth += 1
+        return None
+
+    def def_info(node):
+        """Return (symbol, kind, body_node) if node is a definition, else None.
+
+        Unwraps JS/TS ``export`` statements and ``const x = fn/arrow/class``.
+        """
+        t = node.type
+        if t == "export_statement":
+            for c in node.named_children:
+                info = def_info(c)
+                if info is not None:
+                    nm, kind, body = info
+                    return (nm, f"export_{kind}", body)
+            return None
+        if t in ("lexical_declaration", "variable_declaration"):
+            for d in node.named_children:
+                if d.type == "variable_declarator":
+                    val = d.child_by_field_name("value")
+                    if val is not None and val.type in _FN_VALUE_TYPES:
+                        kind = "arrow_function" if val.type == "arrow_function" else val.type
+                        return (name_of(d), kind, val.child_by_field_name("body"))
+            return None
+        if t in defs:
+            return (name_of(node), t, node.child_by_field_name("body"))
+        return None
+
+    def emit_def(node, parent: str | None, info) -> None:
+        nm, kind, body = info
+        full = f"{parent}.{nm}" if parent and nm else (nm or parent)
+        nt = text_of(node)
+        s, e = span(node)
+        if _est_tokens(nt) <= config.CHUNK_MAX_TOKENS:
+            chunks.append(Chunk(rel_path, language, full, kind, s, e, nt, _est_tokens(nt)))
+            return
+        if body is None or body.type not in _BODY_TYPES:
+            body = next((c for c in node.named_children if c.type in _BODY_TYPES), None)
+        if body is not None and any(def_info(c) is not None for c in body.named_children):
+            bstart = body.start_point[0] + 1
+            # Header = signature + decorators, by BYTES so it survives brace
+            # styles where the body's `{` shares the def's first line (JS/Java/
+            # C#/C++), not just Python-style bodies on the next line.
+            htext = data[node.start_byte : body.start_byte].decode("utf-8", errors="ignore")
+            if htext.strip():
+                chunks.append(
+                    Chunk(rel_path, language, full, kind, s, bstart, htext, _est_tokens(htext))
+                )
+            walk_children(body.named_children, full)
+        else:
+            chunks.extend(_line_window_chunks(rel_path, language, lines[s - 1 : e], s, full, kind))
+
+    def walk_children(children, parent: str | None) -> None:
+        buf_start: int | None = None
+        buf_end: int | None = None
+
+        def flush() -> None:
+            nonlocal buf_start, buf_end
+            if buf_start is None:
+                return
+            seg = lines[buf_start - 1 : buf_end]
+            txt = "\n".join(seg)
+            if txt.strip():
+                if _est_tokens(txt) <= config.CHUNK_MAX_TOKENS:
+                    chunks.append(
+                        Chunk(rel_path, language, parent, "module",
+                              buf_start, buf_end, txt, _est_tokens(txt))
+                    )
+                else:
+                    chunks.extend(
+                        _line_window_chunks(rel_path, language, seg, buf_start, parent, "module")
+                    )
+            buf_start = buf_end = None
+
+        for child in children:
+            info = def_info(child)
+            if info is not None:
+                flush()
+                emit_def(child, parent, info)
+            else:
+                s, e = span(child)
+                if buf_start is None:
+                    buf_start = s
+                buf_end = e
+        flush()
+
+    walk_children(tree.root_node.named_children, None)
+    chunks.sort(key=lambda c: (c.start_line, c.end_line))
+    return chunks

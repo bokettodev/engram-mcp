@@ -1,0 +1,211 @@
+# Engram
+
+> Local, private **semantic code search** for AI coding agents — a self-hosted MCP server.
+
+Point Engram at a codebase. It chunks the code by symbol (tree-sitter), embeds the
+chunks **locally**, and stores them in an embedded vector database. Then an AI agent
+(Claude Code, Cursor, Codex, …) — or you, from the CLI — can ask
+*"where is X implemented?"* in plain language and get back the most relevant code,
+ranked, with file + line ranges.
+
+**Everything runs on your machine. No code ever leaves it** — no cloud embeddings,
+no API keys.
+
+Engram speaks the [Model Context Protocol](https://modelcontextprotocol.io) (MCP) — the
+open standard AI agents use to call tools — so an agent calls a fast `search_code`
+tool instead of grepping blindly.
+
+*(The name: an **engram** is a memory trace — Engram "remembers" your codebase as
+embeddings and recalls it by meaning.)*
+
+## Requirements
+
+- [**uv**](https://docs.astral.sh/uv/) — manages Python 3.12 + dependencies (the only thing you install globally).
+- *Optional:* an NVIDIA GPU, to use the stronger code-specialized embedders. The default embedder runs fine on CPU.
+
+## Quickstart
+
+```bash
+git clone <repo-url> engram-mcp
+cd engram-mcp
+uv sync                                   # installs Python 3.12 + dependencies
+
+uv run engram index  /path/to/your/repo   # build the index (first run downloads a small model)
+uv run engram search /path/to/your/repo "where are http requests retried?"
+```
+
+Example output:
+
+```
+$ uv run engram search ./myrepo "retry an http request with backoff"
+
+[src/http/client.py:88-121]   function request_with_retry   (score=0.78)
+def request_with_retry(url, *, attempts=3, backoff=0.5):
+    for i in range(attempts):
+        ...
+
+[src/http/session.py:40-58]   function _sleep_backoff       (score=0.71)
+...
+```
+
+## CLI
+
+```bash
+uv run engram index    <path> [--rebuild] [--profile P]   # build / update the index
+uv run engram search   <path> "<query>" -k 8 [--mode auto|vector|hybrid] [--rerank] [--lang py]
+uv run engram find-def <path> <symbol>                    # exact symbol definition lookup
+uv run engram eval     <path> evals/self.json [--mode M]  # measure retrieval quality
+uv run engram remove   <path>                             # delete a project's index
+uv run engram chunk    <path> [--show N]                  # walk + chunk only (no embedding)
+```
+
+Indexing is **incremental by default** — only changed/added/deleted files are
+re-processed (detected by content hash + mtime), and unchanged chunks are served
+from a global embedding cache, so re-indexing is near-free. `--rebuild` forces a
+full atomic rebuild (a crash mid-rebuild leaves the previous index searchable).
+
+## Use it as an MCP server
+
+Register Engram with your agent, then it can call the tools below itself. Use the
+**absolute path to where you cloned the repo**.
+
+**Claude Code:**
+
+```bash
+claude mcp add engram -- uv --directory /ABSOLUTE/PATH/TO/engram-mcp run engram-mcp
+```
+
+**Cursor** (`.cursor/mcp.json` or global `mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "uv",
+      "args": ["--directory", "/ABSOLUTE/PATH/TO/engram-mcp", "run", "engram-mcp"]
+    }
+  }
+}
+```
+
+Tools exposed (indexing is async — `index_project` returns a `job_id` you poll, so a
+tool call never blocks for minutes):
+
+| Tool | Purpose |
+|---|---|
+| `index_project(project_path, full_rebuild=False, profile=None)` | start a background index; returns `job_id` |
+| `index_status(job_id)` | progress snapshot (stage, counts, ETA) |
+| `search_code(project_path, query, k=8, language=None, mode="auto", rerank=False)` | ranked code chunks |
+| `find_definition(project_path, symbol)` | exact symbol definition lookup (no embedding) |
+| `reindex_file(project_path, rel_path)` | incrementally re-index/drop one file |
+| `remove_project(project_path)` | delete a project's index |
+| `list_indexed_projects()` | on-disk index inventory |
+
+## How it works
+
+```
+walk (gitignore-aware, skips binary/generated)
+  → chunk by symbol via tree-sitter (+ line-window fallback)
+  → embed each chunk locally, with a "path / symbol / language" header
+  → store vectors + metadata in LanceDB (+ a full-text index for hybrid search)
+
+search:  embed the query → nearest vectors  (+ optional BM25 hybrid + reranker)
+```
+
+Embeddings are cached by content hash, so re-indexing unchanged code costs nothing
+and a full rebuild swaps the index in atomically.
+
+**Where data lives** (one index per project, outside the repo):
+`%LOCALAPPDATA%\engram` on Windows, `$XDG_DATA_HOME/engram` on Linux, else `~/.engram`.
+Override with `ENGRAM_HOME`. It stores your code — treat it as private.
+
+## Embedder profiles
+
+FastEmbed (ONNX, light, **no torch, no GPU needed**) — the default:
+
+| Profile | Model | Device |
+|---|---|---|
+| `local_fast` (default) | bge-small-en-v1.5 (384d) | CPU |
+| `local_gpu` | bge-small-en-v1.5 (384d) | CUDA (falls back to CPU) |
+| `local_quality` | bge-base-en-v1.5 (768d) | CUDA if available |
+
+Code-specialized models (much stronger on code, **GPU recommended**) — behind the
+optional `code` extra (pulls torch, ~2 GB):
+
+```bash
+uv sync --extra code
+uv run engram index <path> --profile local_code_fast
+```
+
+On Windows/Linux this installs a **CUDA build of torch automatically** (the code
+models then run on your NVIDIA GPU — only an NVIDIA driver is needed, no separate
+CUDA toolkit). On CPU the code models work but are ~20× slower, so a GPU is
+strongly recommended for them. The default `uv sync` (no extra) is unaffected —
+it stays torch-free and CPU-only.
+
+| Profile | Model | Dim | Model license |
+|---|---|---|---|
+| `local_code_fast` | jina-code-embeddings-0.5b | 512 | CC-BY-NC-4.0 |
+| `local_code_quality` | jina-code-embeddings-1.5b | 1024 | CC-BY-NC-4.0 |
+| `local_code_apache` | Qwen3-Embedding-0.6B | 1024 | Apache-2.0 |
+
+The embedder id (incl. dim) is recorded in the index manifest, so search
+auto-selects the matching model and switching model re-indexes cleanly. Set the
+default for every command with `ENGRAM_PROFILE` (e.g. `ENGRAM_PROFILE=local_code_fast`).
+`bge-small` stays the default because it needs no GPU and no torch.
+
+## Retrieval quality
+
+Search modes (`--mode`, default `auto`):
+
+- **auto** — routes identifier/literal queries (`EmbeddingCache`, `MAX_FILE_BYTES`,
+  `"file not found"`) to hybrid, and plain natural-language queries to vector.
+- **vector** — dense embedding similarity.
+- **hybrid** — vector + full-text (BM25), fused with reciprocal-rank fusion + symbol/path boosts.
+- **`--rerank`** — a local cross-encoder reranks the top candidates (needs `--extra code`).
+
+A built-in `eval` harness reports hit@1/5/10 + MRR **per query category** — that's how
+the defaults were chosen. On the bundled 50-query set, hybrid beats vector overall
+(hit@1 80% vs 72%), and swapping the CPU `bge-small` for the GPU code model
+`local_code_fast` (jina-code) lifts hit@1 to **88–90%**. Run `eval` on your own repo
+to tune for your codebase.
+
+## Performance
+
+Cold indexing is bound by embedding throughput: ~21 chunks/s on CPU with the default
+model (a few minutes for a mid-size repo; ~15–35 min for 1–2M LOC). Re-indexing is
+near-free thanks to the content-hash cache. Code models are far stronger but ~20×
+slower on CPU — use a GPU for them.
+
+## Stack
+
+| Concern | Choice |
+|---|---|
+| Runtime | Python 3.12 via [`uv`](https://docs.astral.sh/uv/) |
+| Embedder | [FastEmbed](https://github.com/qdrant/fastembed) (`bge-small`, ONNX) · optional [sentence-transformers](https://www.sbert.net/) (jina-code / Qwen3) |
+| Vector store | [LanceDB](https://lancedb.com/) (embedded, on-disk, vector + full-text) |
+| Chunker | tree-sitter — 11 languages (py/js/ts/tsx/go/rust/java/c/cpp/ruby/c#) + line-window fallback |
+| Server | MCP Python SDK (FastMCP, stdio) |
+
+## Status
+
+- ✅ Walk + nested-`.gitignore` ignore + tree-sitter chunking (11 langs, contextual headers)
+- ✅ Local embedding + LanceDB store + content-hash cache
+- ✅ Atomic full rebuild + incremental re-index + per-project lock
+- ✅ Embedder profiles: CPU/GPU FastEmbed + code-specialized (jina-code / Qwen3) via `--extra code`
+- ✅ Search modes auto / vector / hybrid + optional cross-encoder rerank
+- ✅ Per-category eval harness · `find_definition` symbol lookup
+- ✅ Async MCP server (index / status / search / find_definition / reindex_file / remove_project)
+- ⏳ GPU-tuned serving · Merkle incremental · file-watching · job persistence
+
+## Development
+
+```bash
+uv run pytest -q          # 54 tests (+2 skip unless `--extra code` is installed)
+```
+
+## License
+
+[MIT](LICENSE). The optional embedding models you may download have their own
+licenses (jina-code: CC-BY-NC-4.0 — non-commercial; Qwen3: Apache-2.0) and matter
+only if you enable the `code` extra.

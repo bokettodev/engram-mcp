@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# uv / virtualenv
+.venv/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+.artifacts/
+
+# Note: uv.lock IS committed (the lockfile). The semantic index + embedding
+# cache live under %LOCALAPPDATA%\code-index-mcp, outside the repo.

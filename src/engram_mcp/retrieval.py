@@ -1,0 +1,78 @@
+"""Hybrid retrieval: dense vector + full-text (BM25) fused with RRF, then
+deterministic symbol/path boosts. Rank-based fusion avoids mixing score scales.
+"""
+
+from __future__ import annotations
+
+import re
+
+_TOKEN = re.compile(r"[A-Za-z0-9_]+")
+
+# Surface signals that a query is targeting an exact token (identifier, literal,
+# path) rather than a concept — those benefit from the BM25 half of hybrid.
+_IDENT_SIGNALS = (
+    re.compile(r"[a-z][A-Z]"),  # camelCase
+    re.compile(r"[A-Za-z]_[A-Za-z]"),  # snake_case / ALL_CAPS_WORD
+    re.compile(r"\b[A-Z][A-Z0-9]{2,}\b"),  # ALLCAPS token
+    re.compile(r"""['"][^'"]+['"]"""),  # 'quoted literal'
+    re.compile(r"\.(py|js|ts|tsx|go|rs|java|c|cpp|h|rb|cs|json|toml|md)\b"),  # file ext
+    re.compile(r"(?<![\w])_[A-Za-z]\w+"),  # _leading_underscore identifier
+)
+
+
+def _tokens(s: str | None) -> list[str]:
+    return [t.lower() for t in _TOKEN.findall(s or "")]
+
+
+def classify_query(query: str) -> str:
+    """Pick a search mode for `mode=auto`: identifier/literal-ish queries get
+    `hybrid` (BM25 catches exact tokens), pure natural language gets `vector`."""
+    if len(query.split()) == 1:  # a bare single-token query is almost always an identifier
+        return "hybrid"
+    return "hybrid" if any(p.search(query) for p in _IDENT_SIGNALS) else "vector"
+
+
+def _rrf(rank: int, k: int = 60) -> float:
+    return 1.0 / (k + rank)
+
+
+def hybrid_search(store, query, qvector, k=8, where=None, candidate_k=50) -> list[dict]:
+    vec_hits = store.search(qvector, k=candidate_k, where=where)
+    fts_hits = store.search_text(query, k=candidate_k, where=where)
+
+    fused: dict[str, dict] = {}
+
+    def slot(h: dict) -> dict:
+        cid = h.get("chunk_id")
+        e = fused.get(cid)
+        if e is None:
+            e = {"hit": h, "score": 0.0}
+            fused[cid] = e
+        return e
+
+    for rank, h in enumerate(vec_hits, 1):
+        slot(h)["score"] += _rrf(rank)
+    for rank, h in enumerate(fts_hits, 1):
+        slot(h)["score"] += _rrf(rank)
+
+    qtoks = set(_tokens(query))
+    for e in fused.values():
+        h = e["hit"]
+        sym = h.get("symbol") or ""
+        basename = (h.get("rel_path") or "").rsplit("/", 1)[-1]
+        sym_toks = set(_tokens(sym))
+        base_toks = set(_tokens(basename))
+        if qtoks & sym_toks:
+            e["score"] += 0.10 * len(qtoks & sym_toks)
+        if sym.lower() in qtoks:  # the exact symbol name appears in the query
+            e["score"] += 0.20
+        if qtoks & base_toks:
+            e["score"] += 0.05
+
+    ranked = sorted(fused.values(), key=lambda e: e["score"], reverse=True)
+    out = []
+    for e in ranked[:k]:
+        h = dict(e["hit"])
+        h["score"] = round(e["score"], 6)
+        out.append(h)
+    return out
