@@ -88,6 +88,24 @@ claude mcp add engram -- uv --directory /ABSOLUTE/PATH/TO/engram-mcp run engram-
 }
 ```
 
+**Read-only mode.** Set the env var `ENGRAM_READONLY=1` on the server and only the
+read tools (`search_code`, `find_definition`, `index_status`, `list_indexed_projects`)
+are registered — the mutating tools (`index_project`, `reindex_file`,
+`remove_project`) are withheld, so the client physically cannot alter an index.
+Indexing is then driven out-of-band via the `engram` CLI. Useful when handing the
+server to an agent while a separate process owns indexing:
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "engram-mcp",
+      "env": { "ENGRAM_READONLY": "1" }
+    }
+  }
+}
+```
+
 Tools exposed (indexing is async — `index_project` returns a `job_id` you poll, so a
 tool call never blocks for minutes):
 

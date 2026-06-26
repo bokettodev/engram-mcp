@@ -4,16 +4,27 @@ Tools:
   index_project(project_path)            -> {job_id, ...}   (async; poll status)
   index_status(job_id)                   -> progress snapshot
   search_code(project_path, query, ...)  -> ranked chunks
+  find_definition(project_path, symbol)  -> exact symbol lookup
+  reindex_file(project_path, rel_path)   -> incremental single-file re-index
+  remove_project(project_path)           -> delete a project's index
   list_indexed_projects()                -> on-disk index inventory
 
 Indexing runs on a single-worker background thread pool so a tool call returns
 immediately and concurrent index requests serialize on the one embedder.
+
+Read-only mode: set ENGRAM_READONLY=1 (env) to expose ONLY the read tools
+(search_code / find_definition / index_status / list_indexed_projects). The
+mutating tools (index_project / reindex_file / remove_project) are not
+registered, so a client physically cannot alter an index. Indexing is then
+driven out-of-band (e.g. the `engram` CLI). Intended for hosts that hand the
+server to untrusted callers (agents) while a separate process owns indexing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -151,8 +162,11 @@ def list_projects() -> dict:
 
 
 # --- MCP tool surface ---
+#
+# Tools are defined as plain coroutines and registered explicitly at the bottom
+# so the mutating ones can be withheld in read-only mode (ENGRAM_READONLY=1).
 
-@mcp.tool()
+
 async def index_project(
     project_path: str, full_rebuild: bool = False, profile: str | None = None
 ) -> dict:
@@ -166,13 +180,11 @@ async def index_project(
     return start_index_job(project_path, full_rebuild, profile)
 
 
-@mcp.tool()
 async def index_status(job_id: str) -> dict:
     """Progress snapshot for an index job: status, stage, counts, ETA."""
     return get_status(job_id)
 
 
-@mcp.tool()
 async def search_code(
     project_path: str, query: str, k: int = 8, language: str | None = None,
     mode: str = "auto", rerank: bool = False,
@@ -188,29 +200,47 @@ async def search_code(
     return await asyncio.to_thread(do_search, project_path, query, k, language, mode, rerank)
 
 
-@mcp.tool()
 async def reindex_file(project_path: str, rel_path: str) -> dict:
     """Incrementally re-index (or drop, if missing) a single file on the index."""
     return await asyncio.to_thread(do_reindex_file, project_path, rel_path)
 
 
-@mcp.tool()
 async def remove_project(project_path: str) -> dict:
     """Delete a project's on-disk index (vectors + manifests)."""
     return await asyncio.to_thread(do_remove_project, project_path)
 
 
-@mcp.tool()
 async def find_definition(project_path: str, symbol: str) -> dict:
     """Exact symbol lookup (no embedding): the definition(s) named `symbol`
     (or `Parent.symbol`), returned as whole-symbol chunks with line ranges."""
     return await asyncio.to_thread(do_find_definition, project_path, symbol)
 
 
-@mcp.tool()
 async def list_indexed_projects() -> dict:
     """List projects that currently have an index on disk."""
     return list_projects()
+
+
+def read_only_enabled() -> bool:
+    """True when ENGRAM_READONLY selects the read-only tool surface."""
+    return os.environ.get("ENGRAM_READONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def register_tools(read_only: bool) -> None:
+    """Register the MCP tool surface; mutating tools are withheld when read_only."""
+    # Read tools — always available.
+    mcp.tool()(search_code)
+    mcp.tool()(find_definition)
+    mcp.tool()(index_status)
+    mcp.tool()(list_indexed_projects)
+    # Mutating tools — only when not read-only.
+    if not read_only:
+        mcp.tool()(index_project)
+        mcp.tool()(reindex_file)
+        mcp.tool()(remove_project)
+
+
+register_tools(read_only_enabled())
 
 
 def main() -> None:

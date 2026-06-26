@@ -18,6 +18,24 @@ def test_tools_are_registered():
     assert {"index_project", "index_status", "search_code", "list_indexed_projects"} <= names
 
 
+def test_read_only_mode_hides_mutating_tools(monkeypatch):
+    """ENGRAM_READONLY=1 exposes only the read tools; mutating tools are withheld."""
+    import importlib
+
+    from engram_mcp import server as server_mod
+
+    monkeypatch.setenv("ENGRAM_READONLY", "1")
+    importlib.reload(server_mod)
+    try:
+        names = {t.name for t in asyncio.run(server_mod.mcp.list_tools())}
+        assert {"search_code", "find_definition", "index_status", "list_indexed_projects"} <= names
+        assert not ({"index_project", "reindex_file", "remove_project"} & names)
+    finally:
+        # restore the full tool surface for subsequent tests
+        monkeypatch.delenv("ENGRAM_READONLY", raising=False)
+        importlib.reload(server_mod)
+
+
 def test_unknown_job_and_empty_list(tmp_path, monkeypatch):
     from engram_mcp import server
 
