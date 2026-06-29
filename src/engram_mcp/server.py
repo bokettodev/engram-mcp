@@ -195,7 +195,7 @@ async def search_code(
     Returns up to k ranked code chunks (path, line range, symbol, content).
     mode is "auto" (default: identifier/literal queries use hybrid full-text +
     vector, natural-language queries use vector), or force "vector"/"hybrid".
-    rerank=true applies a cross-encoder reranker (needs the `code` extra).
+    rerank=true applies a cross-encoder reranker (needs the `gpu` extra).
     The project must be indexed first via index_project.
     """
     return await asyncio.to_thread(do_search, project_path, query, k, language, mode, rerank)

@@ -59,8 +59,14 @@ def configure_tls() -> str:
 
     bundle = next((os.environ[v] for v in _CA_ENV_VARS if os.environ.get(v)), None)
     if bundle:
+        # Mirror the bundle across clients (which var each reads is uneven).
+        # Treat an empty value as absent: an empty SSL_CERT_FILE makes httpx
+        # silently fall back to certifi, defeating the point. Overwrite any
+        # empty/missing var; a deliberately-different non-empty var is the
+        # user's call and left as-is.
         for v in _CA_ENV_VARS:
-            os.environ.setdefault(v, bundle)
+            if not os.environ.get(v):
+                os.environ[v] = bundle
         logger.debug("using CA bundle from env for downloads: %s", bundle)
         return "ca-bundle"
 
@@ -90,8 +96,9 @@ def _disable_verification() -> None:
         stacklevel=2,
     )
     ssl._create_default_https_context = ssl._create_unverified_context  # type: ignore[attr-defined]
-    # requests (used by huggingface_hub / fastembed) ignores the stdlib default
-    # context, so force verify=False on every session and silence the noise.
+    # The download stack is split: fastembed uses requests directly, while
+    # huggingface_hub (1.x) is httpx-based. The stdlib default-context patch
+    # above covers neither, so disable verification on both clients explicitly.
     try:
         from functools import partialmethod
 
@@ -102,17 +109,50 @@ def _disable_verification() -> None:
         urllib3.disable_warnings()
     except Exception:  # pragma: no cover - requests always present via hf_hub
         pass
+    _disable_httpx_verification()
+
+
+def _disable_httpx_verification() -> None:
+    """Force ``verify=False`` as the default on new httpx clients (best-effort).
+
+    huggingface_hub builds its httpx client lazily, after configure_tls() runs,
+    so patching the constructor default takes effect for the download client. If
+    a caller passes ``verify`` explicitly this is a no-op for that client — hence
+    best-effort; the system-trust / CA-bundle paths are the real fix.
+    """
+    try:
+        import httpx
+    except Exception:  # pragma: no cover - httpx always present via hf_hub
+        return
+
+    def _wrap(orig):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("verify", False)
+            orig(self, *args, **kwargs)
+
+        __init__._engram_insecure = True  # type: ignore[attr-defined]
+        return __init__
+
+    for cls in (httpx.Client, httpx.AsyncClient):
+        if not getattr(cls.__init__, "_engram_insecure", False):
+            cls.__init__ = _wrap(cls.__init__)  # type: ignore[method-assign]
 
 
 def is_cert_error(exc: BaseException) -> bool:
-    """True if ``exc`` (or its cause chain) is a TLS certificate-verification failure."""
+    """True if ``exc`` or anything in its cause/context chain is a TLS
+    certificate-verification failure. Walks BOTH ``__cause__`` and
+    ``__context__`` (a re-raise may attach the real error to either)."""
     seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
         seen.add(id(cur))
         if "certificate verify failed" in repr(cur).lower():
             return True
-        cur = cur.__cause__ or cur.__context__
+        stack.append(cur.__cause__)
+        stack.append(cur.__context__)
     return False
 
 

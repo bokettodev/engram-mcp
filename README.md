@@ -88,6 +88,25 @@ claude mcp add engram -- uv --directory /ABSOLUTE/PATH/TO/engram-mcp run engram-
 }
 ```
 
+**Picking the model for the server.** The server defaults to `local_fast`
+(bge-small). To make it use another profile for *new* indexing, set
+`ENGRAM_PROFILE` in the server's env (this does **not** affect search over an
+existing index — that always uses the model recorded in the project's manifest):
+
+```bash
+claude mcp add engram -e ENGRAM_PROFILE=local_qwen -- \
+  uv --directory /ABSOLUTE/PATH/TO/engram-mcp run --extra gpu engram-mcp
+```
+
+- A `local_qwen*` profile needs the torch models present, so launch the server
+  with `run --extra gpu` (or pre-run `uv sync --extra gpu` once). Without it,
+  `uv run` syncs only the base deps and the Qwen profiles can't load.
+- **Windows footgun:** if `uv run` reports `failed to remove … engram-mcp.exe …
+  used by another process`, a previous server instance is holding the script
+  while `uv` tries to re-sync. Launch with `run --no-sync` (use the already-set-up
+  venv, skip the sync) to avoid the lock:
+  `uv --directory … run --no-sync engram-mcp`.
+
 **Read-only mode.** Set the env var `ENGRAM_READONLY=1` on the server and only the
 read tools (`search_code`, `find_definition`, `index_status`, `list_indexed_projects`)
 are registered — the mutating tools (`index_project`, `reindex_file`,
@@ -136,6 +155,12 @@ and a full rebuild swaps the index in atomically.
 **Where data lives** (one index per project, outside the repo):
 `%LOCALAPPDATA%\engram` on Windows, `$XDG_DATA_HOME/engram` on Linux, else `~/.engram`.
 Override with `ENGRAM_HOME`. It stores your code — treat it as private.
+
+**Model weights** are a separate, shared cache: downloaded once into the
+Hugging Face cache (`~/.cache/huggingface`, or wherever `HF_HOME` points) and
+reused across projects — not under `ENGRAM_HOME`. They are sizeable (bge-small
+~130 MB; Qwen3-4B ~8 GB), so point `HF_HOME` at a roomy disk if your home
+partition is small.
 
 ## Embedder profiles
 

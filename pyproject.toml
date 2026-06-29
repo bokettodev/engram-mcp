@@ -46,8 +46,8 @@ dev = [
     "pytest>=9.1.1",
 ]
 
-# GPU torch for the optional `code` extra. This only affects resolution when
-# torch is pulled in (i.e. `uv sync --extra code`) — the default `uv sync`
+# GPU torch for the optional `gpu` extra. This only affects resolution when
+# torch is pulled in (i.e. `uv sync --extra gpu`) — the default `uv sync`
 # (bge / FastEmbed, no torch) is untouched. Scoped to win/linux; macOS falls
 # back to the default torch wheel (no CUDA wheels there anyway).
 [[tool.uv.index]]

@@ -37,8 +37,11 @@ class CrossEncoderReranker:
             raise ImportError(
                 "reranking needs the optional 'gpu' extra: run `uv sync --extra gpu`"
             ) from exc
+        from engram_mcp.net import guard_download
+
         self.model_id = model_name
-        self._ce = CrossEncoder(model_name, device=_resolve_device(device))
+        with guard_download(model_name):
+            self._ce = CrossEncoder(model_name, device=_resolve_device(device))
 
     def rerank(self, query: str, candidates: list[dict], top_k: int | None = None) -> list[dict]:
         if not candidates:

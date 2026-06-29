@@ -43,16 +43,27 @@ def test_ca_bundle_is_mirrored_across_clients(clean_env):
     assert os.environ["CURL_CA_BUNDLE"] == "/corp/ca.pem"
 
 
-def test_existing_bundle_vars_are_not_overwritten(clean_env):
+def test_existing_nonempty_bundle_vars_are_not_overwritten(clean_env):
     clean_env.setenv("SSL_CERT_FILE", "/a.pem")
     clean_env.setenv("REQUESTS_CA_BUNDLE", "/b.pem")
     assert net.configure_tls() == "ca-bundle"
     import os
 
-    # setdefault must not clobber a var the user set explicitly
+    # a deliberately-different non-empty var is the user's call, left as-is
     assert os.environ["SSL_CERT_FILE"] == "/a.pem"
     assert os.environ["REQUESTS_CA_BUNDLE"] == "/b.pem"
     assert os.environ["CURL_CA_BUNDLE"] in ("/a.pem", "/b.pem")
+
+
+def test_empty_bundle_var_is_overwritten_not_left_blank(clean_env):
+    # The footgun: an empty SSL_CERT_FILE makes httpx fall back to certifi.
+    clean_env.setenv("SSL_CERT_FILE", "")
+    clean_env.setenv("REQUESTS_CA_BUNDLE", "/corp/ca.pem")
+    assert net.configure_tls() == "ca-bundle"
+    import os
+
+    assert os.environ["SSL_CERT_FILE"] == "/corp/ca.pem"
+    assert os.environ["CURL_CA_BUNDLE"] == "/corp/ca.pem"
 
 
 def test_system_trust_disabled_falls_back_to_default(clean_env):
@@ -68,7 +79,7 @@ def test_system_trust_is_default(clean_env, monkeypatch):
     assert injected == [1]
 
 
-def test_is_cert_error_matches_chain():
+def test_is_cert_error_matches_cause_chain():
     inner = OSError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed (_ssl.c:1010)")
     outer = ConnectionError("connect failed")
     outer.__cause__ = inner
@@ -76,9 +87,47 @@ def test_is_cert_error_matches_chain():
     assert net.is_cert_error(inner)
 
 
+def test_is_cert_error_matches_via_context_only():
+    # A re-raise can attach the real error to __context__ (implicit) rather than
+    # __cause__ (explicit `from`); both must be walked.
+    inner = OSError("certificate verify failed: self-signed certificate in chain")
+    outer = RuntimeError("wrapper")
+    outer.__context__ = inner  # no __cause__
+    assert net.is_cert_error(outer)
+
+
 def test_is_cert_error_ignores_unrelated():
     assert not net.is_cert_error(ValueError("nope"))
     assert not net.is_cert_error(ConnectionError("timed out"))
+
+
+def test_disable_verification_patches_requests_and_httpx():
+    import httpx
+    import requests
+    import ssl
+
+    saved = (
+        ssl._create_default_https_context,
+        requests.Session.request,
+        httpx.Client.__init__,
+        httpx.AsyncClient.__init__,
+    )
+    try:
+        net._disable_verification()
+        # httpx is the huggingface_hub 1.x path — must be covered, not just requests
+        assert getattr(httpx.Client.__init__, "_engram_insecure", False)
+        assert getattr(httpx.AsyncClient.__init__, "_engram_insecure", False)
+        assert ssl._create_default_https_context is ssl._create_unverified_context
+        # idempotent: a second call must not double-wrap
+        net._disable_verification()
+        assert getattr(httpx.Client.__init__, "_engram_insecure", False)
+    finally:
+        (
+            ssl._create_default_https_context,
+            requests.Session.request,
+            httpx.Client.__init__,
+            httpx.AsyncClient.__init__,
+        ) = saved
 
 
 def test_guard_download_wraps_cert_error_with_hint():
