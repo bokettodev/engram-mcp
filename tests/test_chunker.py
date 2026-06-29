@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from engram_mcp import config
 from engram_mcp.indexing.chunker import chunk_file
 
 
@@ -62,10 +63,11 @@ def test_rust_function():
     assert "add" in _symbols(chunks)
 
 
-def test_fallback_markdown_is_single_file_chunk():
+def test_markdown_single_section_chunk():
     chunks = chunk_file("readme.md", "markdown", "# Title\n\nsome text\n")
     assert len(chunks) == 1
-    assert chunks[0].symbol_kind == "file"
+    assert chunks[0].symbol_kind == "section"
+    assert chunks[0].symbol == "Title"
     assert chunks[0].start_line == 1
 
 
@@ -171,5 +173,85 @@ def test_oversized_brace_class_keeps_signature():
 def test_c_function_name_from_declarator():
     chunks = chunk_file("m.c", "c", "int add_two(int a, int b) {\n    return a + b;\n}\n")
     assert "add_two" in _symbols(chunks)
+
+
+# --- prose / markdown ---------------------------------------------------------
+
+
+def test_markdown_sections_split_by_heading():
+    src = (
+        "# Guide\n\nintro paragraph\n\n"
+        "## Install\n\nrun the installer\n\n"
+        "## Usage\n\ncall the tool\n"
+    )
+    chunks = chunk_file("doc.md", "markdown", src)
+    syms = _symbols(chunks)
+    assert "Guide" in syms
+    assert "Guide > Install" in syms
+    assert "Guide > Usage" in syms
+    assert all(c.symbol_kind == "section" for c in chunks)
+    install = next(c for c in chunks if c.symbol == "Guide > Install")
+    assert "run the installer" in install.text
+
+
+def test_markdown_breadcrumb_pops_deeper_levels():
+    src = (
+        "# A\n\nt\n\n"
+        "## B\n\nt\n\n"
+        "### C\n\nt\n\n"
+        "## D\n\nt\n"
+    )
+    syms = _symbols(chunk_file("d.md", "markdown", src))
+    assert "A > B > C" in syms
+    assert "A > D" in syms  # level-2 D pops B and C off the stack
+
+
+def test_markdown_preamble_before_first_heading():
+    src = "lead-in text before any heading\n\n# Heading\n\nbody\n"
+    chunks = chunk_file("d.md", "markdown", src)
+    pre = next(c for c in chunks if c.symbol is None)
+    assert pre.symbol_kind == "prose"
+    assert pre.start_line == 1
+    assert "lead-in" in pre.text
+
+
+def test_markdown_ignores_headings_in_fenced_code():
+    src = (
+        "# Real\n\n"
+        "```\n"
+        "# not a heading\n"
+        "```\n\n"
+        "more text\n"
+    )
+    chunks = chunk_file("d.md", "markdown", src)
+    syms = _symbols(chunks)
+    assert "Real" in syms
+    assert "not a heading" not in syms
+    assert len(chunks) == 1  # the fenced `#` did not start a new section
+
+
+def test_markdown_no_headings_is_prose():
+    src = "just a paragraph\n\nand another one\n"
+    chunks = chunk_file("d.md", "markdown", src)
+    assert all(c.symbol_kind == "prose" for c in chunks)
+    assert all(c.symbol is None for c in chunks)
+
+
+def test_plain_text_packs_by_paragraph():
+    chunks = chunk_file("notes.txt", "text", "first para\n\nsecond para\n\nthird para\n")
+    # small paragraphs pack into a single chunk on paragraph boundaries
+    assert len(chunks) == 1
+    assert chunks[0].symbol_kind == "prose"
+    assert chunks[0].start_line == 1
+    assert "first para" in chunks[0].text and "third para" in chunks[0].text
+
+
+def test_prose_oversized_section_splits_into_multiple_chunks():
+    paras = "\n\n".join(f"Paragraph number {i} " + "word " * 60 for i in range(40))
+    src = f"# Big\n\n{paras}\n"
+    chunks = chunk_file("big.md", "markdown", src)
+    big = [c for c in chunks if (c.symbol or "").startswith("Big")]
+    assert len(big) >= 2
+    assert all(c.token_estimate <= config.PROSE_CHUNK_MAX_TOKENS + 5 for c in big)
 
 

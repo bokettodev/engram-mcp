@@ -44,13 +44,18 @@ _GENERATED_MARKERS = (
 )
 
 
-def looks_generated(text: str) -> bool:
+def looks_generated(text: str, language: str | None = None) -> bool:
     """Heuristic skip for generated/minified files (a header marker in the
     leading lines, or a very long line). Restricting markers to the head avoids
-    false positives from the phrase appearing deeper in legitimate source."""
+    false positives from the phrase appearing deeper in legitimate source.
+
+    The long-line check is skipped for prose (markdown/plain text), where a long
+    unwrapped paragraph is normal and would otherwise drop the whole file."""
     head = "\n".join(text.split("\n", 8)[:8]).lower()
     if any(m in head for m in _GENERATED_MARKERS):
         return True
+    if language in ("markdown", "text"):
+        return False
     for line in text.split("\n", 500)[:500]:
         if len(line) > 5000:  # minified / bundled blob
             return True

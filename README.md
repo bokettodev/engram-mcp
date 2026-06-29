@@ -202,12 +202,13 @@ slower on CPU — use a GPU for them.
 | Runtime | Python 3.12 via [`uv`](https://docs.astral.sh/uv/) |
 | Embedder | [FastEmbed](https://github.com/qdrant/fastembed) (`bge-small`, ONNX) · optional [sentence-transformers](https://www.sbert.net/) (jina-code / Qwen3) |
 | Vector store | [LanceDB](https://lancedb.com/) (embedded, on-disk, vector + full-text) |
-| Chunker | tree-sitter — 11 languages (py/js/ts/tsx/go/rust/java/c/cpp/ruby/c#) + line-window fallback |
+| Chunker | tree-sitter — 11 languages (py/js/ts/tsx/go/rust/java/c/cpp/ruby/c#) · markdown by heading section · plain text by paragraph · line-window fallback |
 | Server | MCP Python SDK (FastMCP, stdio) |
 
 ## Status
 
 - ✅ Walk + nested-`.gitignore` ignore + tree-sitter chunking (11 langs, contextual headers)
+- ✅ Structure-aware prose: markdown split by heading section (breadcrumb → chunk symbol) + plain text packed by paragraph
 - ✅ Local embedding + LanceDB store + content-hash cache
 - ✅ Atomic full rebuild + incremental re-index + per-project lock
 - ✅ Embedder profiles: CPU/GPU FastEmbed + code-specialized (jina-code / Qwen3) via `--extra code`

@@ -59,13 +59,19 @@ MAX_FILE_BYTES = 1_000_000  # skip files larger than ~1 MB by default
 CHARS_PER_TOKEN = 4  # rough token estimate for chunk sizing only
 CHUNK_MAX_TOKENS = 480  # hard cap per chunk (bge-small context is 512)
 CHUNK_OVERLAP_TOKENS = 60  # overlap for the line-window fallback
+# Prose (markdown/plain-text) chunk cap. Kept at the model context for now;
+# split as a named knob so prose can be tuned independently of code chunks.
+PROSE_CHUNK_MAX_TOKENS = 480
 
 # Bumped whenever chunking OR embedded-text format changes, so the cache
 # invalidates and incompatible indexes rebuild. v2: contextual chunk headers.
 # v3: brace-style header preservation + C/C++ declarator symbol names.
-# (v4 added file-level imports to the header but measured slightly worse on the
-# eval set, so it was reverted; the lean path/symbol/language header stands.)
-CHUNKER_VERSION = "3"
+# (An earlier v4 added file-level imports to the header but measured slightly
+# worse on the eval set, so it was reverted; the lean path/symbol/language
+# header stands.)
+# v4: structure-aware prose chunking — markdown split by heading sections (the
+# heading breadcrumb becomes the chunk symbol) + plain text packed by paragraph.
+CHUNKER_VERSION = "4"
 
 # Default local embedder (FastEmbed / ONNX, bge-small-en-v1.5, 384-dim).
 DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"

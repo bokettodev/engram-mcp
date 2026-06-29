@@ -148,7 +148,7 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
     chunks = []
     for rec in walk(root):
         text = _read_text(rec.abs_path)
-        if text is None or looks_generated(text):
+        if text is None or looks_generated(text, rec.language):
             continue
         cs = chunk_file(rec.rel_path, rec.language, text)
         chunks.extend(cs)
@@ -212,7 +212,7 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
             unchanged += 1
             continue
         text = _read_text(rec.abs_path)
-        if text is None or looks_generated(text):
+        if text is None or looks_generated(text, rec.language):
             # Skipped (unreadable/generated): not added to new_files, so if it
             # was previously indexed it falls into deleted_paths below.
             continue
@@ -293,6 +293,7 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
         # Apply the same admission rules as a normal walk (skip symlink, binary,
         # oversized, unreadable, generated); a rejected file is just dropped.
         text = None
+        lang = detect_language(abs_path.suffix)
         if abs_path.is_file() and not abs_path.is_symlink():
             ext = abs_path.suffix.lower()
             try:
@@ -301,10 +302,9 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
                 size = 0
             if ext not in config.BINARY_EXTS and 0 < size <= config.MAX_FILE_BYTES:
                 candidate = _read_text(abs_path)
-                if candidate is not None and not looks_generated(candidate):
+                if candidate is not None and not looks_generated(candidate, lang):
                     text = candidate
         if text is not None:
-            lang = detect_language(abs_path.suffix)
             fh = sha256_text(text)
             chunks = chunk_file(rel, lang, text)
             if chunks:

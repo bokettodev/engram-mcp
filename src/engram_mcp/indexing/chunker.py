@@ -17,6 +17,7 @@ Token counts are rough estimates (chars/4) used only for sizing.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 from engram_mcp import config
@@ -92,7 +93,14 @@ _BODY_TYPES = {
 
 def chunk_file(rel_path: str, language: str | None, text: str) -> list[Chunk]:
     """Chunk one file's text into a list of :class:`Chunk`."""
-    if language in GRAMMAR_LANGS:
+    if language == "markdown":
+        try:
+            chunks = _markdown_chunks(rel_path, language, text)
+            if chunks:
+                return chunks
+        except Exception as exc:
+            logger.debug("markdown chunking failed for %s: %r", rel_path, exc)
+    elif language in GRAMMAR_LANGS:
         parser = get_parser(language)
         if parser is not None:
             try:
@@ -101,8 +109,165 @@ def chunk_file(rel_path: str, language: str | None, text: str) -> list[Chunk]:
                     return chunks
             except Exception as exc:
                 logger.debug("AST chunking failed for %s (%s): %r", rel_path, language, exc)
+    elif language == "text":
+        # Plain text / reStructuredText: pack by paragraph, not raw lines.
+        chunks = _prose_chunks(rel_path, language, text.splitlines(), 1, None, "prose")
+        if chunks:
+            return chunks
     lines = text.splitlines()
     return _line_window_chunks(rel_path, language, lines, 1, None, "file")
+
+
+# --- Prose / Markdown chunking ------------------------------------------------
+# ATX heading (`# ...` to `###### ...`), up to 3 leading spaces per CommonMark,
+# with an optional trailing `#` run. Setext (underline) headings are not handled.
+_ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+# Fenced code block open/close marker (``` or ~~~), possibly indented.
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def _paragraphs(lines: list[str], base_line: int) -> list[tuple[int, int, str]]:
+    """Split lines into blank-line-separated paragraphs.
+
+    Returns ``(start_line, end_line, text)`` (1-based inclusive) for each block
+    of consecutive non-blank lines; runs of blank lines are dropped.
+    """
+    paras: list[tuple[int, int, str]] = []
+    n = len(lines)
+    i = 0
+    while i < n:
+        while i < n and not lines[i].strip():
+            i += 1
+        if i >= n:
+            break
+        start = i
+        while i < n and lines[i].strip():
+            i += 1
+        paras.append((base_line + start, base_line + i - 1, "\n".join(lines[start:i])))
+    return paras
+
+
+def _prose_chunks(
+    rel_path: str,
+    language: str | None,
+    lines: list[str],
+    base_line: int,
+    symbol: str | None,
+    symbol_kind: str | None,
+) -> list[Chunk]:
+    """Pack paragraphs into token-budgeted chunks without splitting a paragraph.
+
+    Greedily fills each chunk up to the prose cap on paragraph boundaries, with
+    a trailing-paragraph overlap carried into the next chunk. A single paragraph
+    over the budget is line-window split (its own line range), so an unwrapped
+    blob still chunks cleanly.
+    """
+    budget = config.PROSE_CHUNK_MAX_TOKENS * config.CHARS_PER_TOKEN
+    overlap_budget = config.CHUNK_OVERLAP_TOKENS * config.CHARS_PER_TOKEN
+    paras = _paragraphs(lines, base_line)
+    if not paras:
+        return []
+    chunks: list[Chunk] = []
+    cur: list[tuple[int, int, str]] = []
+    cur_len = 0
+
+    def flush() -> None:
+        nonlocal cur, cur_len
+        if not cur:
+            return
+        txt = "\n\n".join(p[2] for p in cur)
+        if txt.strip():
+            chunks.append(
+                Chunk(rel_path, language, symbol, symbol_kind,
+                      cur[0][0], cur[-1][1], txt, _est_tokens(txt))
+            )
+        cur = []
+        cur_len = 0
+
+    for para in paras:
+        ps, _pe, ptext = para
+        plen = len(ptext)
+        if plen > budget:
+            flush()
+            chunks.extend(
+                _line_window_chunks(rel_path, language, ptext.split("\n"), ps, symbol, symbol_kind)
+            )
+            continue
+        if cur_len and cur_len + plen + 2 > budget:
+            # Compute the trailing-paragraph overlap before flushing clears `cur`.
+            tail: list[tuple[int, int, str]] = []
+            tail_len = 0
+            for p in reversed(cur):
+                if tail and tail_len + len(p[2]) > overlap_budget:
+                    break
+                tail.insert(0, p)
+                tail_len += len(p[2]) + 2
+            flush()
+            cur = list(tail)
+            cur_len = tail_len
+        cur.append(para)
+        cur_len += plen + 2
+    flush()
+    return chunks
+
+
+def _markdown_chunks(rel_path: str, language: str, text: str) -> list[Chunk]:
+    """Split markdown into one chunk per heading section.
+
+    The heading breadcrumb (e.g. ``Install > Requirements``) becomes the chunk
+    ``symbol`` so it is embedded in the contextual header and surfaces in search
+    — a cheap, static cousin of contextual retrieval. Over-cap sections are
+    paragraph-packed. Headings inside fenced code blocks are ignored. Files with
+    no headings fall through to plain prose packing.
+    """
+    lines = text.splitlines()
+    headings: list[tuple[int, int, str]] = []  # (line_idx, level, title)
+    in_fence = False
+    fence_char = ""
+    for i, line in enumerate(lines):
+        fm = _FENCE.match(line)
+        if fm:
+            marker = fm.group(1)[0]
+            if not in_fence:
+                in_fence, fence_char = True, marker
+            elif marker == fence_char:
+                in_fence, fence_char = False, ""
+            continue
+        if in_fence:
+            continue
+        hm = _ATX_HEADING.match(line)
+        if hm:
+            headings.append((i, len(hm.group(1)), hm.group(2).strip()))
+
+    if not headings:
+        return _prose_chunks(rel_path, language, lines, 1, None, "prose")
+
+    chunks: list[Chunk] = []
+    first = headings[0][0]
+    if first > 0 and "\n".join(lines[:first]).strip():
+        chunks.extend(_prose_chunks(rel_path, language, lines[:first], 1, None, "prose"))
+
+    stack: list[tuple[int, str]] = []  # (level, title)
+    for hi, (idx, level, title) in enumerate(headings):
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, title))
+        breadcrumb = " > ".join(t for _, t in stack)
+        end = headings[hi + 1][0] if hi + 1 < len(headings) else len(lines)
+        seg = lines[idx:end]
+        seg_text = "\n".join(seg)
+        if not seg_text.strip():
+            continue
+        if _est_tokens(seg_text) <= config.PROSE_CHUNK_MAX_TOKENS:
+            chunks.append(
+                Chunk(rel_path, language, breadcrumb, "section",
+                      idx + 1, idx + len(seg), seg_text, _est_tokens(seg_text))
+            )
+        else:
+            chunks.extend(_prose_chunks(rel_path, language, seg, idx + 1, breadcrumb, "section"))
+
+    chunks.sort(key=lambda c: (c.start_line, c.end_line))
+    return chunks
 
 
 def _line_window_chunks(
