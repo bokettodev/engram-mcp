@@ -11,6 +11,7 @@ dependencies = [
     "lancedb>=0.33.0",
     "mcp[cli]>=1.28.0",
     "pathspec>=1.1.1",
+    "truststore>=0.10",
     "tree-sitter>=0.25.2",
     "tree-sitter-c>=0.24.2",
     "tree-sitter-c-sharp>=0.23.5",
@@ -25,9 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Code-specialized embedders + reranker (jina-code / Qwen3) run on torch.
-# Heavy (~2GB) + GPU-recommended, so opt-in: `uv sync --extra code`.
-code = [
+# Quality embedders (Qwen3-Embedding) + cross-encoder reranker run on torch.
+# Heavy (~2GB) + GPU-recommended, so opt-in: `uv sync --extra gpu`.
+gpu = [
     "sentence-transformers>=3.0.0",
     "torch>=2.2",
 ]

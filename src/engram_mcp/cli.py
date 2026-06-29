@@ -205,10 +205,10 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--rebuild", action="store_true",
                     help="force a full rebuild (atomic table swap) instead of incremental")
     pi.add_argument("--profile", default=None,
-                    choices=["local_fast", "local_gpu", "local_quality",
-                             "local_code_fast", "local_code_quality", "local_code_apache"],
+                    choices=["local_fast", "local_quality",
+                             "local_qwen_small", "local_qwen"],
                     help="embedder profile (default $ENGRAM_PROFILE or local_fast; "
-                         "local_code_* need `uv sync --extra code` + a GPU)")
+                         "local_qwen* need `uv sync --extra gpu` + a GPU)")
     pi.set_defaults(func=cmd_index)
     pi.set_defaults(func=cmd_index)
 
@@ -226,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     pv.add_argument("evalfile", help="JSON list of {query, expected_path, expected_symbol?}")
     pv.add_argument("-k", type=int, default=10, help="results considered per query")
     pv.add_argument("--mode", default="auto", choices=["auto", "hybrid", "vector"])
-    pv.add_argument("--rerank", action="store_true", help="cross-encoder rerank (needs --extra code)")
+    pv.add_argument("--rerank", action="store_true", help="cross-encoder rerank (needs --extra gpu)")
     pv.add_argument("-v", "--verbose", action="store_true", help="print per-query ranks")
     pv.set_defaults(func=cmd_evaluate)
 
@@ -238,10 +238,15 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--mode", default="auto", choices=["auto", "hybrid", "vector"],
                     help="retrieval mode (auto routes identifier queries to hybrid, NL to vector)")
     ps.add_argument("--rerank", action="store_true",
-                    help="cross-encoder rerank the candidates (needs `uv sync --extra code`)")
+                    help="cross-encoder rerank the candidates (needs `uv sync --extra gpu`)")
     ps.set_defaults(func=cmd_search)
 
     args = p.parse_args(argv)
+    # Set up TLS trust (OS store / CA bundle / insecure) before any embedder
+    # import triggers a model download.
+    from engram_mcp.net import configure_tls
+
+    configure_tls()
     return args.func(args)
 
 

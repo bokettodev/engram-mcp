@@ -1,4 +1,4 @@
-"""Optional local cross-encoder reranker (behind the `code` extra).
+"""Optional local cross-encoder reranker (behind the `gpu` extra).
 
 Reranks the top candidates from vector/hybrid search by scoring each
 (query, code) pair with a cross-encoder — the second-biggest quality lever
@@ -35,7 +35,7 @@ class CrossEncoderReranker:
             from sentence_transformers import CrossEncoder
         except ImportError as exc:  # pragma: no cover - depends on extra
             raise ImportError(
-                "reranking needs the optional 'code' extra: run `uv sync --extra code`"
+                "reranking needs the optional 'gpu' extra: run `uv sync --extra gpu`"
             ) from exc
         self.model_id = model_name
         self._ce = CrossEncoder(model_name, device=_resolve_device(device))

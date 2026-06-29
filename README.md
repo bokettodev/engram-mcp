@@ -141,36 +141,54 @@ Override with `ENGRAM_HOME`. It stores your code — treat it as private.
 
 FastEmbed (ONNX, light, **no torch, no GPU needed**) — the default:
 
-| Profile | Model | Device |
-|---|---|---|
-| `local_fast` (default) | bge-small-en-v1.5 (384d) | CPU |
-| `local_gpu` | bge-small-en-v1.5 (384d) | CUDA (falls back to CPU) |
-| `local_quality` | bge-base-en-v1.5 (768d) | CUDA if available |
+| Profile | Model | Dim | Device |
+|---|---|---|---|
+| `local_fast` (default) | bge-small-en-v1.5 | 384 | CPU |
+| `local_quality` | bge-large-en-v1.5 | 1024 | CUDA if available |
 
-Code-specialized models (much stronger on code, **GPU recommended**) — behind the
-optional `code` extra (pulls torch, ~2 GB):
+Quality models (**GPU recommended**) — behind the optional `gpu` extra (pulls
+torch, ~2 GB). [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-4B)
+tops MTEB on **both text and code**, so one family covers prose and source:
 
 ```bash
-uv sync --extra code
-uv run engram index <path> --profile local_code_fast
+uv sync --extra gpu
+uv run engram index <path> --profile local_qwen
 ```
 
-On Windows/Linux this installs a **CUDA build of torch automatically** (the code
+On Windows/Linux this installs a **CUDA build of torch automatically** (the
 models then run on your NVIDIA GPU — only an NVIDIA driver is needed, no separate
-CUDA toolkit). On CPU the code models work but are ~20× slower, so a GPU is
-strongly recommended for them. The default `uv sync` (no extra) is unaffected —
-it stays torch-free and CPU-only.
+CUDA toolkit). On CPU they work but are far slower, so a GPU is strongly
+recommended. The default `uv sync` (no extra) is unaffected — it stays
+torch-free and CPU-only.
 
 | Profile | Model | Dim | Model license |
 |---|---|---|---|
-| `local_code_fast` | jina-code-embeddings-0.5b | 512 | CC-BY-NC-4.0 |
-| `local_code_quality` | jina-code-embeddings-1.5b | 1024 | CC-BY-NC-4.0 |
-| `local_code_apache` | Qwen3-Embedding-0.6B | 1024 | Apache-2.0 |
+| `local_qwen_small` | Qwen3-Embedding-0.6B | 1024 | Apache-2.0 |
+| `local_qwen` | Qwen3-Embedding-4B | 1024 (MRL) | Apache-2.0 |
 
-The embedder id (incl. dim) is recorded in the index manifest, so search
-auto-selects the matching model and switching model re-indexes cleanly. Set the
-default for every command with `ENGRAM_PROFILE` (e.g. `ENGRAM_PROFILE=local_code_fast`).
-`bge-small` stays the default because it needs no GPU and no torch.
+The 4B's native 2560 dims are truncated to 1024 via Matryoshka (MRL) for index
+parity at <few % quality loss. The embedder id (incl. dim) is recorded in the
+index manifest, so search auto-selects the matching model and switching model
+re-indexes cleanly. Set the default for every command with `ENGRAM_PROFILE`
+(e.g. `ENGRAM_PROFILE=local_qwen`). `bge-small` stays the default because it
+needs no GPU and no torch.
+
+**Every model here is Apache-2.0 / MIT** — no non-commercial restrictions.
+
+### Behind a corporate TLS-inspecting proxy
+
+Model downloads go over HTTPS and verify certificates. On a corporate network
+whose proxy injects a self-signed root CA, Python's bundled `certifi` doesn't
+trust it (even though `curl`/the OS do) and the first download fails with
+`CERTIFICATE_VERIFY_FAILED`. Engram handles this automatically: by default it
+verifies against the **OS trust store** (`truststore`), where the corporate CA
+already lives. If you still hit issues:
+
+- point `SSL_CERT_FILE` at your corporate CA bundle (`.pem`) — Engram mirrors it
+  to `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` for every HTTP client;
+- disable the OS-trust path with `ENGRAM_SYSTEM_TRUST=0`;
+- last resort, on a trusted network: `ENGRAM_INSECURE_DOWNLOADS=1` skips
+  verification for downloads entirely.
 
 ## Retrieval quality
 
@@ -180,27 +198,27 @@ Search modes (`--mode`, default `auto`):
   `"file not found"`) to hybrid, and plain natural-language queries to vector.
 - **vector** — dense embedding similarity.
 - **hybrid** — vector + full-text (BM25), fused with reciprocal-rank fusion + symbol/path boosts.
-- **`--rerank`** — a local cross-encoder reranks the top candidates (needs `--extra code`).
+- **`--rerank`** — a local cross-encoder reranks the top candidates (needs `--extra gpu`).
 
 A built-in `eval` harness reports hit@1/5/10 + MRR **per query category** — that's how
 the defaults were chosen. On the bundled 50-query set, hybrid beats vector overall
-(hit@1 80% vs 72%), and swapping the CPU `bge-small` for the GPU code model
-`local_code_fast` (jina-code) lifts hit@1 to **88–90%**. Run `eval` on your own repo
-to tune for your codebase.
+(hit@1 80% vs 72%), and swapping the CPU `bge-small` for a GPU `local_qwen*`
+(Qwen3-Embedding) model lifts hit@1 further. Run `eval` on your own repo to tune
+for your codebase.
 
 ## Performance
 
 Cold indexing is bound by embedding throughput: ~21 chunks/s on CPU with the default
 model (a few minutes for a mid-size repo; ~15–35 min for 1–2M LOC). Re-indexing is
-near-free thanks to the content-hash cache. Code models are far stronger but ~20×
-slower on CPU — use a GPU for them.
+near-free thanks to the content-hash cache. The Qwen3 quality models are far
+stronger but much slower on CPU — use a GPU for them.
 
 ## Stack
 
 | Concern | Choice |
 |---|---|
 | Runtime | Python 3.12 via [`uv`](https://docs.astral.sh/uv/) |
-| Embedder | [FastEmbed](https://github.com/qdrant/fastembed) (`bge-small`, ONNX) · optional [sentence-transformers](https://www.sbert.net/) (jina-code / Qwen3) |
+| Embedder | [FastEmbed](https://github.com/qdrant/fastembed) (`bge`, ONNX) · optional [sentence-transformers](https://www.sbert.net/) (Qwen3-Embedding) |
 | Vector store | [LanceDB](https://lancedb.com/) (embedded, on-disk, vector + full-text) |
 | Chunker | tree-sitter — 11 languages (py/js/ts/tsx/go/rust/java/c/cpp/ruby/c#) · markdown by heading section · plain text by paragraph · line-window fallback |
 | Server | MCP Python SDK (FastMCP, stdio) |
@@ -211,7 +229,8 @@ slower on CPU — use a GPU for them.
 - ✅ Structure-aware prose: markdown split by heading section (breadcrumb → chunk symbol) + plain text packed by paragraph
 - ✅ Local embedding + LanceDB store + content-hash cache
 - ✅ Atomic full rebuild + incremental re-index + per-project lock
-- ✅ Embedder profiles: CPU/GPU FastEmbed + code-specialized (jina-code / Qwen3) via `--extra code`
+- ✅ Embedder profiles: no-torch FastEmbed (bge) + Qwen3-Embedding quality models via `--extra gpu`
+- ✅ TLS downloads work behind corporate MITM proxies (OS trust store by default)
 - ✅ Search modes auto / vector / hybrid + optional cross-encoder rerank
 - ✅ Per-category eval harness · `find_definition` symbol lookup
 - ✅ Async MCP server (index / status / search / find_definition / reindex_file / remove_project)
@@ -220,11 +239,10 @@ slower on CPU — use a GPU for them.
 ## Development
 
 ```bash
-uv run pytest -q          # 54 tests (+2 skip unless `--extra code` is installed)
+uv run pytest -q          # +2 tests skip unless `--extra gpu` is installed
 ```
 
 ## License
 
-[MIT](LICENSE). The optional embedding models you may download have their own
-licenses (jina-code: CC-BY-NC-4.0 — non-commercial; Qwen3: Apache-2.0) and matter
-only if you enable the `code` extra.
+[MIT](LICENSE). Engram itself and every embedding/reranker model it can download
+are MIT or Apache-2.0 — no non-commercial restrictions.

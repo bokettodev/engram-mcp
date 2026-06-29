@@ -175,7 +175,8 @@ async def index_project(
     Returns a job_id immediately. Poll index_status until status == 'done'
     (or 'error'). Incremental by default (only changed files are touched);
     pass full_rebuild=true to rebuild the whole index atomically. profile is
-    one of local_fast (CPU), local_gpu (CUDA), local_quality (bge-base).
+    one of local_fast (CPU, default), local_quality (bge-large), or the
+    Qwen3 quality profiles local_qwen_small / local_qwen (need the gpu extra).
     """
     return start_index_job(project_path, full_rebuild, profile)
 
@@ -244,6 +245,11 @@ register_tools(read_only_enabled())
 
 
 def main() -> None:
+    # Set up TLS trust (OS store / CA bundle / insecure) before the background
+    # index worker loads a model over HTTPS.
+    from engram_mcp.net import configure_tls
+
+    configure_tls()
     mcp.run()
 
 

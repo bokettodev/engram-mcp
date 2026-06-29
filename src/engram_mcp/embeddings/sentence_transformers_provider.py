@@ -1,9 +1,9 @@
-"""Code-specialized embedder via sentence-transformers (PyTorch, CUDA fp16).
+"""Quality embedder via sentence-transformers (PyTorch, CUDA fp16).
 
-This is the GPU/quality path (jina-code, Qwen3-Embedding, ...). It pulls torch,
-so it lives behind the optional ``code`` extra:
+This is the GPU/quality path (Qwen3-Embedding, ...). It pulls torch, so it lives
+behind the optional ``gpu`` extra:
 
-    uv sync --extra code        # installs sentence-transformers + torch
+    uv sync --extra gpu         # installs sentence-transformers + torch
 
 The model_id includes the model name + output dim so swapping model/dim
 invalidates the index + cache cleanly. CPU and GPU produce the same vectors, so
@@ -45,8 +45,8 @@ class SentenceTransformersProvider:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:  # pragma: no cover - depends on extra
             raise ImportError(
-                "the code-embedder profiles need the optional 'code' extra: "
-                "run `uv sync --extra code` (installs sentence-transformers + torch)"
+                "the Qwen3 quality profiles need the optional 'gpu' extra: "
+                "run `uv sync --extra gpu` (installs sentence-transformers + torch)"
             ) from exc
 
         self.model_name = model_name
