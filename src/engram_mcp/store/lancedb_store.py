@@ -30,6 +30,7 @@ class LanceStore:
                 ("language", pa.string()),
                 ("symbol", pa.string()),
                 ("symbol_kind", pa.string()),
+                ("chunk_role", pa.string()),
                 ("start_line", pa.int32()),
                 ("end_line", pa.int32()),
                 ("content", pa.string()),  # raw text for display
@@ -58,7 +59,7 @@ class LanceStore:
             tbl.add(rows)
             self.refresh_fts()
 
-    def refresh_fts(self, field: str = "search_text") -> None:
+    def refresh_fts(self, field: str = "search_text") -> str | None:
         """(Re)build the full-text index used by hybrid search."""
         if self.exists() and self.count() > 0:
             try:
@@ -66,23 +67,32 @@ class LanceStore:
                     field, replace=True, use_tantivy=False
                 )
             except Exception:
-                pass  # FTS is best-effort; vector search still works without it
+                return "full-text index refresh failed; vector search is still available"
+        return None
 
     def search_text(self, query: str, k: int = 8, where: str | None = None) -> list[dict]:
+        rows, _warning = self.search_text_with_status(query, k=k, where=where)
+        return rows
+
+    def search_text_with_status(
+        self, query: str, k: int = 8, where: str | None = None
+    ) -> tuple[list[dict], str | None]:
         if not self.exists():
-            return []
+            return [], "active LanceDB table is missing"
         try:
             q = self.db.open_table(self.table).search(query, query_type="fts").limit(k)
             if where:
                 q = q.where(where)
-            return q.to_list()
-        except Exception:
-            return []  # no FTS index yet -> caller falls back to vector-only
+            return q.to_list(), None
+        except Exception as exc:
+            return [], f"full-text search unavailable; degraded to vector search ({exc})"
 
     def add(self, rows: list[dict]) -> None:
         if not rows:
             return
-        self._open().add(rows)
+        tbl = self._open()
+        names = set(tbl.schema.names)
+        tbl.add([{k: v for k, v in row.items() if k in names} for row in rows])
 
     def delete_paths(self, rel_paths: list[str]) -> None:
         if not rel_paths or not self.exists():
@@ -128,6 +138,48 @@ class LanceStore:
             r.pop("vector", None)
             r.pop("search_text", None)
         return rows
+
+    def by_chunk_id(self, chunk_id: str) -> dict | None:
+        """Fetch one chunk by its stable chunk id."""
+        if not self.exists():
+            return None
+        safe = chunk_id.replace("'", "''")
+        try:
+            rows = self.db.open_table(self.table).search().where(
+                f"chunk_id = '{safe}'"
+            ).limit(1).to_list()
+        except Exception:
+            return None
+        if not rows:
+            return None
+        row = rows[0]
+        row.pop("vector", None)
+        row.pop("search_text", None)
+        return row
+
+    def symbol_inventory(self, k: int = 5000) -> list[dict]:
+        """Return lightweight symbol rows for near-miss suggestions."""
+        if not self.exists():
+            return []
+        try:
+            rows = self.db.open_table(self.table).search().where(
+                "symbol != ''"
+            ).limit(k).to_list()
+        except Exception:
+            return []
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "symbol": r.get("symbol") or "",
+                    "symbol_kind": r.get("symbol_kind") or "",
+                    "rel_path": r.get("rel_path") or "",
+                    "start_line": r.get("start_line"),
+                    "end_line": r.get("end_line"),
+                    "chunk_role": r.get("chunk_role") or "",
+                }
+            )
+        return out
 
     def search(self, vector: list[float], k: int = 8, where: str | None = None) -> list[dict]:
         if not self.exists():

@@ -71,6 +71,9 @@ PROSE_CHUNK_MAX_TOKENS = 480
 # header stands.)
 # v4: structure-aware prose chunking — markdown split by heading sections (the
 # heading breadcrumb becomes the chunk symbol) + plain text packed by paragraph.
+# chunk_role is stored for new rows and derived for old rows. It does not alter
+# chunk boundaries or embedded text, so it intentionally does not bump the
+# embedding-cache key.
 CHUNKER_VERSION = "4"
 
 # Default local embedder (FastEmbed / ONNX, bge-small-en-v1.5, 384-dim).

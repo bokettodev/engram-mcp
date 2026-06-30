@@ -85,6 +85,7 @@ def snapshot(job: JobState) -> dict:
         per_unit = elapsed / job.done_units
         eta = max(0.0, per_unit * (job.total_units - job.done_units))
     return {
+        "scope": "current_process",
         "job_id": job.job_id,
         "project_path": job.project_path,
         "status": job.status,

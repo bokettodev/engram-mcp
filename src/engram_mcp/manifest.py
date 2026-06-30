@@ -14,6 +14,8 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from engram_mcp import errors
+
 SCHEMA_VERSION = 2
 
 
@@ -60,6 +62,39 @@ def load_project(pdir: Path) -> ProjectManifest | None:
         data["active_table"] = "chunks"
     known = {fld.name for fld in dataclasses.fields(ProjectManifest)}
     return ProjectManifest(**{k: v for k, v in data.items() if k in known})
+
+
+def load_project_strict(pdir: Path) -> ProjectManifest | None:
+    """Load a project manifest, preserving parse/schema errors for callers."""
+
+    f = pdir / "project.json"
+    if not f.is_file():
+        return None
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise errors.EngramError(
+            f"could not read project manifest: {f}",
+            errors.E_INDEX_INVALID,
+            hint=str(exc),
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise errors.EngramError(
+            f"invalid project manifest JSON: {f}",
+            errors.E_INDEX_INVALID,
+            hint=str(exc),
+        ) from exc
+    if "active_table" not in data and (pdir / "lancedb").exists():
+        data["active_table"] = "chunks"
+    known = {fld.name for fld in dataclasses.fields(ProjectManifest)}
+    try:
+        return ProjectManifest(**{k: v for k, v in data.items() if k in known})
+    except TypeError as exc:
+        raise errors.EngramError(
+            f"invalid project manifest schema: {f}",
+            errors.E_INDEX_INVALID,
+            hint=str(exc),
+        ) from exc
 
 
 def save_project(pdir: Path, manifest: ProjectManifest) -> None:

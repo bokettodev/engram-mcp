@@ -86,7 +86,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     from engram_mcp.embeddings import factory
     from engram_mcp.pipeline import index_project
 
-    profile = args.profile or factory.DEFAULT_PROFILE
+    profile = args.profile or factory.default_index_profile()
     print(f"loading embedder ({profile}) ...", file=sys.stderr)
     provider = factory.make_provider(profile)
 
@@ -123,12 +123,15 @@ def cmd_find_def(args: argparse.Namespace) -> int:
 
     root = Path(args.path).resolve()
     try:
-        rows = find_definition(root, args.symbol)
+        out = find_definition(root, args.symbol, include_suggestions=True)
     except ProjectNotIndexedError:
         print(f'project not indexed: {root}\nrun: engram index "{root}"', file=sys.stderr)
         return 2
+    rows = out["results"]
     if not rows:
         print(f"no definition found for {args.symbol!r}")
+        if out["suggestions"]:
+            print("suggestions: " + ", ".join(s["symbol"] for s in out["suggestions"][:5]))
         return 0
     for r in rows:
         print(f"\n[{r['rel_path']}:{r['start_line']}-{r['end_line']}] "
@@ -141,10 +144,12 @@ def cmd_find_def(args: argparse.Namespace) -> int:
 def cmd_evaluate(args: argparse.Namespace) -> int:
     from engram_mcp import evaluate
     from engram_mcp.embeddings import factory
+    from engram_mcp.pipeline import load_query_index
 
     root = Path(args.path).resolve()
     cases = evaluate.load_cases(args.evalfile)
-    provider = factory.provider_for_project(root)
+    qi = load_query_index(root)
+    provider = factory.provider_for_model_id(qi.manifest.embedder_id)
     report = evaluate.run_evaluation(root, provider, cases, k=args.k, mode=args.mode, rerank=args.rerank)
     o = report.overall
     print(f"eval: {o.n} queries  mode={args.mode}  (mean {report.mean_latency_ms:.0f} ms)")
@@ -163,10 +168,11 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 def cmd_search(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     from engram_mcp.embeddings import factory
-    from engram_mcp.pipeline import ProjectNotIndexedError, search_project
+    from engram_mcp.pipeline import ProjectNotIndexedError, load_query_index, search_project
 
-    provider = factory.provider_for_project(root)
     try:
+        qi = load_query_index(root)
+        provider = factory.provider_for_model_id(qi.manifest.embedder_id)
         hits = search_project(root, provider, args.query, k=args.k, language=args.lang,
                               mode=args.mode, rerank=args.rerank)
     except ProjectNotIndexedError:
@@ -208,7 +214,8 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--profile", default=None,
                     choices=["local_fast", "local_quality",
                              "local_qwen_small", "local_qwen"],
-                    help="embedder profile (default $ENGRAM_PROFILE or local_fast; "
+                    help="embedder profile (default $ENGRAM_DEFAULT_INDEX_PROFILE, "
+                         "legacy $ENGRAM_PROFILE, or local_fast; "
                          "local_qwen* need `uv sync --extra gpu` + a GPU)")
     pi.set_defaults(func=cmd_index)
     pi.set_defaults(func=cmd_index)

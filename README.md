@@ -90,11 +90,12 @@ claude mcp add engram -- uv --directory /ABSOLUTE/PATH/TO/engram-mcp run engram-
 
 **Picking the model for the server.** The server defaults to `local_fast`
 (bge-small). To make it use another profile for *new* indexing, set
-`ENGRAM_PROFILE` in the server's env (this does **not** affect search over an
-existing index — that always uses the model recorded in the project's manifest):
+`ENGRAM_DEFAULT_INDEX_PROFILE` in the server's env. `ENGRAM_PROFILE` still works
+as a backwards-compatible alias. Neither affects search over an existing index:
+search always uses the model recorded in the project's manifest.
 
 ```bash
-claude mcp add engram -e ENGRAM_PROFILE=local_qwen -- \
+claude mcp add engram -e ENGRAM_DEFAULT_INDEX_PROFILE=local_qwen -- \
   uv --directory /ABSOLUTE/PATH/TO/engram-mcp run --extra gpu engram-mcp
 ```
 
@@ -108,11 +109,12 @@ claude mcp add engram -e ENGRAM_PROFILE=local_qwen -- \
   `uv --directory … run --no-sync engram-mcp`.
 
 **Read-only mode.** Set the env var `ENGRAM_READONLY=1` on the server and only the
-read tools (`search_code`, `find_definition`, `index_status`, `list_indexed_projects`)
-are registered — the mutating tools (`index_project`, `reindex_file`,
-`remove_project`) are withheld, so the client physically cannot alter an index.
-Indexing is then driven out-of-band via the `engram` CLI. Useful when handing the
-server to an agent while a separate process owns indexing:
+read tools (`search_code`, `get_chunk`, `find_definition`, `model_status`,
+`index_status`, `list_indexed_projects`, `server_info`) are registered. The
+mutating tools (`index_project`, `reindex_file`, `remove_project`) are withheld,
+so the client physically cannot alter an index. Indexing is then driven
+out-of-band via the `engram` CLI/operator. A missing index in read-only mode
+does not load or download a model.
 
 ```json
 {
@@ -131,18 +133,36 @@ tool call never blocks for minutes):
 | Tool | Purpose |
 |---|---|
 | `index_project(project_path, full_rebuild=False, profile=None)` | start a background index; returns `job_id` |
-| `index_status(job_id)` | progress snapshot (stage, counts, ETA) |
-| `search_code(project_path, query, k=8, language=None, mode="auto", rerank=False)` | ranked code chunks |
-| `find_definition(project_path, symbol)` | exact symbol definition lookup (no embedding) |
+| `index_status(job_id)` | current-process progress snapshot (stage, counts, ETA) |
+| `search_code(project_path, query, k=8, language=None, mode="auto", rerank=False, content="preview", max_chars_per_result=800, min_relevance=None)` | compact ranked hits over static indexed source |
+| `get_chunk(project_path, chunk_id, max_chars=None)` | fetch full content for one search hit |
+| `find_definition(project_path, symbol)` | exact symbol definition lookup, with suggestions on miss (no embedding) |
+| `model_status(project_path=None)` | reports whether the project's recorded query model is loaded/loading/not_loaded in this process |
 | `reindex_file(project_path, rel_path)` | incrementally re-index/drop one file |
 | `remove_project(project_path)` | delete a project's index |
-| `list_indexed_projects()` | on-disk index inventory |
+| `list_indexed_projects()` | on-disk index inventory, `data_home`, and broken manifest/table `errors[]` |
+| `server_info()` | data-home, read-only, and default index-profile diagnostics |
+
+`search_code` is a decision tool first: by default each hit contains `chunk_id`,
+`rel_path`/`span`, `symbol`, `symbol_kind`, `chunk_role`, `preview`, `raw_score`,
+`score_normalized`, `relevance` (`high|medium|low|uncertain`), `matched`,
+`match_reason`, `stale`, and `truncated`. It also returns `mode_requested`,
+`mode_used`, `warnings[]`, `rerank_applied`, `source_type:
+"static_indexed_source"`, and a `dirty` freshness summary. Use
+`content="none"` to get metadata only, `content="full"` for bounded inline text,
+or `get_chunk` for exact full content by `chunk_id`. `k` is bounded to `1..50`.
+
+All read-tool errors use a structural shape: `{ "error": "...", "code": "...",
+"hint": "..." }`. Codes include `E_PROJECT_NOT_INDEXED`, `E_INDEX_INVALID`,
+`E_UNKNOWN_PROFILE`, `E_EXTRA_MISSING`, `E_MODEL_LOAD_FAILED`,
+`E_MODEL_LOADING`, and `E_BAD_REQUEST`. TLS certificate download guidance is
+returned as the `hint` on `E_MODEL_LOAD_FAILED`.
 
 ## How it works
 
 ```
 walk (gitignore-aware, skips binary/generated)
-  → chunk by symbol via tree-sitter (+ line-window fallback)
+  → chunk by symbol (tree-sitter) · markdown heading section · prose paragraph (+ line-window fallback)
   → embed each chunk locally, with a "path / symbol / language" header
   → store vectors + metadata in LanceDB (+ a full-text index for hybrid search)
 
@@ -194,9 +214,9 @@ torch-free and CPU-only.
 The 4B's native 2560 dims are truncated to 1024 via Matryoshka (MRL) for index
 parity at <few % quality loss. The embedder id (incl. dim) is recorded in the
 index manifest, so search auto-selects the matching model and switching model
-re-indexes cleanly. Set the default for every command with `ENGRAM_PROFILE`
-(e.g. `ENGRAM_PROFILE=local_qwen`). `bge-small` stays the default because it
-needs no GPU and no torch.
+re-indexes cleanly. Set the index-time default with `ENGRAM_DEFAULT_INDEX_PROFILE`
+(or legacy `ENGRAM_PROFILE`), e.g. `ENGRAM_DEFAULT_INDEX_PROFILE=local_qwen`.
+`bge-small` stays the default because it needs no GPU and no torch.
 
 **Every model here is Apache-2.0 / MIT** — no non-commercial restrictions.
 
@@ -277,15 +297,17 @@ stronger but much slower on CPU — use a GPU for them.
 - ✅ Atomic full rebuild + incremental re-index + per-project lock
 - ✅ Embedder profiles: no-torch FastEmbed (bge) + Qwen3-Embedding quality models via `--extra gpu`
 - ✅ TLS downloads work behind corporate MITM proxies (OS trust store by default)
+- ✅ Bounded + reclaimed GPU memory (`ENGRAM_ST_BATCH_SIZE`, cache release after bulk index)
 - ✅ Search modes auto / vector / hybrid + optional cross-encoder rerank
-- ✅ Per-category eval harness · `find_definition` symbol lookup
-- ✅ Async MCP server (index / status / search / find_definition / reindex_file / remove_project)
-- ⏳ GPU-tuned serving · Merkle incremental · file-watching · job persistence
+- ✅ Per-category eval harness · `find_definition` (with miss suggestions)
+- ✅ Async MCP server: index / status / search / get_chunk / find_definition / model_status / reindex_file / remove_project / list / server_info
+- ✅ Agent-grade tool contract: hermetic reads (model from manifest), structured `E_*` errors, compact-first results + `get_chunk`, normalized score + relevance buckets, search-time freshness (`stale`), honest `mode_used`/`warnings`, `chunk_role`
+- ⏳ GPU-tuned serving · idle model unload · Merkle incremental · file-watching · durable job registry
 
 ## Development
 
 ```bash
-uv run pytest -q          # +2 tests skip unless `--extra gpu` is installed
+uv run --no-sync pytest -q          # +2 tests skip unless `--extra gpu` is installed
 ```
 
 ## License

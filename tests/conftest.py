@@ -10,6 +10,16 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_engram_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("ENGRAM_HOME", str(tmp_path / "home"))
+    from engram_mcp import paths
+
+    paths._reset_data_home_for_tests()
+    yield
+    paths._reset_data_home_for_tests()
+
+
 @pytest.fixture(scope="session")
 def provider():
     if os.environ.get("ENGRAM_SKIP_MODEL") == "1":

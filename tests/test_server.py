@@ -15,7 +15,10 @@ def test_tools_are_registered():
 
     tools = asyncio.run(server.mcp.list_tools())
     names = {t.name for t in tools}
-    assert {"index_project", "index_status", "search_code", "list_indexed_projects"} <= names
+    assert {
+        "index_project", "index_status", "search_code", "list_indexed_projects",
+        "get_chunk", "model_status", "server_info",
+    } <= names
 
 
 def test_read_only_mode_hides_mutating_tools(monkeypatch):
@@ -28,7 +31,10 @@ def test_read_only_mode_hides_mutating_tools(monkeypatch):
     importlib.reload(server_mod)
     try:
         names = {t.name for t in asyncio.run(server_mod.mcp.list_tools())}
-        assert {"search_code", "find_definition", "index_status", "list_indexed_projects"} <= names
+        assert {
+            "search_code", "find_definition", "get_chunk", "model_status",
+            "index_status", "list_indexed_projects", "server_info",
+        } <= names
         assert not ({"index_project", "reindex_file", "remove_project"} & names)
     finally:
         # restore the full tool surface for subsequent tests
@@ -41,7 +47,12 @@ def test_unknown_job_and_empty_list(tmp_path, monkeypatch):
 
     monkeypatch.setenv("ENGRAM_HOME", str(tmp_path / "home"))
     assert "error" in server.get_status("does-not-exist")
-    assert server.list_projects() == {"projects": []}
+    listed = server.list_projects()
+    assert listed["projects"] == []
+    assert listed["errors"] == []
+    assert listed["projects_empty"] is True
+    assert listed["home_exists"] is False
+    assert listed["data_home"] == str(tmp_path / "home")
 
 
 def test_bad_path_raises(tmp_path):

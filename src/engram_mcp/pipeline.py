@@ -13,10 +13,11 @@ from __future__ import annotations
 import shutil
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
 
-from engram_mcp import config, manifest, paths, retrieval
+from engram_mcp import config, errors, manifest, paths, retrieval
 from engram_mcp.embeddings.base import EmbeddingProvider
 from engram_mcp.embeddings.cache import EmbeddingCache
 from engram_mcp.indexing.chunker import chunk_file
@@ -45,6 +46,31 @@ class IndexStats:
     unchanged: int = 0
 
 
+@dataclass(slots=True)
+class QueryIndex:
+    root: Path
+    pdir: Path
+    manifest: manifest.ProjectManifest
+    store: LanceStore
+    count: int
+
+
+MAX_SEARCH_K = 50
+MAX_RERANK_CANDIDATES = 100
+
+_CONFIG_NAMES = {
+    ".env", ".env.example", ".gitignore", ".dockerignore",
+    "package.json", "pyproject.toml", "setup.cfg", "tox.ini",
+    "tsconfig.json", "vite.config.js", "webpack.config.js",
+}
+_CONFIG_EXTS = {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".lock"}
+_TEMPLATE_EXTS = {".html", ".htm", ".jinja", ".j2", ".twig", ".hbs", ".mustache"}
+_EXECUTABLE_KINDS = (
+    "function", "method", "class", "constructor", "interface", "type_alias",
+    "enum", "struct", "trait", "impl", "macro", "namespace", "module_declaration",
+)
+
+
 def _read_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
@@ -53,6 +79,131 @@ def _read_text(path: Path) -> str | None:
             return path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             return None
+
+
+def _norm_path_key(path: Path) -> str:
+    import os
+
+    return os.path.normcase(str(path.resolve()))
+
+
+def derive_chunk_role(
+    rel_path: str | None, language: str | None = None, symbol_kind: str | None = None
+) -> str:
+    """Classify a chunk into a coarse ranking/display role."""
+
+    rel = (rel_path or "").replace("\\", "/")
+    lower = rel.lower()
+    name = lower.rsplit("/", 1)[-1]
+    suffix = Path(name).suffix
+    lang = (language or "").lower()
+    kind = (symbol_kind or "").lower()
+
+    if name in _CONFIG_NAMES or suffix in _CONFIG_EXTS or "/.github/" in f"/{lower}":
+        return "config"
+    if (
+        "/test/" in f"/{lower}/"
+        or "/tests/" in f"/{lower}/"
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith(".test.js")
+        or name.endswith(".test.ts")
+        or name.endswith(".spec.js")
+        or name.endswith(".spec.ts")
+    ):
+        return "test"
+    if suffix in _TEMPLATE_EXTS or lang in {"html", "css"}:
+        return "template"
+    if kind in {"comment", "prose", "section", "file"} or lang in {"markdown", "text"}:
+        return "comment"
+    if any(token in kind for token in _EXECUTABLE_KINDS):
+        return "executable"
+    if kind == "module":
+        return "config" if suffix in _CONFIG_EXTS else "comment"
+    return "comment"
+
+
+def _ensure_chunk_role(row: dict) -> dict:
+    if row.get("chunk_role"):
+        return row
+    row["chunk_role"] = derive_chunk_role(
+        row.get("rel_path"), row.get("language"), row.get("symbol_kind")
+    )
+    return row
+
+
+def _validate_search_k(k: int) -> int:
+    if not isinstance(k, int) or not (1 <= k <= MAX_SEARCH_K):
+        raise ValueError(f"k must be between 1 and {MAX_SEARCH_K}")
+    return k
+
+
+def load_query_index(root: str | Path) -> QueryIndex:
+    """Validate a project's readable index before any model/provider load."""
+
+    root = Path(root).expanduser().resolve()
+    pdir = paths.project_dir(root, create=False)
+    if not pdir.exists():
+        raise ProjectNotIndexedError(f"project not indexed: {root}")
+    m = manifest.load_project_strict(pdir)
+    if m is None:
+        raise ProjectNotIndexedError(f"project not indexed: {root}")
+    problems: list[str] = []
+    if not m.active_table:
+        problems.append("active_table is missing")
+    if not m.embedder_id:
+        problems.append("embedder_id is missing")
+    if not isinstance(m.dim, int) or m.dim <= 0:
+        problems.append("dim must be > 0")
+    if m.chunker_version != config.CHUNKER_VERSION:
+        problems.append(
+            f"chunker_version {m.chunker_version!r} is incompatible with "
+            f"{config.CHUNKER_VERSION!r}"
+        )
+    if not m.root_path:
+        problems.append("root_path is missing")
+    else:
+        try:
+            if _norm_path_key(Path(m.root_path)) != _norm_path_key(root):
+                problems.append(f"root_path {m.root_path!r} does not match requested root")
+        except OSError:
+            problems.append(f"root_path {m.root_path!r} could not be resolved")
+    if problems:
+        raise errors.EngramError(
+            "invalid index manifest: " + "; ".join(problems),
+            errors.E_INDEX_INVALID,
+            hint="Rebuild the index with `engram index --rebuild <project_path>`.",
+        )
+
+    db_dir = pdir / "lancedb"
+    if not db_dir.exists():
+        raise errors.EngramError(
+            f"LanceDB directory is missing: {db_dir}",
+            errors.E_INDEX_INVALID,
+            hint="Rebuild the index with `engram index --rebuild <project_path>`.",
+        )
+    store = LanceStore(db_dir, m.dim, table=m.active_table or "chunks")
+    if not store.exists():
+        raise errors.EngramError(
+            f"active LanceDB table {m.active_table!r} is missing",
+            errors.E_INDEX_INVALID,
+            hint="Rebuild the index with `engram index --rebuild <project_path>`.",
+        )
+    try:
+        count = store.count()
+    except Exception as exc:
+        raise errors.EngramError(
+            f"active LanceDB table {m.active_table!r} could not be read",
+            errors.E_INDEX_INVALID,
+            hint=str(exc),
+        ) from exc
+    if count <= 0:
+        raise errors.EngramError(
+            f"active LanceDB table {m.active_table!r} is empty",
+            errors.E_INDEX_INVALID,
+            hint="Rebuild the index after adding indexable source files.",
+        )
+    return QueryIndex(root=root, pdir=pdir, manifest=m, store=store, count=count)
 
 
 def _search_text(c) -> str:
@@ -112,6 +263,7 @@ def _rows(chunks, search_texts, hashes, vec_by_hash, file_hash_by_path) -> list[
                 "language": c.language or "",
                 "symbol": c.symbol or "",
                 "symbol_kind": c.symbol_kind or "",
+                "chunk_role": derive_chunk_role(c.rel_path, c.language, c.symbol_kind),
                 "start_line": c.start_line,
                 "end_line": c.end_line,
                 "content": c.text,
@@ -331,6 +483,73 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
         return {"rel_path": rel, "action": action, "chunks": len(chunks)}
 
 
+def _freshness_for_hit(root: Path, files_meta: dict[str, dict], hit: dict) -> tuple[bool, str]:
+    rel = hit.get("rel_path") or ""
+    meta = files_meta.get(rel)
+    if not meta:
+        return True, "file is not present in files.json"
+    abs_path = root / rel
+    try:
+        st = abs_path.stat()
+    except OSError:
+        return True, "file is missing from the working tree"
+    if st.st_size == meta.get("size") and st.st_mtime_ns == meta.get("mtime_ns"):
+        return False, "mtime and size match the indexed file"
+    if st.st_size <= config.MAX_FILE_BYTES:
+        text = _read_text(abs_path)
+        if text is not None and sha256_text(text) == meta.get("file_hash"):
+            return False, "content hash matches despite metadata drift"
+    return True, "working-tree file differs from the indexed file"
+
+
+def _annotate_hits(
+    root: Path,
+    pdir: Path,
+    hits: list[dict],
+    query: str,
+    mode_used: str,
+    min_relevance: str | None,
+) -> tuple[list[dict], dict, dict]:
+    files_meta = manifest.load_files(pdir)
+    annotated: list[dict] = []
+    stale_paths: set[str] = set()
+    for rank, hit in enumerate(hits, 1):
+        h = _ensure_chunk_role(dict(hit))
+        raw = float(h.get("score", 0.0))
+        normalized = retrieval.normalize_score(
+            raw, mode_used, rank, reranked=bool(h.get("reranked"))
+        )
+        relevance = retrieval.relevance_bucket(normalized)
+        h["raw_score"] = raw
+        h["score"] = raw
+        h["score_normalized"] = normalized
+        h["relevance"] = relevance
+        h["matched"] = relevance in {"high", "medium"}
+        h["match_reason"] = retrieval.match_reason(h, query, mode_used)
+        stale, reason = _freshness_for_hit(root, files_meta, h)
+        h["stale"] = stale
+        h["freshness_reason"] = reason
+        if stale:
+            stale_paths.add(h.get("rel_path") or "")
+        if retrieval.relevance_at_least(relevance, min_relevance):
+            annotated.append(h)
+
+    dirty = {
+        "stale": bool(stale_paths),
+        "stale_results": len(stale_paths),
+        "stale_paths": sorted(p for p in stale_paths if p),
+    }
+    tail = {
+        "tail_weak": any(
+            h.get("relevance") in {"low", "uncertain"} for h in annotated[3:]
+        ),
+        "tail_weak_after_rank": 3 if len(annotated) > 3 else None,
+    }
+    if not tail["tail_weak"]:
+        tail["tail_weak_after_rank"] = None
+    return annotated, dirty, tail
+
+
 def search_project(
     root: str | Path,
     provider: EmbeddingProvider,
@@ -340,61 +559,163 @@ def search_project(
     mode: str = "auto",
     candidate_k: int = 50,
     rerank: bool = False,
-) -> list[dict]:
+    min_relevance: str | None = None,
+    return_meta: bool = False,
+) -> list[dict] | dict:
     root = Path(root).resolve()
+    k = _validate_search_k(k)
+    if not query or not query.strip():
+        raise ValueError("query must not be empty")
     if language is not None and not is_valid_language(language):
         raise ValueError(f"unknown language filter: {language!r}")
     if mode not in ("auto", "hybrid", "vector"):
         raise ValueError(f"unknown search mode: {mode!r}")
+    if min_relevance is not None and min_relevance not in retrieval.RELEVANCE_ORDER:
+        retrieval.relevance_at_least("low", min_relevance)  # raises the canonical message
     resolved_mode = retrieval.classify_query(query) if mode == "auto" else mode
-    pdir = paths.project_dir(root, create=False)
-    if not pdir.exists():
-        raise ProjectNotIndexedError(f"project not indexed: {root}")
-    m = manifest.load_project(pdir)
-    if m is None or not m.active_table:
-        raise ProjectNotIndexedError(f"project not indexed: {root}")
+    qi = load_query_index(root)
+    m = qi.manifest
     if m.embedder_id and m.embedder_id != provider.model_id:
         raise ValueError(
             f"index built with a different embedder ({m.embedder_id}); reindex with this profile"
         )
-    store = LanceStore(pdir / "lancedb", m.dim or provider.dim, table=m.active_table)
-    if store.count() == 0:
-        raise ProjectNotIndexedError(f"project not indexed: {root}")
+    if m.dim != provider.dim:
+        raise errors.EngramError(
+            f"index dimension {m.dim} does not match provider dimension {provider.dim}",
+            errors.E_INDEX_INVALID,
+            hint="Rebuild the index with the recorded embedder.",
+        )
 
     where = f"language = '{language}'" if language else None  # language is whitelisted above
     qv = provider.embed_queries([query])[0]
-    n = max(k, candidate_k) if rerank else k
+    candidate_k = max(k, min(candidate_k, MAX_RERANK_CANDIDATES))
+    n = candidate_k if rerank else k
+    warnings: list[str] = []
+    mode_used = resolved_mode
     if resolved_mode == "hybrid":
-        hits = retrieval.hybrid_search(store, query, qv, k=n, where=where, candidate_k=candidate_k)
+        hits, meta = retrieval.hybrid_search(
+            qi.store, query, qv, k=n, where=where, candidate_k=candidate_k, return_meta=True
+        )
+        warnings.extend(meta["warnings"])
+        mode_used = meta["mode_used"]
     else:
-        hits = store.search(qv, k=n, where=where)
+        hits = qi.store.search(qv, k=n, where=where)
         for h in hits:
-            h["score"] = -float(h.get("_distance", 0.0))
+            _ensure_chunk_role(h)
+            h["score"] = -float(h.get("_distance", 0.0)) + retrieval._role_boost(
+                h.get("chunk_role")
+            )
+        hits = sorted(hits, key=lambda h: h.get("score", 0.0), reverse=True)
+    rerank_applied = False
     if rerank:
         try:
             from engram_mcp.rerankers import get_reranker
 
             hits = get_reranker().rerank(query, hits, top_k=k)
-        except ImportError as exc:  # surface as the normal handled error shape
-            raise ValueError(str(exc)) from exc
-    return hits[:k]
+            rerank_applied = True
+        except ImportError as exc:
+            warnings.append(str(exc))
+            hits = hits[:k]
+    else:
+        hits = hits[:k]
+
+    annotated, dirty, tail = _annotate_hits(
+        root, qi.pdir, hits[:k], query, mode_used, min_relevance
+    )
+    if not return_meta:
+        return annotated
+    return {
+        "query": query,
+        "project_path": str(root),
+        "project_id": m.project_id,
+        "index_generation": m.generation,
+        "embedder_id": m.embedder_id,
+        "source_type": "static_indexed_source",
+        "mode_requested": mode,
+        "mode_used": mode_used,
+        "warnings": warnings,
+        "rerank_requested": rerank,
+        "rerank_applied": rerank_applied,
+        "dirty": dirty,
+        **tail,
+        "hits": annotated,
+    }
 
 
-def find_definition(root: str | Path, name: str, k: int = 20) -> list[dict]:
+def _symbol_suggestions(store: LanceStore, name: str, limit: int = 8) -> list[dict]:
+    needle = name.lower()
+    seen: set[str] = set()
+    suggestions: list[tuple[float, dict]] = []
+    for row in store.symbol_inventory():
+        sym = row.get("symbol") or ""
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        low = sym.lower()
+        leaf = low.rsplit(".", 1)[-1]
+        score = SequenceMatcher(None, needle, low).ratio()
+        if leaf.startswith(needle) or low.startswith(needle):
+            score += 0.45
+        elif needle in low:
+            score += 0.30
+        elif needle in leaf:
+            score += 0.20
+        if score < 0.45:
+            continue
+        item = dict(row)
+        item["score"] = round(min(score, 1.0), 3)
+        suggestions.append((score, item))
+    suggestions.sort(key=lambda x: (-x[0], x[1].get("symbol", "")))
+    return [s for _, s in suggestions[:limit]]
+
+
+def find_definition(
+    root: str | Path, name: str, k: int = 20, include_suggestions: bool = False
+) -> list[dict] | dict:
     """Exact symbol lookup (no embedding): definitions named `name` or `Parent.name`.
 
     Returns whole-symbol chunks (path + line range + content), preferring real
     definitions over module-level chunks.
     """
-    root = Path(root).resolve()
-    pdir = paths.project_dir(root, create=False)
-    m = manifest.load_project(pdir) if pdir.exists() else None
-    if m is None or not m.active_table:
-        raise ProjectNotIndexedError(f"project not indexed: {root}")
-    store = LanceStore(pdir / "lancedb", m.dim or 0, table=m.active_table)
-    rows = store.by_symbol(name, k=k)
+    if not name or not name.strip():
+        raise ValueError("symbol must not be empty")
+    qi = load_query_index(root)
+    rows = qi.store.by_symbol(name, k=k)
+    for row in rows:
+        _ensure_chunk_role(row)
     defs = [r for r in rows if r.get("symbol_kind") not in ("module", "file")]
-    return defs or rows
+    results = defs or rows
+    if not include_suggestions:
+        return results
+    return {
+        "symbol": name,
+        "project_path": str(qi.root),
+        "project_id": qi.manifest.project_id,
+        "source_type": "static_indexed_source",
+        "count": len(results),
+        "results": results,
+        "suggestions": [] if results else _symbol_suggestions(qi.store, name),
+    }
+
+
+def get_chunk(root: str | Path, chunk_id: str) -> dict:
+    """Fetch the full stored content for one chunk id."""
+
+    if not chunk_id or not chunk_id.strip():
+        raise ValueError("chunk_id must not be empty")
+    qi = load_query_index(root)
+    row = qi.store.by_chunk_id(chunk_id)
+    if row is None:
+        raise ValueError(f"unknown chunk_id: {chunk_id}")
+    _ensure_chunk_role(row)
+    stale, reason = _freshness_for_hit(qi.root, manifest.load_files(qi.pdir), row)
+    row["stale"] = stale
+    row["freshness_reason"] = reason
+    row["project_path"] = str(qi.root)
+    row["project_id"] = qi.manifest.project_id
+    row["index_generation"] = qi.manifest.generation
+    row["source_type"] = "static_indexed_source"
+    return row
 
 
 def remove_project(root: str | Path) -> bool:
