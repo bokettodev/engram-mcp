@@ -57,6 +57,7 @@ def _get_provider(profile: str = factory.DEFAULT_PROFILE):
 
 def _index_worker(job_id: str, project_path: str, full_rebuild: bool, profile: str) -> None:
     _registry.update(job_id, status="running", stage="loading-model", started_at=time.time())
+    provider = None
     try:
         provider = _get_provider(profile)
         _registry.update(job_id, stage="embedding")
@@ -79,6 +80,14 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, profile: s
         _registry.update(
             job_id, status="error", stage="error", error=repr(exc), finished_at=time.time()
         )
+    finally:
+        # Return the bulk-index activation high-water to the GPU (keeps the model
+        # warm). The model itself stays resident for fast subsequent search.
+        if provider is not None:
+            try:
+                provider.release_unused_cache()
+            except Exception:  # never let cleanup turn a finished job into a failure
+                pass
 
 
 # --- plain, testable logic (the MCP tools are thin wrappers over these) ---
@@ -105,6 +114,11 @@ def do_reindex_file(project_path: str, rel_path: str) -> dict:
         return _run_reindex_file(root, provider, rel_path)
     except (ProjectNotIndexedError, ValueError) as exc:
         return {"error": str(exc)}
+    finally:
+        try:
+            provider.release_unused_cache()
+        except Exception:
+            pass
 
 
 def do_remove_project(project_path: str) -> dict:

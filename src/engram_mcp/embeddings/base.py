@@ -17,3 +17,9 @@ class EmbeddingProvider(Protocol):
     def embed_passages(self, texts: Sequence[str]) -> list[list[float]]: ...
 
     def embed_queries(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+    def release_unused_cache(self) -> None:
+        """Return any GPU memory the backend holds but isn't using back to the
+        device (e.g. the activation high-water from a bulk index). Does NOT
+        unload the model. No-op for CPU/ONNX backends."""
+        ...

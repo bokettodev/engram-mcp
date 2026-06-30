@@ -94,6 +94,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"\rembedding {done}/{total} ...", end="", file=sys.stderr, flush=True)
 
     stats = index_project(root, provider, full_rebuild=args.rebuild, progress=_progress)
+    provider.release_unused_cache()  # return the bulk-index VRAM high-water
     print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
     print(f"root:            {root}")
     print(f"embedder:        {provider.model_id} (dim {provider.dim})")

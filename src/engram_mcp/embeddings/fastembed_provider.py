@@ -73,3 +73,7 @@ class FastEmbedProvider:
             return []
         with self._lock:
             return [v.tolist() for v in self._model.query_embed(list(texts))]
+
+    def release_unused_cache(self) -> None:
+        """No-op: FastEmbed/ONNX doesn't hold a PyTorch CUDA allocator cache."""
+        return

@@ -215,6 +215,27 @@ already lives. If you still hit issues:
 - last resort, on a trusted network: `ENGRAM_INSECURE_DOWNLOADS=1` skips
   verification for downloads entirely.
 
+### GPU memory (torch profiles)
+
+The `local_qwen*` profiles load the model into VRAM; the FastEmbed `local_*`
+profiles use ONNX and effectively no VRAM. A few things worth knowing for a
+GPU-shared, always-on server:
+
+- **One model copy per process.** Each MCP client (editor/agent window) spawns
+  its own stdio server process, and each loads its own copy of the model into
+  VRAM. N open clients on a Qwen profile ≈ N model copies. The no-VRAM
+  `local_fast` (bge, default) sidesteps this — keep it as the always-on default
+  and request a `local_qwen*` profile per index when you want the quality.
+- **A Qwen index pulls Qwen into search too:** search uses the model recorded in
+  the project's manifest, so searching a Qwen-indexed project loads Qwen even if
+  your default profile is bge.
+- **`ENGRAM_ST_BATCH_SIZE`** (default 16) caps the encode batch — the real lever
+  on activation VRAM during indexing. Lower it (e.g. 8) on a tight/shared GPU;
+  raise it for throughput on a dedicated one.
+- After a bulk index Engram returns the activation high-water to the GPU, but the
+  **model stays resident** for warm search latency — it's freed when the server
+  process exits (restart the client/server to reclaim it).
+
 ## Retrieval quality
 
 Search modes (`--mode`, default `auto`):

@@ -54,3 +54,21 @@ def test_make_provider_loads_and_reports_dim(provider):
     assert p.model_id == "fastembed:BAAI/bge-small-en-v1.5"
     # device-independent cache key (CPU/GPU must not invalidate)
     assert "cpu" not in p.model_id and "cuda" not in p.model_id
+
+
+def test_fastembed_release_unused_cache_is_noop(provider):
+    # FastEmbed has no torch CUDA cache; release must be a safe no-op.
+    factory.make_provider("local_fast").release_unused_cache()
+
+
+def test_st_batch_size_from_env(monkeypatch):
+    # Pure parsing — no model load (importing the module doesn't import torch/ST).
+    from engram_mcp.embeddings import sentence_transformers_provider as st
+
+    monkeypatch.delenv("ENGRAM_ST_BATCH_SIZE", raising=False)
+    assert st._env_batch_size() == st._DEFAULT_ST_BATCH
+    monkeypatch.setenv("ENGRAM_ST_BATCH_SIZE", "8")
+    assert st._env_batch_size() == 8
+    for bad in ("0", "-4", "abc", ""):
+        monkeypatch.setenv("ENGRAM_ST_BATCH_SIZE", bad)
+        assert st._env_batch_size() == st._DEFAULT_ST_BATCH
