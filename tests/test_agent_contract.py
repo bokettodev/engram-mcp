@@ -418,7 +418,7 @@ def test_gpu_index_job_success_parses_subprocess_json(tmp_path, monkeypatch):
            '"reused_unique": 0, "embedder_id": "fastembed:granite", "backend_id": "st:granite:cuda", '
            '"device": "cuda", "seconds": 0.1}')
     monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _FakeProc(out, 0))
-    server._index_worker(job.job_id, str(tmp_path), False, "cuda")
+    server._index_worker(job.job_id, str(tmp_path), False, "auto")  # auto also routes to the subprocess
     status = server.get_status(job.job_id)
     assert status["status"] == "done"
     assert status["chunks"] == 12

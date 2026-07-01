@@ -94,7 +94,9 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     provider = None
     try:
-        index_device = factory.resolve_index_device(gpu=args.gpu)
+        index_device = factory.resolve_index_device(
+            index_device=getattr(args, "index_device", None), gpu=args.gpu, cpu=args.cpu
+        )
         if not as_json:
             print(f"loading embedder (index device {index_device}) ...", file=sys.stderr)
         provider = factory.make_index_provider(index_device)
@@ -246,7 +248,11 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--rebuild", action="store_true",
                     help="force a full rebuild (atomic table swap) instead of incremental")
     pi.add_argument("--gpu", action="store_true",
-                    help="index with sentence-transformers on CUDA (needs `uv sync --extra gpu`); search remains FastEmbed CPU")
+                    help="force CUDA indexing (needs `uv sync --extra gpu`); errors if no GPU. Default already prefers GPU.")
+    pi.add_argument("--cpu", action="store_true",
+                    help="force CPU indexing — a slow fallback; only when you can't use a GPU")
+    pi.add_argument("--index-device", choices=["auto", "cpu", "cuda"], default=None,
+                    help=argparse.SUPPRESS)  # explicit setting; used by the MCP server subprocess
     pi.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # machine-readable; used by the MCP server's GPU subprocess
     pi.set_defaults(func=cmd_index)
 

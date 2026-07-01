@@ -74,16 +74,19 @@ def _get_provider(index_device: str | None = None):
     return factory.make_index_provider(index_device)
 
 
-def _gpu_index_subprocess(job_id: str, project_path: str, full_rebuild: bool) -> None:
-    """Run a CUDA index in a short-lived subprocess.
+def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, setting: str) -> None:
+    """Run a GPU/auto index in a short-lived subprocess.
 
     Keeps torch/CUDA out of the long-lived server process entirely: the child
-    initializes CUDA, indexes, writes the canonical FastEmbed manifest, and its
-    whole CUDA context is reclaimed when it exits — so the server stays 0-VRAM
-    even after GPU index jobs. Search never touches this path.
+    resolves the device (auto prefers GPU), initializes CUDA if used, indexes,
+    writes the canonical FastEmbed manifest, and its whole CUDA context is
+    reclaimed when it exits — so the server stays 0-VRAM even after GPU jobs.
+    Explicit CPU indexing runs in-process (it never touches CUDA); search never
+    touches this path.
     """
-    _registry.update(job_id, stage="embedding", index_device="cuda")
-    cmd = [sys.executable, "-m", "engram_mcp.cli", "index", project_path, "--gpu", "--json"]
+    _registry.update(job_id, stage="embedding", index_device=setting)
+    cmd = [sys.executable, "-m", "engram_mcp.cli", "index", project_path,
+           "--index-device", setting, "--json"]
     if full_rebuild:
         cmd.append("--rebuild")
     try:
@@ -120,6 +123,7 @@ def _gpu_index_subprocess(job_id: str, project_path: str, full_rebuild: bool) ->
         return
     _registry.update(
         job_id, status="done", stage="done", error=None, code=None, hint=None,
+        index_device=data.get("device") or setting,  # actual device the child used
         embedder_id=data.get("embedder_id"), backend_id=data.get("backend_id"),
         files=data.get("files"), chunks=data.get("chunks"),
         embedded=data.get("embedded_unique"), reused=data.get("reused_unique"),
@@ -135,9 +139,10 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
         index_device=index_device,
         started_at=time.time(),
     )
-    if index_device == "cuda":
-        # Isolate CUDA in a child process so the server keeps ~0 VRAM.
-        _gpu_index_subprocess(job_id, project_path, full_rebuild)
+    if index_device in ("cuda", "auto"):
+        # Isolate GPU/auto (which may load torch) in a child process so the
+        # long-lived server never initializes CUDA and stays ~0 VRAM.
+        _subprocess_index(job_id, project_path, full_rebuild, index_device)
         return
     provider = None
     try:
@@ -554,18 +559,21 @@ def do_server_info() -> dict:
 
 
 async def index_project(
-    project_path: str, full_rebuild: bool = False, gpu: bool = False
+    project_path: str, full_rebuild: bool = False, index_device: str | None = None
 ) -> dict:
     """Start a background index/re-index of a project directory.
 
     Returns a job_id immediately. Poll index_status until status == 'done'
     (or 'error'). Incremental by default (only changed files are touched);
-    pass full_rebuild=true to rebuild the whole index atomically. By default
-    indexing uses FastEmbed/ONNX on CPU. Pass gpu=true, or set
-    ENGRAM_INDEX_DEVICE=cuda, to index once with sentence-transformers on CUDA;
-    search still uses FastEmbed/ONNX on CPU.
+    pass full_rebuild=true to rebuild the whole index atomically.
+
+    index_device is "auto" (default): prefer a CUDA GPU (much faster), falling
+    back to CPU only when no GPU is available. Pass "cuda" to require the GPU
+    (errors if absent) or "cpu" to force the slow CPU fallback. Either way
+    search always uses FastEmbed/ONNX on CPU. GPU indexing runs in a short-lived
+    subprocess, so the server itself stays torch-free and ~0 VRAM.
     """
-    return start_index_job(project_path, full_rebuild, gpu)
+    return start_index_job(project_path, full_rebuild, index_device=index_device)
 
 
 async def index_status(job_id: str) -> dict:

@@ -21,7 +21,9 @@ embeddings and recalls it by meaning.)*
 ## Requirements
 
 - [**uv**](https://docs.astral.sh/uv/) — manages Python 3.12 + dependencies (the only thing you install globally).
-- *Optional:* an NVIDIA GPU, to speed up indexing with sentence-transformers. Search stays on CPU.
+- **Recommended:** an NVIDIA GPU + the `gpu` extra — indexing prefers CUDA by
+  default and is ~150× faster there. CPU indexing works but is a **slow
+  fallback**. Search always stays on CPU (no torch, ~0 VRAM).
 
 ## Quickstart
 
@@ -51,7 +53,7 @@ def request_with_retry(url, *, attempts=3, backoff=0.5):
 ## CLI
 
 ```bash
-uv run engram index    <path> [--rebuild] [--gpu]         # build / update the index
+uv run engram index    <path> [--rebuild] [--gpu|--cpu]   # build / update (defaults to GPU if available, else CPU)
 uv run engram search   <path> "<query>" -k 8 [--mode auto|vector|hybrid] [--rerank] [--lang py]
 uv run engram find-def <path> <symbol>                    # exact symbol definition lookup
 uv run engram eval     <path> evals/self.json [--mode M]  # measure retrieval quality
@@ -88,21 +90,25 @@ claude mcp add engram -- uv --directory /ABSOLUTE/PATH/TO/engram-mcp run engram-
 }
 ```
 
-**Picking the index backend for the server.** Engram has one embedder:
+**Indexing device on the server.** Engram has one embedder:
 `fastembed:ibm-granite/granite-embedding-97m-multilingual-r2` (384d). Search
-always uses FastEmbed/ONNX on CPU. Indexing also defaults to CPU; set
-`ENGRAM_INDEX_DEVICE=cuda` for new index jobs, or pass `gpu=true` to the MCP
-`index_project` tool, to use the sentence-transformers CUDA backend once.
+always uses FastEmbed/ONNX on CPU. **Indexing defaults to `auto` — it prefers a
+CUDA GPU and only falls back to CPU when none is available** (CPU indexing is a
+much slower fallback). The MCP `index_project` tool takes `index_device`
+(`"auto"` default, or `"cuda"` to require the GPU, or `"cpu"` to force the slow
+fallback); `ENGRAM_INDEX_DEVICE` sets the default. Launch with the `gpu` extra so
+the GPU path is available:
 
 ```bash
-claude mcp add engram -e ENGRAM_INDEX_DEVICE=cuda -- \
-  uv --directory /ABSOLUTE/PATH/TO/engram-mcp run --extra gpu engram-mcp
+claude mcp add engram -- \
+  uv --directory /ABSOLUTE/PATH/TO/engram-mcp run --no-sync --extra gpu engram-mcp
 ```
 
-- CUDA indexing needs the torch/sentence-transformers packages, so launch the
-  server with `run --extra gpu` (or pre-run `uv sync --extra gpu` once). Without
-  that extra, requesting CUDA fails explicitly. The default CPU index/search path
-  needs no torch and uses ~0 VRAM.
+- The GPU path needs the torch/sentence-transformers packages (`--extra gpu` /
+  `uv sync --extra gpu`). A GPU index job runs in a short-lived subprocess, so
+  the long-lived server never loads torch and stays ~0 VRAM even after GPU jobs.
+  Without the extra (or without a GPU) the default `auto` transparently uses the
+  CPU fallback; `index_device="cuda"` fails explicitly instead of falling back.
 - **Windows footgun:** if `uv run` reports `failed to remove … engram-mcp.exe …
   used by another process`, a previous server instance is holding the script
   while `uv` tries to re-sync. Launch with `run --no-sync` (use the already-set-up
@@ -133,7 +139,7 @@ tool call never blocks for minutes):
 
 | Tool | Purpose |
 |---|---|
-| `index_project(project_path, full_rebuild=False, gpu=False)` | start a background index; returns `job_id`; `gpu=true` uses CUDA indexing |
+| `index_project(project_path, full_rebuild=False, index_device=None)` | start a background index; returns `job_id`. `index_device`: `auto` (default, prefers GPU) / `cuda` (require GPU) / `cpu` (slow fallback) |
 | `index_status(job_id)` | current-process progress snapshot (stage, counts, ETA) |
 | `search_code(project_path, query, k=8, language=None, mode="auto", rerank=False, content="preview", max_chars_per_result=800, min_relevance=None)` | compact ranked hits over static indexed source |
 | `get_chunk(project_path, chunk_id, max_chars=None)` | fetch full content for one search hit |
@@ -188,23 +194,26 @@ Engram supports one embedder:
 
 | Model | Canonical id | Dim | Search backend | Index backend |
 |---|---|---:|---|---|
-| granite-embedding-97m-multilingual-r2 | `fastembed:ibm-granite/granite-embedding-97m-multilingual-r2` | 384 | FastEmbed/ONNX CPU | FastEmbed/ONNX CPU by default; sentence-transformers CUDA with `--gpu` |
+| granite-embedding-97m-multilingual-r2 | `fastembed:ibm-granite/granite-embedding-97m-multilingual-r2` | 384 | FastEmbed/ONNX CPU | sentence-transformers CUDA by default (auto); FastEmbed/ONNX CPU fallback |
 
 [Granite R2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2)
 (IBM, Apache-2.0) is multilingual (100+ languages incl. Russian) + code. The
 canonical `fastembed:` id is recorded in the index manifest and used in the
-embedding cache even when indexing was produced by the optional CUDA backend.
-That keeps search torch-free: a CUDA-built index is still queried with
-FastEmbed/ONNX on CPU.
+embedding cache even when indexing was produced by the CUDA backend (the ONNX
+and CUDA vectors match to cosine 0.99997). That keeps search torch-free: a
+CUDA-built index is still queried with FastEmbed/ONNX on CPU.
 
 ```bash
-uv run engram index <path>                 # CPU indexing, no torch
-uv run --extra gpu engram index <path> --gpu
-ENGRAM_INDEX_DEVICE=cuda uv run --extra gpu engram-mcp
+uv run --extra gpu engram index <path>        # default: GPU if available, else CPU
+uv run --extra gpu engram index <path> --gpu  # require GPU (error if none)
+uv run engram index <path> --cpu              # force the slow CPU fallback (no torch)
 ```
 
-CUDA indexing is explicit. If `sentence-transformers`/torch or CUDA is missing,
-Engram returns a structured error instead of silently falling back to CPU.
+The default `auto` prefers the GPU and quietly uses the CPU fallback when no
+usable CUDA GPU is present. Explicit `--gpu` / `index_device="cuda"` never falls
+back — if `sentence-transformers`/torch or CUDA is missing it returns a
+structured error, so a misconfigured "must be GPU" job fails loudly instead of
+silently crawling on CPU.
 
 ### Behind a corporate TLS-inspecting proxy
 
@@ -224,11 +233,12 @@ already lives. If you still hit issues:
 ### GPU memory
 
 Search never loads torch and uses **~0 VRAM**. The long-lived MCP server never
-initializes CUDA either: a `gpu=true` index job runs in a **short-lived
-subprocess** that loads Granite on CUDA, indexes, and exits — so its entire CUDA
-context (not just the model) is reclaimed when the job ends, and the server
-process itself stays torch-free at all times. From the CLI, `engram index --gpu`
-is likewise a single process that frees everything on exit.
+initializes CUDA either: a GPU index job (the default `auto` when a GPU is
+present, or explicit `cuda`) runs in a **short-lived subprocess** that loads
+Granite on CUDA, indexes, and exits — so its entire CUDA context (not just the
+model) is reclaimed when the job ends, and the server process itself stays
+torch-free at all times. From the CLI, `engram index` is likewise a single
+process that frees everything on exit.
 
 - **`ENGRAM_ST_BATCH_SIZE`** (default 16) caps the encode batch — the real lever
   on activation VRAM during indexing. Lower it (e.g. 8) on a tight/shared GPU;
@@ -251,10 +261,12 @@ A built-in `eval` harness reports hit@1/5/10 + MRR **per query category**. Run
 
 ## Performance
 
-Cold indexing is bound by embedding throughput. The CPU FastEmbed path is
-torch-free and cheap; `--gpu` switches only indexing to sentence-transformers on
-CUDA for much higher throughput. Re-indexing is near-free thanks to the
-content-hash cache.
+Cold indexing is bound by embedding throughput. By default it runs on the GPU
+(sentence-transformers/CUDA) at ~hundreds–1000 chunks/s; the CPU fallback is
+torch-free but far slower (single-digit to low-tens chunks/s), so it's a
+last-resort for machines without a GPU. Re-indexing is near-free thanks to the
+content-hash cache — only changed chunks are re-embedded. Search embeds one
+query on CPU and is always cheap.
 
 ## Stack
 

@@ -31,7 +31,7 @@ def _clear_loaded() -> None:
 def test_single_supported_embedder_constants():
     assert factory.GRANITE_MODEL == "ibm-granite/granite-embedding-97m-multilingual-r2"
     assert factory.CANONICAL_EMBEDDER_ID == f"fastembed:{factory.GRANITE_MODEL}"
-    assert factory.SUPPORTED_INDEX_DEVICES == ("cpu", "cuda")
+    assert factory.SUPPORTED_INDEX_DEVICES == ("auto", "cpu", "cuda")
 
 
 @pytest.mark.skipif(
@@ -134,17 +134,31 @@ def test_make_index_provider_cpu_uses_fastembed(monkeypatch):
     assert p.device == "cpu"
 
 
-def test_resolve_index_device_prefers_flag_over_env(monkeypatch):
+def test_resolve_index_device_default_is_auto_gpu_priority(monkeypatch):
     monkeypatch.delenv("ENGRAM_INDEX_DEVICE", raising=False)
-    assert factory.resolve_index_device() == "cpu"
+    assert factory.resolve_index_device() == "auto"          # GPU-priority default
     monkeypatch.setenv("ENGRAM_INDEX_DEVICE", "cuda")
     assert factory.resolve_index_device() == "cuda"
     monkeypatch.setenv("ENGRAM_INDEX_DEVICE", "cpu")
-    assert factory.resolve_index_device(gpu=True) == "cuda"
+    assert factory.resolve_index_device(gpu=True) == "cuda"   # flag beats env
+    assert factory.resolve_index_device(cpu=True) == "cpu"
+    with pytest.raises(errors.EngramError) as exc:
+        factory.resolve_index_device(gpu=True, cpu=True)
+    assert exc.value.code == errors.E_BAD_REQUEST
     monkeypatch.setenv("ENGRAM_INDEX_DEVICE", "bogus")
     with pytest.raises(errors.EngramError) as exc:
         factory.resolve_index_device()
     assert exc.value.code == errors.E_BAD_REQUEST
+
+
+def test_effective_index_device_prefers_gpu_falls_back_to_cpu(monkeypatch):
+    # "auto" resolves to cuda when a GPU is present, else cpu. Explicit passes through.
+    monkeypatch.setattr(factory, "_cuda_available", lambda: True)
+    assert factory.effective_index_device("auto") == "cuda"
+    monkeypatch.setattr(factory, "_cuda_available", lambda: False)
+    assert factory.effective_index_device("auto") == "cpu"
+    assert factory.effective_index_device("cuda") == "cuda"
+    assert factory.effective_index_device("cpu") == "cpu"
 
 
 def test_canonical_st_provider_identity_and_loaded_tracking(monkeypatch):
