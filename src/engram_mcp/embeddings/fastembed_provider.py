@@ -11,13 +11,47 @@ vectors for the same model, so switching device must NOT invalidate the cache.
 
 from __future__ import annotations
 
+import builtins
+import contextlib
 import logging
+import sys
 import threading
 from typing import Sequence
 
 from engram_mcp import config
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _utf8_text_open():
+    """Default encoding-less text ``open()`` to UTF-8 for the duration of the
+    block, on Windows only.
+
+    FastEmbed loads some model assets (e.g. Granite 311m's
+    ``tokenizer_config.json``) with the process default encoding, which is cp1252
+    on Windows and raises ``UnicodeDecodeError`` on UTF-8 content. UTF-8 mode
+    can't be toggled after interpreter start and re-exec is unsafe for the stdio
+    server, so we scope a minimal ``open`` shim to the model-load call. Binary
+    opens and explicit-encoding opens are untouched."""
+    if sys.platform != "win32" or sys.flags.utf8_mode:
+        yield
+        return
+    orig = builtins.open
+
+    def _patched(file, *args, **kwargs):
+        mode = kwargs.get("mode", args[0] if args else "r")
+        # inject only when the caller passed neither a binary mode nor an
+        # encoding (positionally: file, mode, buffering, encoding -> len<3).
+        if "b" not in mode and "encoding" not in kwargs and len(args) < 3:
+            kwargs["encoding"] = "utf-8"
+        return orig(file, *args, **kwargs)
+
+    builtins.open = _patched
+    try:
+        yield
+    finally:
+        builtins.open = orig
 
 
 # ONNX models not in FastEmbed's default catalog, registered on first use.
@@ -82,12 +116,14 @@ class FastEmbedProvider:
 
         kwargs = {"cuda": True} if self.device == "cuda" else {}
         try:
-            self._model = TextEmbedding(model_name, **kwargs)
+            with _utf8_text_open():
+                self._model = TextEmbedding(model_name, **kwargs)
         except Exception as exc:
             if self.device == "cuda":
                 logger.warning("CUDA embedder unavailable (%r); falling back to CPU", exc)
                 self.device = "cpu"
-                self._model = TextEmbedding(model_name)
+                with _utf8_text_open():
+                    self._model = TextEmbedding(model_name)
             else:
                 raise
 

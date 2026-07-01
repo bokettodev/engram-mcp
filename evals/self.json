@@ -1,58 +1,274 @@
 [
-  {"category": "nl", "query": "atomic table swap on a full rebuild", "expected_path": "engram_mcp/pipeline.py"},
-  {"category": "nl", "query": "acquire a per-project file lock for writers", "expected_path": "engram_mcp/paths.py"},
-  {"category": "nl", "query": "tree-sitter AST aware chunking of source code", "expected_path": "engram_mcp/indexing/chunker.py"},
-  {"category": "nl", "query": "global content hash embedding cache in sqlite", "expected_path": "engram_mcp/embeddings/cache.py"},
-  {"category": "nl", "query": "fuse vector and full text results with reciprocal rank fusion", "expected_path": "engram_mcp/retrieval.py"},
-  {"category": "nl", "query": "walk a project and prune ignored directories", "expected_path": "engram_mcp/indexing/walker.py"},
-  {"category": "nl", "query": "start a background indexing job and poll its status", "expected_path": "engram_mcp/server.py"},
-  {"category": "nl", "query": "local embedder profiles with optional GPU acceleration", "expected_path": "engram_mcp/embeddings/factory.py"},
-  {"category": "nl", "query": "lancedb table schema with a fixed size vector column", "expected_path": "engram_mcp/store/lancedb_store.py"},
-  {"category": "nl", "query": "write the project manifest json atomically", "expected_path": "engram_mcp/manifest.py"},
-  {"category": "nl", "query": "detect added changed and deleted files for incremental index", "expected_path": "engram_mcp/pipeline.py"},
-  {"category": "nl", "query": "skip generated or minified files", "expected_path": "engram_mcp/indexing/walker.py"},
-  {"category": "nl", "query": "measure retrieval quality with hit rate and mrr", "expected_path": "engram_mcp/evaluate.py"},
-  {"category": "nl", "query": "map a file extension to a programming language", "expected_path": "engram_mcp/indexing/languages.py"},
-  {"category": "nl", "query": "prepend a contextual header to the text before embedding", "expected_path": "engram_mcp/pipeline.py"},
-
-  {"category": "exact_symbol", "query": "EmbeddingCache", "expected_path": "engram_mcp/embeddings/cache.py", "expected_symbol": "EmbeddingCache"},
-  {"category": "exact_symbol", "query": "_search_text", "expected_path": "engram_mcp/pipeline.py", "expected_symbol": "_search_text"},
-  {"category": "exact_symbol", "query": "hybrid_search", "expected_path": "engram_mcp/retrieval.py", "expected_symbol": "hybrid_search"},
-  {"category": "exact_symbol", "query": "looks_generated", "expected_path": "engram_mcp/indexing/walker.py", "expected_symbol": "looks_generated"},
-  {"category": "exact_symbol", "query": "project_lock", "expected_path": "engram_mcp/paths.py", "expected_symbol": "project_lock"},
-  {"category": "exact_symbol", "query": "FastEmbedProvider", "expected_path": "engram_mcp/embeddings/fastembed_provider.py", "expected_symbol": "FastEmbedProvider"},
-  {"category": "exact_symbol", "query": "IgnoreMatcher", "expected_path": "engram_mcp/indexing/ignore.py", "expected_symbol": "IgnoreMatcher"},
-  {"category": "exact_symbol", "query": "ProjectManifest", "expected_path": "engram_mcp/manifest.py", "expected_symbol": "ProjectManifest"},
-  {"category": "exact_symbol", "query": "detect_language", "expected_path": "engram_mcp/indexing/languages.py", "expected_symbol": "detect_language"},
-  {"category": "exact_symbol", "query": "run_evaluation", "expected_path": "engram_mcp/evaluate.py", "expected_symbol": "run_evaluation"},
-
-  {"category": "partial_id", "query": "CHUNKER_VERSION", "expected_path": "engram_mcp/config.py"},
-  {"category": "partial_id", "query": "CUDAExecutionProvider", "expected_path": "engram_mcp/embeddings/fastembed_provider.py"},
-  {"category": "partial_id", "query": "chunks_g generation table name", "expected_path": "engram_mcp/pipeline.py"},
-  {"category": "partial_id", "query": "embedding_input_hash", "expected_path": "engram_mcp/indexing/hash.py"},
-  {"category": "partial_id", "query": "MAX_FILE_BYTES", "expected_path": "engram_mcp/config.py"},
-  {"category": "partial_id", "query": "DEFAULT_EXCLUDE_DIRS", "expected_path": "engram_mcp/config.py"},
-  {"category": "partial_id", "query": "EMBED_BATCH_SIZE", "expected_path": "engram_mcp/config.py"},
-
-  {"category": "error_string", "query": "project not indexed", "expected_path": "engram_mcp/pipeline.py"},
-  {"category": "error_string", "query": "unsupported embedder id", "expected_path": "engram_mcp/embeddings/factory.py"},
-  {"category": "error_string", "query": "path escapes project root", "expected_path": "engram_mcp/pipeline.py"},
-  {"category": "error_string", "query": "unknown search mode", "expected_path": "engram_mcp/pipeline.py"},
-  {"category": "error_string", "query": "unknown profile choices", "expected_paths": ["engram_mcp/embeddings/factory.py", "engram_mcp/server.py"]},
-
-  {"category": "path_tool", "query": "where command line subcommands are registered", "expected_path": "engram_mcp/cli.py"},
-  {"category": "path_tool", "query": "where tree-sitter parsers are constructed per language", "expected_path": "engram_mcp/indexing/languages.py"},
-  {"category": "path_tool", "query": "where the pyarrow vector schema is defined", "expected_path": "engram_mcp/store/lancedb_store.py"},
-  {"category": "path_tool", "query": "where the sqlite WAL pragma and busy timeout are set", "expected_path": "engram_mcp/embeddings/cache.py"},
-  {"category": "path_tool", "query": "where the MCP tools are registered with the server", "expected_path": "engram_mcp/server.py"},
-
-  {"category": "structural", "query": "who calls _embed", "expected_path": "engram_mcp/pipeline.py"},
-  {"category": "structural", "query": "where active_table is swapped to the new generation", "expected_path": "engram_mcp/pipeline.py"},
-  {"category": "structural", "query": "what builds or refreshes the full text search index", "expected_path": "engram_mcp/store/lancedb_store.py"},
-  {"category": "structural", "query": "where chunks are deleted by relative path", "expected_path": "engram_mcp/store/lancedb_store.py"},
-  {"category": "structural", "query": "what computes the per-chunk embedding cache key", "expected_path": "engram_mcp/indexing/hash.py"},
-
-  {"category": "ambiguous", "query": "where is the project write lock acquired or defined", "expected_paths": ["engram_mcp/paths.py", "engram_mcp/pipeline.py"]},
-  {"category": "ambiguous", "query": "how is the embedder model selected and constructed", "expected_paths": ["engram_mcp/embeddings/factory.py", "engram_mcp/embeddings/fastembed_provider.py"]},
-  {"category": "ambiguous", "query": "where are language filter ids validated", "expected_paths": ["engram_mcp/indexing/languages.py", "engram_mcp/pipeline.py"]}
+  {
+    "category": "nl",
+    "query": "atomic table swap on a full rebuild",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "nl",
+    "query": "acquire a per-project file lock for writers",
+    "expected_path": "src/engram_mcp/paths.py"
+  },
+  {
+    "category": "nl",
+    "query": "tree-sitter AST aware chunking of source code",
+    "expected_path": "src/engram_mcp/indexing/chunker.py"
+  },
+  {
+    "category": "nl",
+    "query": "global content hash embedding cache in sqlite",
+    "expected_path": "src/engram_mcp/embeddings/cache.py"
+  },
+  {
+    "category": "nl",
+    "query": "fuse vector and full text results with reciprocal rank fusion",
+    "expected_path": "src/engram_mcp/retrieval.py"
+  },
+  {
+    "category": "nl",
+    "query": "walk a project and prune ignored directories",
+    "expected_path": "src/engram_mcp/indexing/walker.py"
+  },
+  {
+    "category": "nl",
+    "query": "start a background indexing job and poll its status",
+    "expected_path": "src/engram_mcp/server.py"
+  },
+  {
+    "category": "nl",
+    "query": "local embedder profiles with optional GPU acceleration",
+    "expected_path": "src/engram_mcp/embeddings/factory.py"
+  },
+  {
+    "category": "nl",
+    "query": "lancedb table schema with a fixed size vector column",
+    "expected_path": "src/engram_mcp/store/lancedb_store.py"
+  },
+  {
+    "category": "nl",
+    "query": "write the project manifest json atomically",
+    "expected_path": "src/engram_mcp/manifest.py"
+  },
+  {
+    "category": "nl",
+    "query": "detect added changed and deleted files for incremental index",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "nl",
+    "query": "skip generated or minified files",
+    "expected_path": "src/engram_mcp/indexing/walker.py"
+  },
+  {
+    "category": "nl",
+    "query": "measure retrieval quality with hit rate and mrr",
+    "expected_path": "src/engram_mcp/evaluate.py"
+  },
+  {
+    "category": "nl",
+    "query": "map a file extension to a programming language",
+    "expected_path": "src/engram_mcp/indexing/languages.py"
+  },
+  {
+    "category": "nl",
+    "query": "prepend a contextual header to the text before embedding",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "EmbeddingCache",
+    "expected_path": "src/engram_mcp/embeddings/cache.py",
+    "expected_symbol": "EmbeddingCache"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "_search_text",
+    "expected_path": "src/engram_mcp/pipeline.py",
+    "expected_symbol": "_search_text"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "hybrid_search",
+    "expected_path": "src/engram_mcp/retrieval.py",
+    "expected_symbol": "hybrid_search"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "looks_generated",
+    "expected_path": "src/engram_mcp/indexing/walker.py",
+    "expected_symbol": "looks_generated"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "project_lock",
+    "expected_path": "src/engram_mcp/paths.py",
+    "expected_symbol": "project_lock"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "FastEmbedProvider",
+    "expected_path": "src/engram_mcp/embeddings/fastembed_provider.py",
+    "expected_symbol": "FastEmbedProvider"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "IgnoreMatcher",
+    "expected_path": "src/engram_mcp/indexing/ignore.py",
+    "expected_symbol": "IgnoreMatcher"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "ProjectManifest",
+    "expected_path": "src/engram_mcp/manifest.py",
+    "expected_symbol": "ProjectManifest"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "detect_language",
+    "expected_path": "src/engram_mcp/indexing/languages.py",
+    "expected_symbol": "detect_language"
+  },
+  {
+    "category": "exact_symbol",
+    "query": "run_evaluation",
+    "expected_path": "src/engram_mcp/evaluate.py",
+    "expected_symbol": "run_evaluation"
+  },
+  {
+    "category": "partial_id",
+    "query": "CHUNKER_VERSION",
+    "expected_path": "src/engram_mcp/config.py"
+  },
+  {
+    "category": "partial_id",
+    "query": "CUDAExecutionProvider",
+    "expected_path": "src/engram_mcp/embeddings/fastembed_provider.py"
+  },
+  {
+    "category": "partial_id",
+    "query": "chunks_g generation table name",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "partial_id",
+    "query": "embedding_input_hash",
+    "expected_path": "src/engram_mcp/indexing/hash.py"
+  },
+  {
+    "category": "partial_id",
+    "query": "MAX_FILE_BYTES",
+    "expected_path": "src/engram_mcp/config.py"
+  },
+  {
+    "category": "partial_id",
+    "query": "DEFAULT_EXCLUDE_DIRS",
+    "expected_path": "src/engram_mcp/config.py"
+  },
+  {
+    "category": "partial_id",
+    "query": "EMBED_BATCH_SIZE",
+    "expected_path": "src/engram_mcp/config.py"
+  },
+  {
+    "category": "error_string",
+    "query": "project not indexed",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "error_string",
+    "query": "unsupported embedder id",
+    "expected_path": "src/engram_mcp/embeddings/factory.py"
+  },
+  {
+    "category": "error_string",
+    "query": "path escapes project root",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "error_string",
+    "query": "unknown search mode",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "error_string",
+    "query": "unknown profile choices",
+    "expected_paths": [
+      "src/engram_mcp/embeddings/factory.py",
+      "src/engram_mcp/server.py"
+    ]
+  },
+  {
+    "category": "path_tool",
+    "query": "where command line subcommands are registered",
+    "expected_path": "src/engram_mcp/cli.py"
+  },
+  {
+    "category": "path_tool",
+    "query": "where tree-sitter parsers are constructed per language",
+    "expected_path": "src/engram_mcp/indexing/languages.py"
+  },
+  {
+    "category": "path_tool",
+    "query": "where the pyarrow vector schema is defined",
+    "expected_path": "src/engram_mcp/store/lancedb_store.py"
+  },
+  {
+    "category": "path_tool",
+    "query": "where the sqlite WAL pragma and busy timeout are set",
+    "expected_path": "src/engram_mcp/embeddings/cache.py"
+  },
+  {
+    "category": "path_tool",
+    "query": "where the MCP tools are registered with the server",
+    "expected_path": "src/engram_mcp/server.py"
+  },
+  {
+    "category": "structural",
+    "query": "who calls _embed",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "structural",
+    "query": "where active_table is swapped to the new generation",
+    "expected_path": "src/engram_mcp/pipeline.py"
+  },
+  {
+    "category": "structural",
+    "query": "what builds or refreshes the full text search index",
+    "expected_path": "src/engram_mcp/store/lancedb_store.py"
+  },
+  {
+    "category": "structural",
+    "query": "where chunks are deleted by relative path",
+    "expected_path": "src/engram_mcp/store/lancedb_store.py"
+  },
+  {
+    "category": "structural",
+    "query": "what computes the per-chunk embedding cache key",
+    "expected_path": "src/engram_mcp/indexing/hash.py"
+  },
+  {
+    "category": "ambiguous",
+    "query": "where is the project write lock acquired or defined",
+    "expected_paths": [
+      "src/engram_mcp/paths.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  },
+  {
+    "category": "ambiguous",
+    "query": "how is the embedder model selected and constructed",
+    "expected_paths": [
+      "src/engram_mcp/embeddings/factory.py",
+      "src/engram_mcp/embeddings/fastembed_provider.py"
+    ]
+  },
+  {
+    "category": "ambiguous",
+    "query": "where are language filter ids validated",
+    "expected_paths": [
+      "src/engram_mcp/indexing/languages.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  }
 ]

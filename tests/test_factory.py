@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 
 import pytest
 
@@ -27,6 +28,23 @@ def test_cpu_profiles_are_no_torch_fastembed():
     assert not any(
         tok in p for p in factory.PROFILES for tok in ("openai", "voyage", "cohere", "api")
     )
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or sys.flags.utf8_mode,
+    reason="the open() shim only applies on Windows without UTF-8 mode",
+)
+def test_utf8_text_open_defaults_encoding_to_utf8(tmp_path):
+    from engram_mcp.embeddings.fastembed_provider import _utf8_text_open
+
+    f = tmp_path / "cfg.json"
+    f.write_text("тест", encoding="utf-8")  # non-ASCII → cp1252 would misread/raise
+    with _utf8_text_open():
+        with open(f) as fh:  # no encoding passed → shim injects utf-8
+            assert fh.encoding.lower().replace("-", "") == "utf8"
+            assert fh.read() == "тест"
+    # binary + explicit-encoding opens are untouched, and open() is restored after
+    assert open is __import__("builtins").open
 
 
 def test_granite_custom_onnx_metadata():
