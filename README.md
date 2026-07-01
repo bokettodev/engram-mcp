@@ -186,10 +186,18 @@ partition is small.
 
 FastEmbed (ONNX, light, **no torch, no GPU needed**) — the default:
 
-| Profile | Model | Dim | Device |
-|---|---|---|---|
-| `local_fast` (default) | bge-small-en-v1.5 | 384 | CPU |
-| `local_quality` | bge-large-en-v1.5 | 1024 | CUDA if available |
+| Profile | Model | Dim | Lang | Device |
+|---|---|---|---|---|
+| `local_fast` (default) | bge-small-en-v1.5 | 384 | English | CPU |
+| `local_quality` | bge-large-en-v1.5 | 1024 | English | CUDA if available |
+| `local_granite` | granite-embedding-97m-multilingual-r2 | 384 | **multilingual + code** | CPU |
+| `local_granite_quality` | granite-embedding-311m-multilingual-r2 | 768 | **multilingual + code** | CPU |
+
+[Granite R2](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2)
+(IBM, Apache-2.0) covers 100+ languages **including Russian** plus code, runs on
+CPU/ONNX with **~0 VRAM**, and has a 32K context — the light everyday pick when
+several editor/agent windows each spawn their own server (see *GPU memory* below).
+The model is registered with FastEmbed on first use and downloaded once.
 
 Quality models (**GPU recommended**) — behind the optional `gpu` extra (pulls
 torch, ~2 GB). [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-4B)

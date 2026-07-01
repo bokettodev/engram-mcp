@@ -11,7 +11,18 @@ from engram_mcp.embeddings import factory
 
 def test_profiles_include_fastembed_and_qwen_all_local():
     assert {"local_fast", "local_quality"} <= set(factory.PROFILES)
+    assert {"local_granite", "local_granite_quality"} <= set(factory.PROFILES)
     assert {"local_qwen_small", "local_qwen"} <= set(factory.PROFILES)
+
+
+def test_granite_profiles_are_no_torch_fastembed():
+    # Granite runs on the FastEmbed (ONNX) path, so it needs no `gpu` extra.
+    from engram_mcp.embeddings import fastembed_provider as fe
+
+    for name in ("local_granite", "local_granite_quality"):
+        model_name, device = factory._FASTEMBED[name]
+        assert model_name in fe._CUSTOM_ONNX
+        assert device == "cpu"
     # all local — no cloud/api profile leaked in
     assert not any(
         tok in p for p in factory.PROFILES for tok in ("openai", "voyage", "cohere", "api")

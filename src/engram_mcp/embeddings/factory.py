@@ -3,8 +3,11 @@
 All profiles are LOCAL (no cloud API) and Apache-2.0 / MIT licensed. Two backends:
 
   FastEmbed (ONNX, light, no torch) — the default / no-GPU path:
-    local_fast     - bge-small-en-v1.5 (384d) CPU. Default.
-    local_quality  - bge-large-en-v1.5 (1024d), CUDA if available.
+    local_fast     - bge-small-en-v1.5 (384d) CPU. Default. English.
+    local_quality  - bge-large-en-v1.5 (1024d), CUDA if available. English.
+    local_granite  - granite-embedding-97m-multilingual-r2 (384d) CPU.
+                     Multilingual (incl. Russian) + code, Apache-2.0, ~0 VRAM.
+    local_granite_quality - granite-embedding-311m-multilingual-r2 (768d) CPU.
 
   sentence-transformers (torch, GPU-recommended) — the quality path, behind the
   optional `gpu` extra (`uv sync --extra gpu`). Qwen3-Embedding tops MTEB on
@@ -29,6 +32,10 @@ from engram_mcp.embeddings.fastembed_provider import FastEmbedProvider
 _FASTEMBED: dict[str, tuple[str, str]] = {
     "local_fast": ("BAAI/bge-small-en-v1.5", "cpu"),
     "local_quality": ("BAAI/bge-large-en-v1.5", "auto"),
+    # Granite R2 (ONNX, no torch): multilingual (incl. Russian) + code, Apache-2.0,
+    # ~0 VRAM — the light everyday pick when many chats each spawn a server.
+    "local_granite": ("ibm-granite/granite-embedding-97m-multilingual-r2", "cpu"),
+    "local_granite_quality": ("ibm-granite/granite-embedding-311m-multilingual-r2", "cpu"),
 }
 
 # name -> (model_name, device, truncate_dim, query_prompt, passage_prompt)

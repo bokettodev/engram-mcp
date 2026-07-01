@@ -213,9 +213,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="force a full rebuild (atomic table swap) instead of incremental")
     pi.add_argument("--profile", default=None,
                     choices=["local_fast", "local_quality",
+                             "local_granite", "local_granite_quality",
                              "local_qwen_small", "local_qwen"],
                     help="embedder profile (default $ENGRAM_DEFAULT_INDEX_PROFILE, "
                          "legacy $ENGRAM_PROFILE, or local_fast; "
+                         "local_granite* = no-torch multilingual+code; "
                          "local_qwen* need `uv sync --extra gpu` + a GPU)")
     pi.set_defaults(func=cmd_index)
     pi.set_defaults(func=cmd_index)

@@ -20,6 +20,36 @@ from engram_mcp import config
 logger = logging.getLogger(__name__)
 
 
+# ONNX models not in FastEmbed's default catalog, registered on first use.
+# Granite R2 is multilingual (100+ langs incl. Russian) + code, Apache-2.0, CLS
+# pooling — a no-torch, ~0-VRAM alternative to the Qwen torch profiles, which
+# matters when many MCP clients each run their own server process.
+_CUSTOM_ONNX: dict[str, dict] = {
+    "ibm-granite/granite-embedding-97m-multilingual-r2": {"pooling": "CLS", "dim": 384},
+    "ibm-granite/granite-embedding-311m-multilingual-r2": {"pooling": "CLS", "dim": 768},
+}
+
+
+def _ensure_custom_registered(model_name: str) -> None:
+    """Register a known custom ONNX model with FastEmbed (idempotent, no download)."""
+    spec = _CUSTOM_ONNX.get(model_name)
+    if spec is None:
+        return
+    from fastembed import TextEmbedding
+
+    if any(m["model"] == model_name for m in TextEmbedding.list_supported_models()):
+        return
+    from fastembed.common.model_description import ModelSource, PoolingType
+
+    TextEmbedding.add_custom_model(
+        model=model_name,
+        pooling=PoolingType[spec["pooling"]],
+        normalization=True,
+        sources=ModelSource(hf=model_name),
+        dim=spec["dim"],
+    )
+
+
 def _resolve_device(device: str) -> str:
     if device != "auto":
         return device
@@ -37,6 +67,7 @@ class FastEmbedProvider:
     def __init__(self, model_name: str = config.DEFAULT_EMBED_MODEL, device: str = "cpu"):
         from fastembed import TextEmbedding
 
+        _ensure_custom_registered(model_name)
         self.model_name = model_name
         self.model_id = f"fastembed:{model_name}"  # device-independent cache key
         self.device = _resolve_device(device)
