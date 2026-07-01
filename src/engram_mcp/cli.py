@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from collections import Counter
@@ -78,9 +79,13 @@ def cmd_chunk(args: argparse.Namespace) -> int:
 
 
 def cmd_index(args: argparse.Namespace) -> int:
+    as_json = getattr(args, "json", False)
     root = Path(args.path).resolve()
     if not root.is_dir():
-        print(f"error: not a directory: {root}", file=sys.stderr)
+        if as_json:
+            print(json.dumps({"ok": False, "error": f"not a directory: {root}", "code": "E_BAD_REQUEST"}))
+        else:
+            print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
     # Imported lazily so `chunk` doesn't pay the embedder import cost.
     from engram_mcp import errors
@@ -90,13 +95,27 @@ def cmd_index(args: argparse.Namespace) -> int:
     provider = None
     try:
         index_device = factory.resolve_index_device(gpu=args.gpu)
-        print(f"loading embedder (index device {index_device}) ...", file=sys.stderr)
+        if not as_json:
+            print(f"loading embedder (index device {index_device}) ...", file=sys.stderr)
         provider = factory.make_index_provider(index_device)
 
         def _progress(done: int, total: int) -> None:
-            print(f"\rembedding {done}/{total} ...", end="", file=sys.stderr, flush=True)
+            if not as_json:
+                print(f"\rembedding {done}/{total} ...", end="", file=sys.stderr, flush=True)
 
         stats = index_project(root, provider, full_rebuild=args.rebuild, progress=_progress)
+        if as_json:
+            # machine-readable result (used when the MCP server runs a GPU index
+            # in this short-lived subprocess so its own CUDA context fully exits).
+            print(json.dumps({
+                "ok": True, "mode": stats.mode, "files": stats.files, "chunks": stats.chunks,
+                "embedded_unique": stats.embedded_unique, "reused_unique": stats.reused_unique,
+                "added": stats.added, "changed": stats.changed, "deleted": stats.deleted,
+                "unchanged": stats.unchanged, "embedder_id": provider.model_id,
+                "backend_id": provider.backend_id, "device": provider.device,
+                "seconds": stats.seconds,
+            }))
+            return 0
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
         print(f"root:            {root}")
         print(f"embedder:        {provider.model_id} (dim {provider.dim})")
@@ -112,9 +131,12 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"index time:      {stats.seconds:.2f}s ({stats.chunks_per_sec:.0f} chunks/s)")
         return 0
     except errors.EngramError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        if exc.hint:
-            print(f"hint: {exc.hint}", file=sys.stderr)
+        if as_json:
+            print(json.dumps({"ok": False, "error": str(exc), "code": exc.code, "hint": exc.hint}))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+            if exc.hint:
+                print(f"hint: {exc.hint}", file=sys.stderr)
         return 2
     finally:
         if provider is not None:
@@ -225,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="force a full rebuild (atomic table swap) instead of incremental")
     pi.add_argument("--gpu", action="store_true",
                     help="index with sentence-transformers on CUDA (needs `uv sync --extra gpu`); search remains FastEmbed CPU")
+    pi.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # machine-readable; used by the MCP server's GPU subprocess
     pi.set_defaults(func=cmd_index)
 
     prm = sub.add_parser("remove", help="delete a project's index from disk")

@@ -30,6 +30,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
@@ -72,6 +74,59 @@ def _get_provider(index_device: str | None = None):
     return factory.make_index_provider(index_device)
 
 
+def _gpu_index_subprocess(job_id: str, project_path: str, full_rebuild: bool) -> None:
+    """Run a CUDA index in a short-lived subprocess.
+
+    Keeps torch/CUDA out of the long-lived server process entirely: the child
+    initializes CUDA, indexes, writes the canonical FastEmbed manifest, and its
+    whole CUDA context is reclaimed when it exits — so the server stays 0-VRAM
+    even after GPU index jobs. Search never touches this path.
+    """
+    _registry.update(job_id, stage="embedding", index_device="cuda")
+    cmd = [sys.executable, "-m", "engram_mcp.cli", "index", project_path, "--gpu", "--json"]
+    if full_rebuild:
+        cmd.append("--rebuild")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception as exc:
+        _registry.update(
+            job_id, status="error", stage="error",
+            error=f"failed to launch GPU index subprocess: {exc!r}",
+            code=errors.E_MODEL_LOAD_FAILED, finished_at=time.time(),
+        )
+        return
+    data = None
+    for line in reversed((proc.stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                data = json.loads(line)
+                break
+            except ValueError:
+                continue
+    if data is None:
+        _registry.update(
+            job_id, status="error", stage="error",
+            error=f"GPU index subprocess produced no result (exit {proc.returncode})",
+            hint=(proc.stderr or "")[-500:] or None,
+            code=errors.E_MODEL_LOAD_FAILED, finished_at=time.time(),
+        )
+        return
+    if not data.get("ok"):
+        _registry.update(
+            job_id, status="error", stage="error", error=data.get("error"),
+            code=data.get("code"), hint=data.get("hint"), finished_at=time.time(),
+        )
+        return
+    _registry.update(
+        job_id, status="done", stage="done", error=None, code=None, hint=None,
+        embedder_id=data.get("embedder_id"), backend_id=data.get("backend_id"),
+        files=data.get("files"), chunks=data.get("chunks"),
+        embedded=data.get("embedded_unique"), reused=data.get("reused_unique"),
+        finished_at=time.time(),
+    )
+
+
 def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_device: str) -> None:
     _registry.update(
         job_id,
@@ -80,6 +135,10 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
         index_device=index_device,
         started_at=time.time(),
     )
+    if index_device == "cuda":
+        # Isolate CUDA in a child process so the server keeps ~0 VRAM.
+        _gpu_index_subprocess(job_id, project_path, full_rebuild)
+        return
     provider = None
     try:
         provider = _get_provider(index_device)

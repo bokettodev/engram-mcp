@@ -223,15 +223,18 @@ already lives. If you still hit issues:
 
 ### GPU memory
 
-Search never loads torch and uses ~0 VRAM. CUDA indexing loads Granite through
-sentence-transformers only for the duration of the index job, then unloads the
-model and empties the CUDA cache.
+Search never loads torch and uses **~0 VRAM**. The long-lived MCP server never
+initializes CUDA either: a `gpu=true` index job runs in a **short-lived
+subprocess** that loads Granite on CUDA, indexes, and exits — so its entire CUDA
+context (not just the model) is reclaimed when the job ends, and the server
+process itself stays torch-free at all times. From the CLI, `engram index --gpu`
+is likewise a single process that frees everything on exit.
 
-- **`ENGRAM_ST_BATCH_SIZE`** (default 16) caps the encode batch - the real lever
+- **`ENGRAM_ST_BATCH_SIZE`** (default 16) caps the encode batch — the real lever
   on activation VRAM during indexing. Lower it (e.g. 8) on a tight/shared GPU;
   raise it for throughput on a dedicated one.
-- Each MCP client still has its own process, but CUDA memory is consumed only
-  while that process is actively running a GPU index job.
+- VRAM is held only for the duration of a GPU index job, by the child process,
+  never by the always-on search server.
 
 ## Retrieval quality
 

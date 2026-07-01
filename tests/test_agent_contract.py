@@ -373,7 +373,8 @@ def test_manifest_compat_uses_canonical_model_id():
     assert _is_compatible(m, CanonicalProvider())
 
 
-def test_index_job_errors_are_structured(tmp_path, monkeypatch):
+def test_cpu_index_job_errors_are_structured(tmp_path, monkeypatch):
+    # The CPU (in-process) path structures a provider-construction failure.
     from engram_mcp import server
 
     job = server._registry.create(str(tmp_path))
@@ -382,9 +383,43 @@ def test_index_job_errors_are_structured(tmp_path, monkeypatch):
         raise errors.EngramError("missing extra", errors.E_EXTRA_MISSING, hint="install gpu")
 
     monkeypatch.setattr(server, "_get_provider", fail)
-    server._index_worker(job.job_id, str(tmp_path), False, "cuda")
+    server._index_worker(job.job_id, str(tmp_path), False, "cpu")
     status = server.get_status(job.job_id)
     assert status["status"] == "error"
     assert status["error"] == "missing extra"
     assert status["code"] == errors.E_EXTRA_MISSING
     assert status["hint"] == "install gpu"
+
+
+class _FakeProc:
+    def __init__(self, stdout="", returncode=0, stderr=""):
+        self.stdout, self.returncode, self.stderr = stdout, returncode, stderr
+
+
+def test_gpu_index_job_error_from_subprocess_is_structured(tmp_path, monkeypatch):
+    # CUDA jobs run in a subprocess; its JSON error must surface in job status.
+    from engram_mcp import server
+
+    job = server._registry.create(str(tmp_path))
+    out = '{"ok": false, "error": "missing extra", "code": "E_EXTRA_MISSING", "hint": "install gpu"}'
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _FakeProc(out, 2))
+    server._index_worker(job.job_id, str(tmp_path), False, "cuda")
+    status = server.get_status(job.job_id)
+    assert status["status"] == "error"
+    assert status["code"] == errors.E_EXTRA_MISSING
+    assert status["hint"] == "install gpu"
+
+
+def test_gpu_index_job_success_parses_subprocess_json(tmp_path, monkeypatch):
+    from engram_mcp import server
+
+    job = server._registry.create(str(tmp_path))
+    out = ('{"ok": true, "mode": "full", "files": 3, "chunks": 12, "embedded_unique": 12, '
+           '"reused_unique": 0, "embedder_id": "fastembed:granite", "backend_id": "st:granite:cuda", '
+           '"device": "cuda", "seconds": 0.1}')
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _FakeProc(out, 0))
+    server._index_worker(job.job_id, str(tmp_path), False, "cuda")
+    status = server.get_status(job.job_id)
+    assert status["status"] == "done"
+    assert status["chunks"] == 12
+    assert status["embedder_id"] == "fastembed:granite"
