@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Quality embedders (Qwen3-Embedding) + cross-encoder reranker run on torch.
+# CUDA indexing via sentence-transformers + optional cross-encoder reranker.
 # Heavy (~2GB) + GPU-recommended, so opt-in: `uv sync --extra gpu`.
 gpu = [
     "sentence-transformers>=3.0.0",

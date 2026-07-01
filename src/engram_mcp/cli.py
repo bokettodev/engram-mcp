@@ -83,30 +83,42 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
     # Imported lazily so `chunk` doesn't pay the embedder import cost.
+    from engram_mcp import errors
     from engram_mcp.embeddings import factory
     from engram_mcp.pipeline import index_project
 
-    profile = args.profile or factory.default_index_profile()
-    print(f"loading embedder ({profile}) ...", file=sys.stderr)
-    provider = factory.make_provider(profile)
+    provider = None
+    try:
+        index_device = factory.resolve_index_device(gpu=args.gpu)
+        print(f"loading embedder (index device {index_device}) ...", file=sys.stderr)
+        provider = factory.make_index_provider(index_device)
 
-    def _progress(done: int, total: int) -> None:
-        print(f"\rembedding {done}/{total} ...", end="", file=sys.stderr, flush=True)
+        def _progress(done: int, total: int) -> None:
+            print(f"\rembedding {done}/{total} ...", end="", file=sys.stderr, flush=True)
 
-    stats = index_project(root, provider, full_rebuild=args.rebuild, progress=_progress)
-    provider.release_unused_cache()  # return the bulk-index VRAM high-water
-    print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
-    print(f"root:            {root}")
-    print(f"embedder:        {provider.model_id} (dim {provider.dim})")
-    print(f"mode:            {stats.mode}")
-    if stats.mode == "incremental":
-        print(f"changes:         +{stats.added} ~{stats.changed} -{stats.deleted}  (unchanged {stats.unchanged})")
-    print(f"files:           {stats.files}")
-    print(f"chunks:          {stats.chunks}")
-    print(f"embedded (new):  {stats.embedded_unique}")
-    print(f"reused (cache):  {stats.reused_unique}")
-    print(f"index time:      {stats.seconds:.2f}s ({stats.chunks_per_sec:.0f} chunks/s)")
-    return 0
+        stats = index_project(root, provider, full_rebuild=args.rebuild, progress=_progress)
+        print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
+        print(f"root:            {root}")
+        print(f"embedder:        {provider.model_id} (dim {provider.dim})")
+        print(f"index backend:   {provider.backend_id}")
+        print(f"index device:    {provider.device}")
+        print(f"mode:            {stats.mode}")
+        if stats.mode == "incremental":
+            print(f"changes:         +{stats.added} ~{stats.changed} -{stats.deleted}  (unchanged {stats.unchanged})")
+        print(f"files:           {stats.files}")
+        print(f"chunks:          {stats.chunks}")
+        print(f"embedded (new):  {stats.embedded_unique}")
+        print(f"reused (cache):  {stats.reused_unique}")
+        print(f"index time:      {stats.seconds:.2f}s ({stats.chunks_per_sec:.0f} chunks/s)")
+        return 0
+    except errors.EngramError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        if exc.hint:
+            print(f"hint: {exc.hint}", file=sys.stderr)
+        return 2
+    finally:
+        if provider is not None:
+            factory.release_index_provider(provider)
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
@@ -211,14 +223,8 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("path", help="project root directory")
     pi.add_argument("--rebuild", action="store_true",
                     help="force a full rebuild (atomic table swap) instead of incremental")
-    pi.add_argument("--profile", default=None,
-                    choices=["local_cpu_small", "local_cpu_large",
-                             "local_gpu_small", "local_gpu_large"],
-                    help="embedder profile (default $ENGRAM_DEFAULT_INDEX_PROFILE, "
-                         "legacy $ENGRAM_PROFILE, or local_cpu_small; "
-                         "all multilingual+code; local_cpu_* = no-torch/~0 VRAM, "
-                         "local_gpu_* need `uv sync --extra gpu` + a GPU)")
-    pi.set_defaults(func=cmd_index)
+    pi.add_argument("--gpu", action="store_true",
+                    help="index with sentence-transformers on CUDA (needs `uv sync --extra gpu`); search remains FastEmbed CPU")
     pi.set_defaults(func=cmd_index)
 
     prm = sub.add_parser("remove", help="delete a project's index from disk")

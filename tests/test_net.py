@@ -132,7 +132,7 @@ def test_disable_verification_patches_requests_and_httpx():
 
 def test_guard_download_wraps_cert_error_with_hint():
     with pytest.raises(RuntimeError, match="certificate verification failed"):
-        with net.guard_download("Qwen/Qwen3-Embedding-4B"):
+        with net.guard_download("ibm-granite/granite-embedding-97m-multilingual-r2"):
             raise OSError("certificate verify failed: self-signed certificate in chain")
 
 

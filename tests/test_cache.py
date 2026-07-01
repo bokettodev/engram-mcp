@@ -29,6 +29,14 @@ def test_cache_persists_across_connections(tmp_path):
     c2.close()
 
 
+def test_cache_get_many_can_filter_by_stored_dim(tmp_path):
+    cache = EmbeddingCache(tmp_path / "emb.sqlite")
+    cache.put_many({"x": [0.5, 0.5]})
+    assert cache.get_many(["x"], dim=2)["x"] == [0.5, 0.5]
+    assert cache.get_many(["x"], dim=3) == {}
+    cache.close()
+
+
 def test_embedding_input_hash_changes_with_model_and_chunker():
     base = embedding_input_hash("m1", "1", "def f(): pass")
     assert base != embedding_input_hash("m2", "1", "def f(): pass")  # model swap

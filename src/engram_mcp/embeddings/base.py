@@ -12,6 +12,7 @@ from typing import Protocol, Sequence, runtime_checkable
 @runtime_checkable
 class EmbeddingProvider(Protocol):
     model_id: str  # stable id baked into cache keys (e.g. "fastembed:ibm-granite/granite-embedding-97m-multilingual-r2")
+    backend_id: str  # actual loaded runtime id used for diagnostics/status
     dim: int
 
     def embed_passages(self, texts: Sequence[str]) -> list[list[float]]: ...

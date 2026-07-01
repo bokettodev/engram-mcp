@@ -1,12 +1,8 @@
 """Local embedding provider backed by FastEmbed (ONNX).
 
-Default model: granite-embedding-97m-multilingual-r2 (384-dim). Device is "cpu" by default;
-"cuda" uses the ONNX CUDA execution provider (requires the `fastembed-gpu`
-package + a working CUDA runtime) and falls back to CPU if unavailable. "auto"
-picks CUDA when an ONNX CUDA provider is present.
-
-The model id intentionally excludes the device: CPU and GPU produce the same
-vectors for the same model, so switching device must NOT invalidate the cache.
+Engram's query path uses Granite 97m through FastEmbed on CPU. The provider's
+``model_id`` is the canonical manifest/cache id. ``backend_id`` is the loaded
+runtime id used for process-local diagnostics.
 """
 
 from __future__ import annotations
@@ -28,9 +24,8 @@ def _utf8_text_open():
     """Default encoding-less text ``open()`` to UTF-8 for the duration of the
     block, on Windows only.
 
-    FastEmbed loads some model assets (e.g. Granite 311m's
-    ``tokenizer_config.json``) with the process default encoding, which is cp1252
-    on Windows and raises ``UnicodeDecodeError`` on UTF-8 content. UTF-8 mode
+    FastEmbed may load model assets with the process default encoding, which is
+    cp1252 on Windows and raises ``UnicodeDecodeError`` on UTF-8 content. UTF-8 mode
     can't be toggled after interpreter start and re-exec is unsafe for the stdio
     server, so we scope a minimal ``open`` shim to the model-load call. Binary
     opens and explicit-encoding opens are untouched."""
@@ -56,11 +51,10 @@ def _utf8_text_open():
 
 # ONNX models not in FastEmbed's default catalog, registered on first use.
 # Granite R2 is multilingual (100+ langs incl. Russian) + code, Apache-2.0, CLS
-# pooling — a no-torch, ~0-VRAM alternative to the Qwen torch profiles, which
-# matters when many MCP clients each run their own server process.
+# pooling. The fastembed id is the canonical search/compatibility id even when
+# an index was produced by the optional sentence-transformers CUDA backend.
 _CUSTOM_ONNX: dict[str, dict] = {
     "ibm-granite/granite-embedding-97m-multilingual-r2": {"pooling": "CLS", "dim": 384},
-    "ibm-granite/granite-embedding-311m-multilingual-r2": {"pooling": "CLS", "dim": 768},
 }
 
 _REGISTER_LOCK = threading.Lock()
@@ -112,6 +106,7 @@ class FastEmbedProvider:
         _ensure_custom_registered(model_name)
         self.model_name = model_name
         self.model_id = f"fastembed:{model_name}"  # device-independent cache key
+        self.backend_id = self.model_id
         self.device = _resolve_device(device)
 
         kwargs = {"cuda": True} if self.device == "cuda" else {}

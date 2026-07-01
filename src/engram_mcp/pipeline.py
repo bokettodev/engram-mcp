@@ -234,7 +234,7 @@ def _is_compatible(m: manifest.ProjectManifest | None, provider: EmbeddingProvid
 def _embed(texts, provider, cache, batch_size, progress):
     """Embed only texts whose hash is not cached. Returns (vec_by_hash, hashes, n_new, n_reused)."""
     hashes = [embedding_input_hash(provider.model_id, config.CHUNKER_VERSION, t) for t in texts]
-    cached = cache.get_many(set(hashes))
+    cached = cache.get_many(set(hashes), dim=provider.dim)
     missing: dict[str, str] = {}
     for t, h in zip(texts, hashes):
         if h not in cached and h not in missing:
@@ -577,7 +577,7 @@ def search_project(
     m = qi.manifest
     if m.embedder_id and m.embedder_id != provider.model_id:
         raise ValueError(
-            f"index built with a different embedder ({m.embedder_id}); reindex with this profile"
+            f"index built with a different embedder ({m.embedder_id}); rebuild the index"
         )
     if m.dim != provider.dim:
         raise errors.EngramError(

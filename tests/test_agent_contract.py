@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -16,12 +15,14 @@ from engram_mcp.pipeline import (
     index_project,
     load_query_index,
     search_project,
+    _is_compatible,
 )
 from engram_mcp.store.lancedb_store import LanceStore
 
 
 class FakeProvider:
     model_id = "test:fake"
+    backend_id = model_id
     dim = 4
 
     def _vec(self, text: str) -> list[float]:
@@ -68,14 +69,14 @@ def _indexed_project(tmp_path: Path) -> tuple[Path, FakeProvider]:
     return proj, provider
 
 
-def _write_manifest_only(root: Path, **overrides) -> Path:
+def _write_manifest_only(root: Path, dim: int = 4, **overrides) -> Path:
     pdir = paths.project_dir(root)
     m = manifest.ProjectManifest(
         project_id=paths.project_id_for(root),
         root_path=str(root.resolve()),
         active_table="chunks",
         embedder_id="test:fake",
-        dim=4,
+        dim=dim,
         chunker_version=config.CHUNKER_VERSION,
         files=1,
         chunks=1,
@@ -86,9 +87,10 @@ def _write_manifest_only(root: Path, **overrides) -> Path:
     return pdir
 
 
-def _create_one_row_table(root: Path, *, embedder_id: str = "test:fake") -> None:
-    pdir = _write_manifest_only(root, embedder_id=embedder_id)
-    LanceStore(pdir / "lancedb", 4, table="chunks").create(
+def _create_one_row_table(root: Path, *, embedder_id: str = "test:fake", dim: int = 4) -> None:
+    pdir = _write_manifest_only(root, embedder_id=embedder_id, dim=dim)
+    vector = [1.0] + [0.0] * (dim - 1)
+    LanceStore(pdir / "lancedb", dim, table="chunks").create(
         [
             {
                 "chunk_id": "c1",
@@ -103,7 +105,7 @@ def _create_one_row_table(root: Path, *, embedder_id: str = "test:fake") -> None
                 "search_text": "path: a.py\nsymbol: a\n\ndef a(): pass",
                 "file_hash": "h",
                 "chunk_hash": "ch",
-                "vector": [1.0, 0.0, 0.0, 1.0],
+                "vector": vector,
             }
         ]
     )
@@ -208,25 +210,20 @@ def test_server_error_codes_and_read_only_hint(tmp_path, monkeypatch):
     assert bad_req["code"] == errors.E_BAD_REQUEST
 
 
-def test_invalid_env_profile_is_index_time_only(tmp_path, monkeypatch):
+def test_invalid_env_index_device_is_index_time_only(tmp_path, monkeypatch):
     from engram_mcp import server
     from engram_mcp.embeddings import factory
 
-    monkeypatch.setenv("ENGRAM_PROFILE", "not-a-profile")
-    importlib.reload(factory)
-    try:
-        with pytest.raises(errors.EngramError) as exc:
-            factory.default_index_profile()
-        assert exc.value.code == errors.E_UNKNOWN_PROFILE
+    monkeypatch.setenv("ENGRAM_INDEX_DEVICE", "not-a-device")
+    with pytest.raises(errors.EngramError) as exc:
+        factory.default_index_device()
+    assert exc.value.code == errors.E_BAD_REQUEST
 
-        proj, provider = _indexed_project(tmp_path)
-        monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
-        out = server.do_search(str(proj), "add numbers", k=1)
-        assert "error" not in out
-        assert out["count"] == 1
-    finally:
-        monkeypatch.delenv("ENGRAM_PROFILE", raising=False)
-        importlib.reload(factory)
+    proj, provider = _indexed_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    out = server.do_search(str(proj), "add numbers", k=1)
+    assert "error" not in out
+    assert out["count"] == 1
 
 
 def test_compact_search_get_chunk_relevance_and_stale(tmp_path, monkeypatch):
@@ -332,8 +329,62 @@ def test_find_definition_suggestions(tmp_path):
 
 def test_model_status_does_not_load_model(tmp_path):
     from engram_mcp import server
+    from engram_mcp.embeddings import factory
 
-    proj, _provider = _indexed_project(tmp_path)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _create_one_row_table(
+        proj,
+        embedder_id=factory.CANONICAL_EMBEDDER_ID,
+        dim=config.DEFAULT_EMBED_DIM,
+    )
     out = server.do_model_status(str(proj))
     assert out["status"] in {"not_loaded", "loaded"}
-    assert out["model_id"] == "test:fake"
+    assert out["model_id"] == factory.CANONICAL_EMBEDDER_ID
+    assert out["backend_id"] == factory.CANONICAL_EMBEDDER_ID
+
+
+def test_model_status_rejects_removed_embedder_without_load(tmp_path):
+    from engram_mcp import server
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _create_one_row_table(proj, embedder_id="st:Qwen/Qwen3-Embedding-4B@1024#query/none")
+    out = server.do_model_status(str(proj))
+    assert out["code"] == errors.E_UNKNOWN_PROFILE
+
+
+def test_manifest_compat_uses_canonical_model_id():
+    from engram_mcp.embeddings import factory
+
+    class CanonicalProvider:
+        model_id = factory.CANONICAL_EMBEDDER_ID
+        backend_id = f"st:{factory.GRANITE_MODEL}@full#none/none:cuda"
+        dim = config.DEFAULT_EMBED_DIM
+
+    m = manifest.ProjectManifest(
+        project_id="p",
+        root_path="/tmp/p",
+        active_table="chunks",
+        embedder_id=factory.CANONICAL_EMBEDDER_ID,
+        dim=config.DEFAULT_EMBED_DIM,
+        chunker_version=config.CHUNKER_VERSION,
+    )
+    assert _is_compatible(m, CanonicalProvider())
+
+
+def test_index_job_errors_are_structured(tmp_path, monkeypatch):
+    from engram_mcp import server
+
+    job = server._registry.create(str(tmp_path))
+
+    def fail(_device):
+        raise errors.EngramError("missing extra", errors.E_EXTRA_MISSING, hint="install gpu")
+
+    monkeypatch.setattr(server, "_get_provider", fail)
+    server._index_worker(job.job_id, str(tmp_path), False, "cuda")
+    status = server.get_status(job.job_id)
+    assert status["status"] == "error"
+    assert status["error"] == "missing extra"
+    assert status["code"] == errors.E_EXTRA_MISSING
+    assert status["hint"] == "install gpu"

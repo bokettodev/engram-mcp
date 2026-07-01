@@ -21,7 +21,7 @@ embeddings and recalls it by meaning.)*
 ## Requirements
 
 - [**uv**](https://docs.astral.sh/uv/) — manages Python 3.12 + dependencies (the only thing you install globally).
-- *Optional:* an NVIDIA GPU, to use the stronger code-specialized embedders. The default embedder runs fine on CPU.
+- *Optional:* an NVIDIA GPU, to speed up indexing with sentence-transformers. Search stays on CPU.
 
 ## Quickstart
 
@@ -51,7 +51,7 @@ def request_with_retry(url, *, attempts=3, backoff=0.5):
 ## CLI
 
 ```bash
-uv run engram index    <path> [--rebuild] [--profile P]   # build / update the index
+uv run engram index    <path> [--rebuild] [--gpu]         # build / update the index
 uv run engram search   <path> "<query>" -k 8 [--mode auto|vector|hybrid] [--rerank] [--lang py]
 uv run engram find-def <path> <symbol>                    # exact symbol definition lookup
 uv run engram eval     <path> evals/self.json [--mode M]  # measure retrieval quality
@@ -88,21 +88,21 @@ claude mcp add engram -- uv --directory /ABSOLUTE/PATH/TO/engram-mcp run engram-
 }
 ```
 
-**Picking the model for the server.** The server defaults to `local_cpu_small`
-(Granite, no torch, ~0 VRAM). To make it use another profile for *new* indexing,
-set `ENGRAM_DEFAULT_INDEX_PROFILE` in the server's env. `ENGRAM_PROFILE` still
-works as a backwards-compatible alias. Neither affects search over an existing
-index: search always uses the model recorded in the project's manifest.
+**Picking the index backend for the server.** Engram has one embedder:
+`fastembed:ibm-granite/granite-embedding-97m-multilingual-r2` (384d). Search
+always uses FastEmbed/ONNX on CPU. Indexing also defaults to CPU; set
+`ENGRAM_INDEX_DEVICE=cuda` for new index jobs, or pass `gpu=true` to the MCP
+`index_project` tool, to use the sentence-transformers CUDA backend once.
 
 ```bash
-claude mcp add engram -e ENGRAM_DEFAULT_INDEX_PROFILE=local_gpu_large -- \
+claude mcp add engram -e ENGRAM_INDEX_DEVICE=cuda -- \
   uv --directory /ABSOLUTE/PATH/TO/engram-mcp run --extra gpu engram-mcp
 ```
 
-- A `local_gpu_*` profile needs the torch models present, so launch the server
-  with `run --extra gpu` (or pre-run `uv sync --extra gpu` once). Without it,
-  `uv run` syncs only the base deps and the GPU profiles can't load. The default
-  `local_cpu_*` profiles need no extra.
+- CUDA indexing needs the torch/sentence-transformers packages, so launch the
+  server with `run --extra gpu` (or pre-run `uv sync --extra gpu` once). Without
+  that extra, requesting CUDA fails explicitly. The default CPU index/search path
+  needs no torch and uses ~0 VRAM.
 - **Windows footgun:** if `uv run` reports `failed to remove … engram-mcp.exe …
   used by another process`, a previous server instance is holding the script
   while `uv` tries to re-sync. Launch with `run --no-sync` (use the already-set-up
@@ -133,7 +133,7 @@ tool call never blocks for minutes):
 
 | Tool | Purpose |
 |---|---|
-| `index_project(project_path, full_rebuild=False, profile=None)` | start a background index; returns `job_id` |
+| `index_project(project_path, full_rebuild=False, gpu=False)` | start a background index; returns `job_id`; `gpu=true` uses CUDA indexing |
 | `index_status(job_id)` | current-process progress snapshot (stage, counts, ETA) |
 | `search_code(project_path, query, k=8, language=None, mode="auto", rerank=False, content="preview", max_chars_per_result=800, min_relevance=None)` | compact ranked hits over static indexed source |
 | `get_chunk(project_path, chunk_id, max_chars=None)` | fetch full content for one search hit |
@@ -142,7 +142,7 @@ tool call never blocks for minutes):
 | `reindex_file(project_path, rel_path)` | incrementally re-index/drop one file |
 | `remove_project(project_path)` | delete a project's index |
 | `list_indexed_projects()` | on-disk index inventory, `data_home`, and broken manifest/table `errors[]` |
-| `server_info()` | data-home, read-only, and default index-profile diagnostics |
+| `server_info()` | data-home, read-only, canonical embedder, and index-device diagnostics |
 
 `search_code` is a decision tool first: by default each hit contains `chunk_id`,
 `rel_path`/`span`, `symbol`, `symbol_kind`, `chunk_role`, `preview`, `raw_score`,
@@ -179,48 +179,32 @@ Override with `ENGRAM_HOME`. It stores your code — treat it as private.
 
 **Model weights** are a separate, shared cache: downloaded once into the
 Hugging Face cache (`~/.cache/huggingface`, or wherever `HF_HOME` points) and
-reused across projects — not under `ENGRAM_HOME`. Sizes range from ~0.2 GB
-(the default Granite 97m) to ~8 GB (Qwen3-4B), so point `HF_HOME` at a roomy
-disk if your home partition is small.
+reused across projects - not under `ENGRAM_HOME`. The Granite 97m embedder is
+small (~0.2 GB); the optional `gpu` extra also installs torch wheels.
 
-## Embedder profiles
+## Embedder
 
-Four profiles, named `local_<cpu|gpu>_<small|large>`. **Every model is
-multilingual (100+ languages incl. Russian) + code, and Apache-2.0.** The axis
-that matters is cost: `cpu` = FastEmbed/ONNX, no torch, **~0 VRAM**; `gpu` =
-torch, loads the model into VRAM.
+Engram supports one embedder:
 
-| Profile | Model | Dim | Backend / cost |
-|---|---|---|---|
-| `local_cpu_small` (default) | granite-embedding-97m-multilingual-r2 | 384 | ONNX · no torch · ~0 VRAM |
-| `local_cpu_large` | granite-embedding-311m-multilingual-r2 | 768 | ONNX · no torch · ~0 VRAM |
-| `local_gpu_small` | Qwen3-Embedding-0.6B | 1024 | torch · needs `gpu` extra + GPU |
-| `local_gpu_large` | Qwen3-Embedding-4B | 1024 (MRL) | torch · needs `gpu` extra + GPU |
+| Model | Canonical id | Dim | Search backend | Index backend |
+|---|---|---:|---|---|
+| granite-embedding-97m-multilingual-r2 | `fastembed:ibm-granite/granite-embedding-97m-multilingual-r2` | 384 | FastEmbed/ONNX CPU | FastEmbed/ONNX CPU by default; sentence-transformers CUDA with `--gpu` |
 
-**cpu path — [Granite R2](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2)**
-(IBM, Apache-2.0): 32K context, runs on CPU/ONNX with ~0 VRAM, registered with
-FastEmbed on first use (downloaded once). The default, and the right pick when
-several editor/agent windows each spawn their own server (see *GPU memory*).
-On this repo's English eval `local_cpu_small` matches the old bge-small baseline
-— no English regression — while adding Russian + code.
-
-**gpu path — [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-4B)**
-(Apache-2.0): stronger, tops MTEB on text and code, but loads into VRAM. Behind
-the optional `gpu` extra (pulls a CUDA build of torch automatically on
-Windows/Linux, ~2 GB — only an NVIDIA driver needed):
+[Granite R2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2)
+(IBM, Apache-2.0) is multilingual (100+ languages incl. Russian) + code. The
+canonical `fastembed:` id is recorded in the index manifest and used in the
+embedding cache even when indexing was produced by the optional CUDA backend.
+That keeps search torch-free: a CUDA-built index is still queried with
+FastEmbed/ONNX on CPU.
 
 ```bash
-uv sync --extra gpu
-uv run engram index <path> --profile local_gpu_large
+uv run engram index <path>                 # CPU indexing, no torch
+uv run --extra gpu engram index <path> --gpu
+ENGRAM_INDEX_DEVICE=cuda uv run --extra gpu engram-mcp
 ```
 
-The 4B's native 2560 dims are truncated to 1024 via Matryoshka (MRL) for index
-parity at <few % quality loss. The default `uv sync` (no extra) stays torch-free
-and CPU-only. The embedder id (incl. dim) is recorded in the index manifest, so
-search auto-selects the matching model and switching model re-indexes cleanly.
-Set the index-time default with `ENGRAM_DEFAULT_INDEX_PROFILE` (or legacy
-`ENGRAM_PROFILE`), e.g. `ENGRAM_DEFAULT_INDEX_PROFILE=local_gpu_small`.
-`local_cpu_small` is the default because it needs no GPU and no torch.
+CUDA indexing is explicit. If `sentence-transformers`/torch or CUDA is missing,
+Engram returns a structured error instead of silently falling back to CPU.
 
 ### Behind a corporate TLS-inspecting proxy
 
@@ -237,26 +221,17 @@ already lives. If you still hit issues:
 - last resort, on a trusted network: `ENGRAM_INSECURE_DOWNLOADS=1` skips
   verification for downloads entirely.
 
-### GPU memory (torch profiles)
+### GPU memory
 
-The `local_gpu_*` profiles load the model into VRAM; the `local_cpu_*` profiles
-use FastEmbed/ONNX and effectively no VRAM. A few things worth knowing for a
-GPU-shared, always-on server:
+Search never loads torch and uses ~0 VRAM. CUDA indexing loads Granite through
+sentence-transformers only for the duration of the index job, then unloads the
+model and empties the CUDA cache.
 
-- **One model copy per process.** Each MCP client (editor/agent window) spawns
-  its own stdio server process, and each loads its own copy of the model into
-  VRAM. N open clients on a `local_gpu_*` profile ≈ N model copies. The no-VRAM
-  `local_cpu_small` (default) sidesteps this — keep it as the always-on default
-  and request a `local_gpu_*` profile per index when you want the extra quality.
-- **A `local_gpu_*` index pulls that model into search too:** search uses the
-  model recorded in the project's manifest, so searching a Qwen-indexed project
-  loads Qwen even if your default profile is a `local_cpu_*` one.
-- **`ENGRAM_ST_BATCH_SIZE`** (default 16) caps the encode batch — the real lever
+- **`ENGRAM_ST_BATCH_SIZE`** (default 16) caps the encode batch - the real lever
   on activation VRAM during indexing. Lower it (e.g. 8) on a tight/shared GPU;
   raise it for throughput on a dedicated one.
-- After a bulk index Engram returns the activation high-water to the GPU, but the
-  **model stays resident** for warm search latency — it's freed when the server
-  process exits (restart the client/server to reclaim it).
+- Each MCP client still has its own process, but CUDA memory is consumed only
+  while that process is actively running a GPU index job.
 
 ## Retrieval quality
 
@@ -268,48 +243,30 @@ Search modes (`--mode`, default `auto`):
 - **hybrid** — vector + full-text (BM25), fused with reciprocal-rank fusion + symbol/path boosts.
 - **`--rerank`** — a local cross-encoder reranks the top candidates (needs `--extra gpu`).
 
-A built-in `eval` harness reports hit@1/5/10 + MRR **per query category**. On the
-repo's own 50-query set the no-VRAM `local_cpu_small` (Granite) is on par with the
-GPU `local_gpu_small` (Qwen3-0.6B) for code retrieval; the `local_gpu_*` profiles
-pull ahead more on large, prose-heavy, or non-English corpora. Run `eval` on your
-own repo to tune for your codebase.
+A built-in `eval` harness reports hit@1/5/10 + MRR **per query category**. Run
+`eval` on your own repo to tune search mode and reranking for your codebase.
 
 ## Performance
 
-Cold indexing is bound by embedding throughput: ~21 chunks/s on CPU with the default
-model (a few minutes for a mid-size repo; ~15–35 min for 1–2M LOC). Re-indexing is
-near-free thanks to the content-hash cache. The Qwen3 quality models are far
-stronger but much slower on CPU — use a GPU for them.
+Cold indexing is bound by embedding throughput. The CPU FastEmbed path is
+torch-free and cheap; `--gpu` switches only indexing to sentence-transformers on
+CUDA for much higher throughput. Re-indexing is near-free thanks to the
+content-hash cache.
 
 ## Stack
 
 | Concern | Choice |
 |---|---|
 | Runtime | Python 3.12 via [`uv`](https://docs.astral.sh/uv/) |
-| Embedder | [FastEmbed](https://github.com/qdrant/fastembed) (Granite R2, ONNX, no torch) · optional [sentence-transformers](https://www.sbert.net/) (Qwen3-Embedding, GPU) |
+| Embedder | Granite R2 97m via [FastEmbed](https://github.com/qdrant/fastembed) for CPU search/index; optional [sentence-transformers](https://www.sbert.net/) CUDA for index-only acceleration |
 | Vector store | [LanceDB](https://lancedb.com/) (embedded, on-disk, vector + full-text) |
 | Chunker | tree-sitter — 11 languages (py/js/ts/tsx/go/rust/java/c/cpp/ruby/c#) · markdown by heading section · plain text by paragraph · line-window fallback |
 | Server | MCP Python SDK (FastMCP, stdio) |
 
-## Status
-
-- ✅ Walk + nested-`.gitignore` ignore + tree-sitter chunking (11 langs, contextual headers)
-- ✅ Structure-aware prose: markdown split by heading section (breadcrumb → chunk symbol) + plain text packed by paragraph
-- ✅ Local embedding + LanceDB store + content-hash cache
-- ✅ Atomic full rebuild + incremental re-index + per-project lock
-- ✅ Embedder profiles: multilingual+code, `local_<cpu|gpu>_<small|large>` — no-torch Granite R2 (default) + Qwen3-Embedding via `--extra gpu`
-- ✅ TLS downloads work behind corporate MITM proxies (OS trust store by default)
-- ✅ Bounded + reclaimed GPU memory (`ENGRAM_ST_BATCH_SIZE`, cache release after bulk index)
-- ✅ Search modes auto / vector / hybrid + optional cross-encoder rerank
-- ✅ Per-category eval harness · `find_definition` (with miss suggestions)
-- ✅ Async MCP server: index / status / search / get_chunk / find_definition / model_status / reindex_file / remove_project / list / server_info
-- ✅ Agent-grade tool contract: hermetic reads (model from manifest), structured `E_*` errors, compact-first results + `get_chunk`, normalized score + relevance buckets, search-time freshness (`stale`), honest `mode_used`/`warnings`, `chunk_role`
-- ⏳ GPU-tuned serving · idle model unload · Merkle incremental · file-watching · durable job registry
-
 ## Development
 
 ```bash
-uv run --no-sync pytest -q          # +2 tests skip unless `--extra gpu` is installed
+uv run --no-sync pytest -q   # model- and GPU-gated tests skip without the model / `--extra gpu`
 ```
 
 ## License

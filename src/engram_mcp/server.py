@@ -67,17 +67,28 @@ _MAX_RESULT_CHARS = 20_000
 _MODEL_RETRY_AFTER_SEC = 2
 
 
-def _get_provider(profile: str | None = None):
-    """Index-time provider for a profile (model instances cached by the factory)."""
-    return factory.make_provider(profile)
+def _get_provider(index_device: str | None = None):
+    """Index-time provider for the selected backend."""
+    return factory.make_index_provider(index_device)
 
 
-def _index_worker(job_id: str, project_path: str, full_rebuild: bool, profile: str) -> None:
-    _registry.update(job_id, status="running", stage="loading-model", started_at=time.time())
+def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_device: str) -> None:
+    _registry.update(
+        job_id,
+        status="running",
+        stage="loading-model",
+        index_device=index_device,
+        started_at=time.time(),
+    )
     provider = None
     try:
-        provider = _get_provider(profile)
-        _registry.update(job_id, stage="embedding")
+        provider = _get_provider(index_device)
+        _registry.update(
+            job_id,
+            stage="embedding",
+            embedder_id=provider.model_id,
+            backend_id=provider.backend_id,
+        )
 
         def progress(done: int, total: int) -> None:
             _registry.update(job_id, done_units=done, total_units=total)
@@ -87,6 +98,9 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, profile: s
             job_id,
             status="done",
             stage="done",
+            error=None,
+            code=None,
+            hint=None,
             files=stats.files,
             chunks=stats.chunks,
             embedded=stats.embedded_unique,
@@ -94,15 +108,20 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, profile: s
             finished_at=time.time(),
         )
     except Exception as exc:  # surface failure via status, never crash the server
+        payload = _error_payload(exc)
         _registry.update(
-            job_id, status="error", stage="error", error=repr(exc), finished_at=time.time()
+            job_id,
+            status="error",
+            stage="error",
+            error=payload.get("error", str(exc)),
+            code=payload.get("code"),
+            hint=payload.get("hint"),
+            finished_at=time.time(),
         )
     finally:
-        # Return the bulk-index activation high-water to the GPU (keeps the model
-        # warm). The model itself stays resident for fast subsequent search.
         if provider is not None:
             try:
-                provider.release_unused_cache()
+                factory.release_index_provider(provider)
             except Exception:  # never let cleanup turn a finished job into a failure
                 pass
 
@@ -110,17 +129,26 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, profile: s
 # --- plain, testable logic (the MCP tools are thin wrappers over these) ---
 
 def start_index_job(
-    project_path: str, full_rebuild: bool = False, profile: str | None = None
+    project_path: str,
+    full_rebuild: bool = False,
+    gpu: bool = False,
+    index_device: str | None = None,
 ) -> dict:
     root = Path(project_path).expanduser()
     if not root.is_dir():
         raise ValueError(f"not a directory: {root}")
-    profile = profile or factory.default_index_profile()
-    factory.validate_profile(profile)
+    device = factory.resolve_index_device(index_device, gpu=gpu)
     resolved = str(root.resolve())
     job = _registry.create(resolved)
-    _index_pool.submit(_index_worker, job.job_id, resolved, full_rebuild, profile)
-    return {"job_id": job.job_id, "project_path": resolved, "status": job.status}
+    _registry.update(job.job_id, index_device=device, embedder_id=factory.CANONICAL_EMBEDDER_ID)
+    _index_pool.submit(_index_worker, job.job_id, resolved, full_rebuild, device)
+    return {
+        "job_id": job.job_id,
+        "project_path": resolved,
+        "status": job.status,
+        "index_device": device,
+        "embedder_id": factory.CANONICAL_EMBEDDER_ID,
+    }
 
 
 def _not_indexed_hint() -> str:
@@ -162,9 +190,8 @@ def _provider_load_worker(model_id: str):
 def _provider_for_query_model(model_id: str):
     """Return a loaded provider or schedule warmup and raise E_MODEL_LOADING."""
 
-    if not (model_id.startswith("fastembed:") or model_id.startswith("st:")):
-        return factory.provider_for_model_id(model_id)
-    if factory.is_model_loaded(model_id):
+    backend_id = factory.query_backend_id_for_model_id(model_id)
+    if factory.is_model_loaded(backend_id):
         return factory.provider_for_model_id(model_id)
     with _model_loads_lock:
         fut = _model_loads.get(model_id)
@@ -181,19 +208,21 @@ def _provider_for_query_model(model_id: str):
 
 
 def _model_status_for(model_id: str) -> dict:
+    backend_id = factory.query_backend_id_for_model_id(model_id)
+    base = {"model_id": model_id, "backend_id": backend_id}
     with _model_loads_lock:
         fut = _model_loads.get(model_id)
-    if factory.is_model_loaded(model_id):
-        return {"model_id": model_id, "status": "loaded"}
+    if factory.is_model_loaded(backend_id):
+        return base | {"status": "loaded"}
     if fut is None:
-        return {"model_id": model_id, "status": "not_loaded"}
+        return base | {"status": "not_loaded"}
     if not fut.done():
-        return {"model_id": model_id, "status": "loading", "retry_after_sec": _MODEL_RETRY_AFTER_SEC}
+        return base | {"status": "loading", "retry_after_sec": _MODEL_RETRY_AFTER_SEC}
     exc = fut.exception()
     if exc is not None:
         payload = _error_payload(exc)
-        return {"model_id": model_id, "status": "error", **payload}
-    return {"model_id": model_id, "status": "loaded"}
+        return base | {"status": "error", **payload}
+    return base | {"status": "loaded"}
 
 
 def _check_k(k: int) -> None:
@@ -248,7 +277,7 @@ def do_reindex_file(project_path: str, rel_path: str) -> dict:
     finally:
         if provider is not None:
             try:
-                provider.release_unused_cache()
+                factory.release_index_provider(provider)
             except Exception:
                 pass
 
@@ -424,6 +453,7 @@ def do_model_status(project_path: str | None = None) -> dict:
             "data_home": str(paths.data_home(create=False)),
             "loaded_models": factory.loaded_model_ids(),
             "active_loads": sorted(_model_loads),
+            "embedder_id": factory.CANONICAL_EMBEDDER_ID,
         }
         if project_path is None:
             return base
@@ -440,18 +470,20 @@ def do_model_status(project_path: str | None = None) -> dict:
 def do_server_info() -> dict:
     default_error = None
     try:
-        default_profile = factory.default_index_profile()
+        default_device = factory.default_index_device()
     except Exception as exc:
-        default_profile = factory.DEFAULT_PROFILE
+        default_device = factory.DEFAULT_INDEX_DEVICE
         default_error = _error_payload(exc)
     return {
         "data_home": str(paths.data_home(create=False)),
         "data_home_source": paths.data_home_source(),
         "data_home_exists": paths.data_home(create=False).exists(),
         "read_only": read_only_enabled(),
-        "default_index_profile": default_profile,
-        "default_index_profile_error": default_error,
-        "profiles": sorted(factory.PROFILES),
+        "embedder_id": factory.CANONICAL_EMBEDDER_ID,
+        "default_index_device": default_device,
+        "default_index_device_error": default_error,
+        "supported_index_devices": list(factory.SUPPORTED_INDEX_DEVICES),
+        "search_backend": "fastembed-cpu",
         "source_type": "static_indexed_source",
     }
 
@@ -463,18 +495,18 @@ def do_server_info() -> dict:
 
 
 async def index_project(
-    project_path: str, full_rebuild: bool = False, profile: str | None = None
+    project_path: str, full_rebuild: bool = False, gpu: bool = False
 ) -> dict:
     """Start a background index/re-index of a project directory.
 
     Returns a job_id immediately. Poll index_status until status == 'done'
     (or 'error'). Incremental by default (only changed files are touched);
-    pass full_rebuild=true to rebuild the whole index atomically. profile is
-    one of local_cpu_small (default) / local_cpu_large (Granite, no-torch,
-    ~0 VRAM) or local_gpu_small / local_gpu_large (Qwen3, need the gpu extra).
-    All are multilingual + code.
+    pass full_rebuild=true to rebuild the whole index atomically. By default
+    indexing uses FastEmbed/ONNX on CPU. Pass gpu=true, or set
+    ENGRAM_INDEX_DEVICE=cuda, to index once with sentence-transformers on CUDA;
+    search still uses FastEmbed/ONNX on CPU.
     """
-    return start_index_job(project_path, full_rebuild, profile)
+    return start_index_job(project_path, full_rebuild, gpu)
 
 
 async def index_status(job_id: str) -> dict:

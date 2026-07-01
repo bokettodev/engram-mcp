@@ -16,6 +16,9 @@ from dataclasses import dataclass
 class JobState:
     job_id: str
     project_path: str
+    index_device: str = ""
+    embedder_id: str = ""
+    backend_id: str = ""
     status: str = "queued"  # queued | running | done | error
     stage: str = ""
     files: int = 0
@@ -25,6 +28,8 @@ class JobState:
     done_units: int = 0
     total_units: int = 0
     error: str | None = None
+    code: str | None = None
+    hint: str | None = None
     created_at: float = 0.0
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -88,6 +93,9 @@ def snapshot(job: JobState) -> dict:
         "scope": "current_process",
         "job_id": job.job_id,
         "project_path": job.project_path,
+        "index_device": job.index_device,
+        "embedder_id": job.embedder_id,
+        "backend_id": job.backend_id,
         "status": job.status,
         "stage": job.stage,
         "files": job.files,
@@ -98,4 +106,6 @@ def snapshot(job: JobState) -> dict:
         "elapsed_sec": round(elapsed, 2),
         "eta_sec": round(eta, 1) if eta is not None else None,
         "error": job.error,
+        "code": job.code,
+        "hint": job.hint,
     }

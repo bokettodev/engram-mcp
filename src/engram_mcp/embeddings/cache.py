@@ -30,7 +30,7 @@ class EmbeddingCache:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def get_many(self, hashes: Iterable[str]) -> dict[str, list[float]]:
+    def get_many(self, hashes: Iterable[str], dim: int | None = None) -> dict[str, list[float]]:
         hashes = list(hashes)
         out: dict[str, list[float]] = {}
         if not hashes:
@@ -39,9 +39,15 @@ class EmbeddingCache:
         for i in range(0, len(hashes), 800):
             batch = hashes[i : i + 800]
             placeholders = ",".join("?" * len(batch))
-            rows = self.conn.execute(
-                f"SELECT h, vec FROM embeddings WHERE h IN ({placeholders})", batch
-            ).fetchall()
+            if dim is None:
+                rows = self.conn.execute(
+                    f"SELECT h, vec FROM embeddings WHERE h IN ({placeholders})", batch
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"SELECT h, vec FROM embeddings WHERE dim = ? AND h IN ({placeholders})",
+                    [dim, *batch],
+                ).fetchall()
             for h, blob in rows:
                 a = array("f")
                 a.frombytes(blob)

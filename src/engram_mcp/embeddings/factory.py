@@ -1,23 +1,19 @@
-"""Embedder profiles + a cached factory.
+"""Embedding provider factory for the single supported Granite embedder.
 
-All profiles are LOCAL (no cloud API), Apache-2.0, and multilingual (incl.
-Russian) + code. Naming: local_<cpu|gpu>_<small|large>. Two backends:
+Engram stores one canonical embedder id in manifests and cache keys:
 
-  cpu — FastEmbed/ONNX, no torch, ~0 VRAM (Granite R2). The default path:
-    local_cpu_small - granite-embedding-97m-multilingual-r2  (384d). Default.
-    local_cpu_large - granite-embedding-311m-multilingual-r2 (768d).
+    fastembed:ibm-granite/granite-embedding-97m-multilingual-r2
 
-  gpu — sentence-transformers (torch), behind the optional `gpu` extra
-  (`uv sync --extra gpu`). Qwen3-Embedding, stronger but loads into VRAM:
-    local_gpu_small - Qwen3-Embedding-0.6B (1024d).
-    local_gpu_large - Qwen3-Embedding-4B (1024d MRL). Strongest practical pick.
-
-model_id is device-independent but model+dim-specific, so it keys the index +
-cache: switching model/dim invalidates cleanly; switching CPU<->GPU does not.
+Search always replays that id with FastEmbed/ONNX on CPU. Indexing uses the
+same FastEmbed CPU backend by default, or a one-shot sentence-transformers CUDA
+backend when explicitly requested. The CUDA backend reports the canonical
+``model_id`` for compatibility/cache semantics and a distinct ``backend_id`` for
+loaded-model accounting.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import threading
 from functools import lru_cache
@@ -25,156 +21,171 @@ from functools import lru_cache
 from engram_mcp import errors
 from engram_mcp.embeddings.fastembed_provider import FastEmbedProvider
 
-# Unified profile names: local_<cpu|gpu>_<small|large>.
-#   cpu = FastEmbed/ONNX, no torch, ~0 VRAM   |   gpu = torch, VRAM
-# Every model is multilingual (incl. Russian) + code, Apache-2.0.
+GRANITE_MODEL = "ibm-granite/granite-embedding-97m-multilingual-r2"
+CANONICAL_EMBEDDER_ID = f"fastembed:{GRANITE_MODEL}"
+SUPPORTED_INDEX_DEVICES = ("cpu", "cuda")
+DEFAULT_INDEX_DEVICE = "cpu"
 
-# cpu path — name -> (model_name, device). Granite R2 via FastEmbed custom ONNX.
-_FASTEMBED: dict[str, tuple[str, str]] = {
-    "local_cpu_small": ("ibm-granite/granite-embedding-97m-multilingual-r2", "cpu"),
-    "local_cpu_large": ("ibm-granite/granite-embedding-311m-multilingual-r2", "cpu"),
-}
-
-# gpu path — name -> (model_name, device, truncate_dim, query_prompt, passage_prompt).
-# Qwen3-Embedding family; MRL truncates the 4B's native 2560d to 1024 for index
-# parity at <few % quality loss.
-_QWEN: dict[str, tuple[str, str, int | None, str | None, str | None]] = {
-    "local_gpu_small": ("Qwen/Qwen3-Embedding-0.6B", "auto", 1024, "query", None),
-    "local_gpu_large": ("Qwen/Qwen3-Embedding-4B", "auto", 1024, "query", None),
-}
-
-PROFILES = frozenset(_FASTEMBED) | frozenset(_QWEN)
-# Index-time default profile. ENGRAM_DEFAULT_INDEX_PROFILE is the explicit knob;
-# ENGRAM_PROFILE remains as a backwards-compatible alias. Default is the light
-# no-VRAM multilingual model so an always-on server stays cheap across clients.
-DEFAULT_PROFILE = (
-    os.environ.get("ENGRAM_DEFAULT_INDEX_PROFILE")
-    or os.environ.get("ENGRAM_PROFILE")
-    or "local_cpu_small"
+_REMOVED_EMBEDDER_HINT = (
+    "This index was built with a removed/unsupported embedder; rebuild it "
+    "with `engram index --rebuild <path>`."
 )
 
-_LOADED_MODEL_IDS: set[str] = set()
+_LOADED_BACKEND_IDS: set[str] = set()
 _LOADED_LOCK = threading.Lock()
 
 
-def validate_profile(profile: str) -> None:
-    if profile not in PROFILES:
-        raise errors.EngramError(
-            f"unknown profile {profile!r}; choices: {', '.join(sorted(PROFILES))}",
-            errors.E_UNKNOWN_PROFILE,
-        )
-
-
-def default_index_profile() -> str:
-    validate_profile(DEFAULT_PROFILE)
-    return DEFAULT_PROFILE
+def _backend_id(provider) -> str:
+    return str(getattr(provider, "backend_id", provider.model_id))
 
 
 def _remember_loaded(provider) -> None:
     with _LOADED_LOCK:
-        _LOADED_MODEL_IDS.add(provider.model_id)
+        _LOADED_BACKEND_IDS.add(_backend_id(provider))
+
+
+def _forget_loaded(provider) -> None:
+    with _LOADED_LOCK:
+        _LOADED_BACKEND_IDS.discard(_backend_id(provider))
 
 
 def loaded_model_ids() -> list[str]:
+    """Loaded backend ids, not canonical manifest ids."""
+
     with _LOADED_LOCK:
-        return sorted(_LOADED_MODEL_IDS)
+        return sorted(_LOADED_BACKEND_IDS)
 
 
-def is_model_loaded(model_id: str) -> bool:
+def is_model_loaded(backend_id: str) -> bool:
     with _LOADED_LOCK:
-        return model_id in _LOADED_MODEL_IDS
+        return backend_id in _LOADED_BACKEND_IDS
 
 
-@lru_cache(maxsize=8)
-def _fastembed(model_name: str, device: str) -> FastEmbedProvider:
+def _unsupported_embedder(model_id: str) -> errors.EngramError:
+    return errors.EngramError(
+        f"unsupported embedder id: {model_id!r}",
+        errors.E_UNKNOWN_PROFILE,
+        hint=_REMOVED_EMBEDDER_HINT,
+    )
+
+
+def query_backend_id_for_model_id(model_id: str) -> str:
+    """Return the search backend id for a canonical manifest id without loading."""
+
+    if model_id == CANONICAL_EMBEDDER_ID:
+        return CANONICAL_EMBEDDER_ID
+    raise _unsupported_embedder(model_id)
+
+
+def resolve_index_device(index_device: str | None = None, *, gpu: bool = False) -> str:
+    """Resolve index device from an explicit request plus ENGRAM_INDEX_DEVICE."""
+
+    if gpu:
+        return "cuda"
+    raw = (index_device or os.environ.get("ENGRAM_INDEX_DEVICE") or DEFAULT_INDEX_DEVICE)
+    device = raw.strip().lower()
+    if device not in SUPPORTED_INDEX_DEVICES:
+        raise errors.EngramError(
+            f"unsupported index device {raw!r}",
+            errors.E_BAD_REQUEST,
+            hint="Use `cpu` or `cuda` (or unset ENGRAM_INDEX_DEVICE).",
+        )
+    return device
+
+
+def default_index_device() -> str:
+    return resolve_index_device(None)
+
+
+@lru_cache(maxsize=1)
+def _fastembed_granite_cpu() -> FastEmbedProvider:
     from engram_mcp.net import guard_download
 
-    with guard_download(model_name):
-        return FastEmbedProvider(model_name, device=device)
+    with guard_download(GRANITE_MODEL):
+        return FastEmbedProvider(GRANITE_MODEL, device="cpu")
 
 
-@lru_cache(maxsize=8)
-def _st(model_name, device, truncate_dim, query_prompt, passage_prompt):
+def _sentence_transformers_granite_cuda():
+    if importlib.util.find_spec("sentence_transformers") is None:
+        raise errors.EngramError(
+            "CUDA indexing needs the optional 'gpu' extra.",
+            errors.E_EXTRA_MISSING,
+            hint="Run `uv sync --extra gpu` or `uv run --extra gpu engram index --gpu <path>`.",
+        )
+
     from engram_mcp.embeddings.sentence_transformers_provider import (
         SentenceTransformersProvider,
     )
     from engram_mcp.net import guard_download
 
-    with guard_download(model_name):
+    with guard_download(GRANITE_MODEL):
         return SentenceTransformersProvider(
-            model_name, device=device, truncate_dim=truncate_dim,
-            query_prompt=query_prompt, passage_prompt=passage_prompt,
+            GRANITE_MODEL,
+            device="cuda",
+            truncate_dim=None,
+            query_prompt=None,
+            passage_prompt=None,
+            canonical_id=CANONICAL_EMBEDDER_ID,
+            strict_device=True,
         )
 
 
-def make_provider(profile: str | None = None):
-    profile = profile or default_index_profile()
-    validate_profile(profile)
-    if profile in _FASTEMBED:
-        provider = _fastembed(*_FASTEMBED[profile])
-        _remember_loaded(provider)
-        return provider
-    if profile in _QWEN:
-        provider = _st(*_QWEN[profile])
-        _remember_loaded(provider)
-        return provider
-    raise AssertionError("validated profile missing from provider tables")
+def provider_for_model_id(model_id: str):
+    """Build the CPU query provider for a manifest's canonical embedder id."""
+
+    if model_id != CANONICAL_EMBEDDER_ID:
+        raise _unsupported_embedder(model_id)
+    provider = _fastembed_granite_cpu()
+    _remember_loaded(provider)
+    return provider
 
 
-def provider_for_model_id(model_id: str, device: str = "auto"):
-    """Build the provider matching a manifest's recorded embedder id."""
-    if model_id.startswith("fastembed:"):
-        model_name = model_id.split(":", 1)[1]
-        if not model_name:
-            raise errors.EngramError(
-                f"unsupported embedder id: {model_id!r}",
-                errors.E_UNKNOWN_PROFILE,
-            )
-        # Custom ONNX models (Granite) are the no-VRAM `local_cpu_*` profiles:
-        # pin replay to CPU so it (a) reuses the same cached provider built at
-        # index time (device is part of the lru key) and (b) can never quietly
-        # run on CUDA and break the advertised ~0-VRAM contract.
-        from engram_mcp.embeddings.fastembed_provider import _CUSTOM_ONNX
+def make_index_provider(index_device: str | None = None):
+    """Build an index-time provider.
 
-        dev = "cpu" if model_name in _CUSTOM_ONNX else device
-        provider = _fastembed(model_name, dev)
-        _remember_loaded(provider)
-        return provider
-    if model_id.startswith("st:"):
-        # st:<model>@<dim>#<query_prompt>/<passage_prompt>
-        spec, _, ptag = model_id[len("st:"):].partition("#")
-        model, _, dim_tag = spec.rpartition("@")
-        if not model:
-            raise errors.EngramError(
-                f"unsupported embedder id: {model_id!r}",
-                errors.E_UNKNOWN_PROFILE,
-            )
-        try:
-            truncate = None if dim_tag in ("full", "") else int(dim_tag)
-        except ValueError as exc:
-            raise errors.EngramError(
-                f"unsupported embedder id: {model_id!r}",
-                errors.E_UNKNOWN_PROFILE,
-            ) from exc
-        qp, _, pp = ptag.partition("/")
-        qp = None if qp in ("none", "") else qp
-        pp = None if pp in ("none", "") else pp
-        provider = _st(model, device, truncate, qp, pp)
-        _remember_loaded(provider)
-        return provider
-    raise errors.EngramError(
-        f"unsupported embedder id: {model_id!r}",
-        errors.E_UNKNOWN_PROFILE,
-        hint="This index was built with an embedder this Engram version does not know how to load.",
-    )
-
-
-def provider_for_project(root, device: str = "auto"):
-    """Return the embedder recorded in a project's manifest.
-
-    Kept for compatibility with older callers. It intentionally does not fall
-    back to the default profile; read paths must be hermetic to the index.
+    CPU providers are cached. CUDA providers are intentionally not cached so a
+    GPU index job can unload the model and return VRAM after the job.
     """
+
+    device = resolve_index_device(index_device)
+    if device == "cpu":
+        provider = _fastembed_granite_cpu()
+    elif device == "cuda":
+        provider = _sentence_transformers_granite_cuda()
+    else:  # pragma: no cover - resolve_index_device validates the value
+        raise AssertionError(f"unhandled index device: {device}")
+    _remember_loaded(provider)
+    return provider
+
+
+def make_provider(index_device: str | None = None):
+    """Compatibility alias for older internal callers."""
+
+    return make_index_provider(index_device)
+
+
+def release_index_provider(provider) -> None:
+    """Release index backend resources after a job.
+
+    FastEmbed CPU is cached and retained. The one-shot CUDA provider is unloaded
+    so VRAM use is limited to the index job.
+    """
+
+    if provider is None:
+        return
+    try:
+        provider.release_unused_cache()
+    finally:
+        if getattr(provider, "device", None) == "cuda" and hasattr(provider, "unload"):
+            try:
+                provider.unload()
+            finally:
+                _forget_loaded(provider)
+
+
+def provider_for_project(root):
+    """Return the CPU query provider recorded in a project's manifest."""
+
     from engram_mcp import manifest, paths
 
     pdir = paths.project_dir(root, create=False)
@@ -184,4 +195,4 @@ def provider_for_project(root, device: str = "auto"):
             f"project not indexed: {root}",
             errors.E_PROJECT_NOT_INDEXED,
         )
-    return provider_for_model_id(m.embedder_id, device)
+    return provider_for_model_id(m.embedder_id)

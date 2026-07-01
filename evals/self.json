@@ -36,7 +36,7 @@
   },
   {
     "category": "nl",
-    "query": "local embedder profiles with optional GPU acceleration",
+    "query": "single canonical granite embedder with optional GPU indexing",
     "expected_path": "src/engram_mcp/embeddings/factory.py"
   },
   {
@@ -191,7 +191,7 @@
   },
   {
     "category": "error_string",
-    "query": "unknown profile choices",
+    "query": "unsupported removed embedder id error",
     "expected_paths": [
       "src/engram_mcp/embeddings/factory.py",
       "src/engram_mcp/server.py"
