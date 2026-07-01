@@ -1,19 +1,16 @@
 """Embedder profiles + a cached factory.
 
-All profiles are LOCAL (no cloud API) and Apache-2.0 / MIT licensed. Two backends:
+All profiles are LOCAL (no cloud API), Apache-2.0, and multilingual (incl.
+Russian) + code. Naming: local_<cpu|gpu>_<small|large>. Two backends:
 
-  FastEmbed (ONNX, light, no torch) — the default / no-GPU path:
-    local_fast     - bge-small-en-v1.5 (384d) CPU. Default. English.
-    local_quality  - bge-large-en-v1.5 (1024d), CUDA if available. English.
-    local_granite  - granite-embedding-97m-multilingual-r2 (384d) CPU.
-                     Multilingual (incl. Russian) + code, Apache-2.0, ~0 VRAM.
-    local_granite_quality - granite-embedding-311m-multilingual-r2 (768d) CPU.
+  cpu — FastEmbed/ONNX, no torch, ~0 VRAM (Granite R2). The default path:
+    local_cpu_small - granite-embedding-97m-multilingual-r2  (384d). Default.
+    local_cpu_large - granite-embedding-311m-multilingual-r2 (768d).
 
-  sentence-transformers (torch, GPU-recommended) — the quality path, behind the
-  optional `gpu` extra (`uv sync --extra gpu`). Qwen3-Embedding tops MTEB on
-  both text AND code, so one family covers prose and source:
-    local_qwen_small - Qwen3-Embedding-0.6B (1024d). Light, CPU-tolerable.
-    local_qwen       - Qwen3-Embedding-4B (1024d MRL). Strongest practical pick.
+  gpu — sentence-transformers (torch), behind the optional `gpu` extra
+  (`uv sync --extra gpu`). Qwen3-Embedding, stronger but loads into VRAM:
+    local_gpu_small - Qwen3-Embedding-0.6B (1024d).
+    local_gpu_large - Qwen3-Embedding-4B (1024d MRL). Strongest practical pick.
 
 model_id is device-independent but model+dim-specific, so it keys the index +
 cache: switching model/dim invalidates cleanly; switching CPU<->GPU does not.
@@ -28,31 +25,32 @@ from functools import lru_cache
 from engram_mcp import errors
 from engram_mcp.embeddings.fastembed_provider import FastEmbedProvider
 
-# name -> (model_name, device)
+# Unified profile names: local_<cpu|gpu>_<small|large>.
+#   cpu = FastEmbed/ONNX, no torch, ~0 VRAM   |   gpu = torch, VRAM
+# Every model is multilingual (incl. Russian) + code, Apache-2.0.
+
+# cpu path — name -> (model_name, device). Granite R2 via FastEmbed custom ONNX.
 _FASTEMBED: dict[str, tuple[str, str]] = {
-    "local_fast": ("BAAI/bge-small-en-v1.5", "cpu"),
-    "local_quality": ("BAAI/bge-large-en-v1.5", "auto"),
-    # Granite R2 (ONNX, no torch): multilingual (incl. Russian) + code, Apache-2.0,
-    # ~0 VRAM — the light everyday pick when many chats each spawn a server.
-    "local_granite": ("ibm-granite/granite-embedding-97m-multilingual-r2", "cpu"),
-    "local_granite_quality": ("ibm-granite/granite-embedding-311m-multilingual-r2", "cpu"),
+    "local_cpu_small": ("ibm-granite/granite-embedding-97m-multilingual-r2", "cpu"),
+    "local_cpu_large": ("ibm-granite/granite-embedding-311m-multilingual-r2", "cpu"),
 }
 
-# name -> (model_name, device, truncate_dim, query_prompt, passage_prompt)
-# Qwen3-Embedding family (Apache-2.0). MRL lets the 4B's native 2560d be
-# truncated to 1024 for index parity with bge-large at <few % quality loss.
+# gpu path — name -> (model_name, device, truncate_dim, query_prompt, passage_prompt).
+# Qwen3-Embedding family; MRL truncates the 4B's native 2560d to 1024 for index
+# parity at <few % quality loss.
 _QWEN: dict[str, tuple[str, str, int | None, str | None, str | None]] = {
-    "local_qwen_small": ("Qwen/Qwen3-Embedding-0.6B", "auto", 1024, "query", None),
-    "local_qwen": ("Qwen/Qwen3-Embedding-4B", "auto", 1024, "query", None),
+    "local_gpu_small": ("Qwen/Qwen3-Embedding-0.6B", "auto", 1024, "query", None),
+    "local_gpu_large": ("Qwen/Qwen3-Embedding-4B", "auto", 1024, "query", None),
 }
 
 PROFILES = frozenset(_FASTEMBED) | frozenset(_QWEN)
 # Index-time default profile. ENGRAM_DEFAULT_INDEX_PROFILE is the explicit knob;
-# ENGRAM_PROFILE remains as a backwards-compatible alias for existing setups.
+# ENGRAM_PROFILE remains as a backwards-compatible alias. Default is the light
+# no-VRAM multilingual model so an always-on server stays cheap across clients.
 DEFAULT_PROFILE = (
     os.environ.get("ENGRAM_DEFAULT_INDEX_PROFILE")
     or os.environ.get("ENGRAM_PROFILE")
-    or "local_fast"
+    or "local_cpu_small"
 )
 
 _LOADED_MODEL_IDS: set[str] = set()
@@ -132,7 +130,14 @@ def provider_for_model_id(model_id: str, device: str = "auto"):
                 f"unsupported embedder id: {model_id!r}",
                 errors.E_UNKNOWN_PROFILE,
             )
-        provider = _fastembed(model_name, device)
+        # Custom ONNX models (Granite) are the no-VRAM `local_cpu_*` profiles:
+        # pin replay to CPU so it (a) reuses the same cached provider built at
+        # index time (device is part of the lru key) and (b) can never quietly
+        # run on CUDA and break the advertised ~0-VRAM contract.
+        from engram_mcp.embeddings.fastembed_provider import _CUSTOM_ONNX
+
+        dev = "cpu" if model_name in _CUSTOM_ONNX else device
+        provider = _fastembed(model_name, dev)
         _remember_loaded(provider)
         return provider
     if model_id.startswith("st:"):

@@ -57,7 +57,7 @@ BINARY_EXTS = frozenset(
 
 MAX_FILE_BYTES = 1_000_000  # skip files larger than ~1 MB by default
 CHARS_PER_TOKEN = 4  # rough token estimate for chunk sizing only
-CHUNK_MAX_TOKENS = 480  # hard cap per chunk (bge-small context is 512)
+CHUNK_MAX_TOKENS = 480  # hard cap per chunk (small enough for any embedder's context)
 CHUNK_OVERLAP_TOKENS = 60  # overlap for the line-window fallback
 # Prose (markdown/plain-text) chunk cap. Kept at the model context for now;
 # split as a named knob so prose can be tuned independently of code chunks.
@@ -76,7 +76,7 @@ PROSE_CHUNK_MAX_TOKENS = 480
 # embedding-cache key.
 CHUNKER_VERSION = "4"
 
-# Default local embedder (FastEmbed / ONNX, bge-small-en-v1.5, 384-dim).
-DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# Default local embedder (FastEmbed / ONNX, Granite R2 97m multilingual, 384-dim).
+DEFAULT_EMBED_MODEL = "ibm-granite/granite-embedding-97m-multilingual-r2"
 DEFAULT_EMBED_DIM = 384
 EMBED_BATCH_SIZE = 256

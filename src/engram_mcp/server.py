@@ -470,8 +470,9 @@ async def index_project(
     Returns a job_id immediately. Poll index_status until status == 'done'
     (or 'error'). Incremental by default (only changed files are touched);
     pass full_rebuild=true to rebuild the whole index atomically. profile is
-    one of local_fast (CPU, default), local_quality (bge-large), or the
-    Qwen3 quality profiles local_qwen_small / local_qwen (need the gpu extra).
+    one of local_cpu_small (default) / local_cpu_large (Granite, no-torch,
+    ~0 VRAM) or local_gpu_small / local_gpu_large (Qwen3, need the gpu extra).
+    All are multilingual + code.
     """
     return start_index_job(project_path, full_rebuild, profile)
 

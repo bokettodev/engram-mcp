@@ -1,6 +1,6 @@
 """Local embedding provider backed by FastEmbed (ONNX).
 
-Default model: BAAI/bge-small-en-v1.5 (384-dim). Device is "cpu" by default;
+Default model: granite-embedding-97m-multilingual-r2 (384-dim). Device is "cpu" by default;
 "cuda" uses the ONNX CUDA execution provider (requires the `fastembed-gpu`
 package + a working CUDA runtime) and falls back to CPU if unavailable. "auto"
 picks CUDA when an ONNX CUDA provider is present.
@@ -29,6 +29,8 @@ _CUSTOM_ONNX: dict[str, dict] = {
     "ibm-granite/granite-embedding-311m-multilingual-r2": {"pooling": "CLS", "dim": 768},
 }
 
+_REGISTER_LOCK = threading.Lock()
+
 
 def _ensure_custom_registered(model_name: str) -> None:
     """Register a known custom ONNX model with FastEmbed (idempotent, no download)."""
@@ -37,17 +39,23 @@ def _ensure_custom_registered(model_name: str) -> None:
         return
     from fastembed import TextEmbedding
 
-    if any(m["model"] == model_name for m in TextEmbedding.list_supported_models()):
-        return
-    from fastembed.common.model_description import ModelSource, PoolingType
+    # check-and-add under a lock: lru_cache can compute concurrent first-use
+    # misses, and add_custom_model rejects duplicates.
+    with _REGISTER_LOCK:
+        if any(m["model"] == model_name for m in TextEmbedding.list_supported_models()):
+            return
+        from fastembed.common.model_description import ModelSource, PoolingType
 
-    TextEmbedding.add_custom_model(
-        model=model_name,
-        pooling=PoolingType[spec["pooling"]],
-        normalization=True,
-        sources=ModelSource(hf=model_name),
-        dim=spec["dim"],
-    )
+        try:
+            TextEmbedding.add_custom_model(
+                model=model_name,
+                pooling=PoolingType[spec["pooling"]],
+                normalization=True,
+                sources=ModelSource(hf=model_name),
+                dim=spec["dim"],
+            )
+        except ValueError:
+            pass  # already registered by a racing caller
 
 
 def _resolve_device(device: str) -> str:

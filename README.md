@@ -88,20 +88,21 @@ claude mcp add engram -- uv --directory /ABSOLUTE/PATH/TO/engram-mcp run engram-
 }
 ```
 
-**Picking the model for the server.** The server defaults to `local_fast`
-(bge-small). To make it use another profile for *new* indexing, set
-`ENGRAM_DEFAULT_INDEX_PROFILE` in the server's env. `ENGRAM_PROFILE` still works
-as a backwards-compatible alias. Neither affects search over an existing index:
-search always uses the model recorded in the project's manifest.
+**Picking the model for the server.** The server defaults to `local_cpu_small`
+(Granite, no torch, ~0 VRAM). To make it use another profile for *new* indexing,
+set `ENGRAM_DEFAULT_INDEX_PROFILE` in the server's env. `ENGRAM_PROFILE` still
+works as a backwards-compatible alias. Neither affects search over an existing
+index: search always uses the model recorded in the project's manifest.
 
 ```bash
-claude mcp add engram -e ENGRAM_DEFAULT_INDEX_PROFILE=local_qwen -- \
+claude mcp add engram -e ENGRAM_DEFAULT_INDEX_PROFILE=local_gpu_large -- \
   uv --directory /ABSOLUTE/PATH/TO/engram-mcp run --extra gpu engram-mcp
 ```
 
-- A `local_qwen*` profile needs the torch models present, so launch the server
+- A `local_gpu_*` profile needs the torch models present, so launch the server
   with `run --extra gpu` (or pre-run `uv sync --extra gpu` once). Without it,
-  `uv run` syncs only the base deps and the Qwen profiles can't load.
+  `uv run` syncs only the base deps and the GPU profiles can't load. The default
+  `local_cpu_*` profiles need no extra.
 - **Windows footgun:** if `uv run` reports `failed to remove … engram-mcp.exe …
   used by another process`, a previous server instance is holding the script
   while `uv` tries to re-sync. Launch with `run --no-sync` (use the already-set-up
@@ -178,55 +179,48 @@ Override with `ENGRAM_HOME`. It stores your code — treat it as private.
 
 **Model weights** are a separate, shared cache: downloaded once into the
 Hugging Face cache (`~/.cache/huggingface`, or wherever `HF_HOME` points) and
-reused across projects — not under `ENGRAM_HOME`. They are sizeable (bge-small
-~130 MB; Qwen3-4B ~8 GB), so point `HF_HOME` at a roomy disk if your home
-partition is small.
+reused across projects — not under `ENGRAM_HOME`. Sizes range from ~0.2 GB
+(the default Granite 97m) to ~8 GB (Qwen3-4B), so point `HF_HOME` at a roomy
+disk if your home partition is small.
 
 ## Embedder profiles
 
-FastEmbed (ONNX, light, **no torch, no GPU needed**) — the default:
+Four profiles, named `local_<cpu|gpu>_<small|large>`. **Every model is
+multilingual (100+ languages incl. Russian) + code, and Apache-2.0.** The axis
+that matters is cost: `cpu` = FastEmbed/ONNX, no torch, **~0 VRAM**; `gpu` =
+torch, loads the model into VRAM.
 
-| Profile | Model | Dim | Lang | Device |
-|---|---|---|---|---|
-| `local_fast` (default) | bge-small-en-v1.5 | 384 | English | CPU |
-| `local_quality` | bge-large-en-v1.5 | 1024 | English | CUDA if available |
-| `local_granite` | granite-embedding-97m-multilingual-r2 | 384 | **multilingual + code** | CPU |
-| `local_granite_quality` | granite-embedding-311m-multilingual-r2 | 768 | **multilingual + code** | CPU |
+| Profile | Model | Dim | Backend / cost |
+|---|---|---|---|
+| `local_cpu_small` (default) | granite-embedding-97m-multilingual-r2 | 384 | ONNX · no torch · ~0 VRAM |
+| `local_cpu_large` | granite-embedding-311m-multilingual-r2 | 768 | ONNX · no torch · ~0 VRAM |
+| `local_gpu_small` | Qwen3-Embedding-0.6B | 1024 | torch · needs `gpu` extra + GPU |
+| `local_gpu_large` | Qwen3-Embedding-4B | 1024 (MRL) | torch · needs `gpu` extra + GPU |
 
-[Granite R2](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2)
-(IBM, Apache-2.0) covers 100+ languages **including Russian** plus code, runs on
-CPU/ONNX with **~0 VRAM**, and has a 32K context — the light everyday pick when
-several editor/agent windows each spawn their own server (see *GPU memory* below).
-The model is registered with FastEmbed on first use and downloaded once.
+**cpu path — [Granite R2](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2)**
+(IBM, Apache-2.0): 32K context, runs on CPU/ONNX with ~0 VRAM, registered with
+FastEmbed on first use (downloaded once). The default, and the right pick when
+several editor/agent windows each spawn their own server (see *GPU memory*).
+On this repo's English eval `local_cpu_small` matches the old bge-small baseline
+— no English regression — while adding Russian + code.
 
-Quality models (**GPU recommended**) — behind the optional `gpu` extra (pulls
-torch, ~2 GB). [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-4B)
-tops MTEB on **both text and code**, so one family covers prose and source:
+**gpu path — [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-4B)**
+(Apache-2.0): stronger, tops MTEB on text and code, but loads into VRAM. Behind
+the optional `gpu` extra (pulls a CUDA build of torch automatically on
+Windows/Linux, ~2 GB — only an NVIDIA driver needed):
 
 ```bash
 uv sync --extra gpu
-uv run engram index <path> --profile local_qwen
+uv run engram index <path> --profile local_gpu_large
 ```
 
-On Windows/Linux this installs a **CUDA build of torch automatically** (the
-models then run on your NVIDIA GPU — only an NVIDIA driver is needed, no separate
-CUDA toolkit). On CPU they work but are far slower, so a GPU is strongly
-recommended. The default `uv sync` (no extra) is unaffected — it stays
-torch-free and CPU-only.
-
-| Profile | Model | Dim | Model license |
-|---|---|---|---|
-| `local_qwen_small` | Qwen3-Embedding-0.6B | 1024 | Apache-2.0 |
-| `local_qwen` | Qwen3-Embedding-4B | 1024 (MRL) | Apache-2.0 |
-
 The 4B's native 2560 dims are truncated to 1024 via Matryoshka (MRL) for index
-parity at <few % quality loss. The embedder id (incl. dim) is recorded in the
-index manifest, so search auto-selects the matching model and switching model
-re-indexes cleanly. Set the index-time default with `ENGRAM_DEFAULT_INDEX_PROFILE`
-(or legacy `ENGRAM_PROFILE`), e.g. `ENGRAM_DEFAULT_INDEX_PROFILE=local_qwen`.
-`bge-small` stays the default because it needs no GPU and no torch.
-
-**Every model here is Apache-2.0 / MIT** — no non-commercial restrictions.
+parity at <few % quality loss. The default `uv sync` (no extra) stays torch-free
+and CPU-only. The embedder id (incl. dim) is recorded in the index manifest, so
+search auto-selects the matching model and switching model re-indexes cleanly.
+Set the index-time default with `ENGRAM_DEFAULT_INDEX_PROFILE` (or legacy
+`ENGRAM_PROFILE`), e.g. `ENGRAM_DEFAULT_INDEX_PROFILE=local_gpu_small`.
+`local_cpu_small` is the default because it needs no GPU and no torch.
 
 ### Behind a corporate TLS-inspecting proxy
 
@@ -245,18 +239,18 @@ already lives. If you still hit issues:
 
 ### GPU memory (torch profiles)
 
-The `local_qwen*` profiles load the model into VRAM; the FastEmbed `local_*`
-profiles use ONNX and effectively no VRAM. A few things worth knowing for a
+The `local_gpu_*` profiles load the model into VRAM; the `local_cpu_*` profiles
+use FastEmbed/ONNX and effectively no VRAM. A few things worth knowing for a
 GPU-shared, always-on server:
 
 - **One model copy per process.** Each MCP client (editor/agent window) spawns
   its own stdio server process, and each loads its own copy of the model into
-  VRAM. N open clients on a Qwen profile ≈ N model copies. The no-VRAM
-  `local_fast` (bge, default) sidesteps this — keep it as the always-on default
-  and request a `local_qwen*` profile per index when you want the quality.
-- **A Qwen index pulls Qwen into search too:** search uses the model recorded in
-  the project's manifest, so searching a Qwen-indexed project loads Qwen even if
-  your default profile is bge.
+  VRAM. N open clients on a `local_gpu_*` profile ≈ N model copies. The no-VRAM
+  `local_cpu_small` (default) sidesteps this — keep it as the always-on default
+  and request a `local_gpu_*` profile per index when you want the extra quality.
+- **A `local_gpu_*` index pulls that model into search too:** search uses the
+  model recorded in the project's manifest, so searching a Qwen-indexed project
+  loads Qwen even if your default profile is a `local_cpu_*` one.
 - **`ENGRAM_ST_BATCH_SIZE`** (default 16) caps the encode batch — the real lever
   on activation VRAM during indexing. Lower it (e.g. 8) on a tight/shared GPU;
   raise it for throughput on a dedicated one.
@@ -274,11 +268,11 @@ Search modes (`--mode`, default `auto`):
 - **hybrid** — vector + full-text (BM25), fused with reciprocal-rank fusion + symbol/path boosts.
 - **`--rerank`** — a local cross-encoder reranks the top candidates (needs `--extra gpu`).
 
-A built-in `eval` harness reports hit@1/5/10 + MRR **per query category** — that's how
-the defaults were chosen. On the bundled 50-query set, hybrid beats vector overall
-(hit@1 80% vs 72%), and swapping the CPU `bge-small` for a GPU `local_qwen*`
-(Qwen3-Embedding) model lifts hit@1 further. Run `eval` on your own repo to tune
-for your codebase.
+A built-in `eval` harness reports hit@1/5/10 + MRR **per query category**. On the
+repo's own 50-query set the no-VRAM `local_cpu_small` (Granite) is on par with the
+GPU `local_gpu_small` (Qwen3-0.6B) for code retrieval; the `local_gpu_*` profiles
+pull ahead more on large, prose-heavy, or non-English corpora. Run `eval` on your
+own repo to tune for your codebase.
 
 ## Performance
 
@@ -292,7 +286,7 @@ stronger but much slower on CPU — use a GPU for them.
 | Concern | Choice |
 |---|---|
 | Runtime | Python 3.12 via [`uv`](https://docs.astral.sh/uv/) |
-| Embedder | [FastEmbed](https://github.com/qdrant/fastembed) (`bge`, ONNX) · optional [sentence-transformers](https://www.sbert.net/) (Qwen3-Embedding) |
+| Embedder | [FastEmbed](https://github.com/qdrant/fastembed) (Granite R2, ONNX, no torch) · optional [sentence-transformers](https://www.sbert.net/) (Qwen3-Embedding, GPU) |
 | Vector store | [LanceDB](https://lancedb.com/) (embedded, on-disk, vector + full-text) |
 | Chunker | tree-sitter — 11 languages (py/js/ts/tsx/go/rust/java/c/cpp/ruby/c#) · markdown by heading section · plain text by paragraph · line-window fallback |
 | Server | MCP Python SDK (FastMCP, stdio) |
@@ -303,7 +297,7 @@ stronger but much slower on CPU — use a GPU for them.
 - ✅ Structure-aware prose: markdown split by heading section (breadcrumb → chunk symbol) + plain text packed by paragraph
 - ✅ Local embedding + LanceDB store + content-hash cache
 - ✅ Atomic full rebuild + incremental re-index + per-project lock
-- ✅ Embedder profiles: no-torch FastEmbed (bge) + Qwen3-Embedding quality models via `--extra gpu`
+- ✅ Embedder profiles: multilingual+code, `local_<cpu|gpu>_<small|large>` — no-torch Granite R2 (default) + Qwen3-Embedding via `--extra gpu`
 - ✅ TLS downloads work behind corporate MITM proxies (OS trust store by default)
 - ✅ Bounded + reclaimed GPU memory (`ENGRAM_ST_BATCH_SIZE`, cache release after bulk index)
 - ✅ Search modes auto / vector / hybrid + optional cross-encoder rerank
