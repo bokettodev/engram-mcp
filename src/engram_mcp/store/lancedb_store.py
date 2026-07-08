@@ -50,14 +50,15 @@ class LanceStore:
             return self.db.open_table(self.table)
         return self.db.create_table(self.table, schema=self._schema)
 
-    def create(self, rows: list[dict]) -> None:
+    def create(self, rows: list[dict], *, refresh_fts: bool = True) -> None:
         """(Re)create this table from scratch with ``rows`` and an FTS index."""
         if self.exists():
             self.db.drop_table(self.table)
         tbl = self.db.create_table(self.table, schema=self._schema)
         if rows:
             tbl.add(rows)
-            self.refresh_fts()
+            if refresh_fts:
+                self.refresh_fts()
 
     def refresh_fts(self, field: str = "search_text") -> str | None:
         """(Re)build the full-text index used by hybrid search."""

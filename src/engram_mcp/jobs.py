@@ -25,14 +25,29 @@ class JobState:
     chunks: int = 0
     embedded: int = 0
     reused: int = 0
+    progress_unit: str = ""
     done_units: int = 0
-    total_units: int = 0
+    total_units: int | None = None
     error: str | None = None
     code: str | None = None
     hint: str | None = None
     created_at: float = 0.0
     started_at: float = 0.0
+    updated_at: float = 0.0
     finished_at: float = 0.0
+    update_seq: int = 0
+
+    @property
+    def duration_sec(self) -> float:
+        if not self.started_at:
+            return 0.0
+        return (self.finished_at or time.time()) - self.started_at
+
+    @property
+    def seconds_since_update(self) -> float:
+        if not self.updated_at:
+            return 0.0
+        return time.time() - self.updated_at
 
 
 _MAX_HISTORY = 200
@@ -51,6 +66,7 @@ class JobRegistry:
                 project_path=project_path,
                 created_at=time.time(),
             )
+            job.updated_at = job.created_at
             self._jobs[job.job_id] = job
             return job
 
@@ -72,6 +88,8 @@ class JobRegistry:
                 return
             for k, v in fields.items():
                 setattr(job, k, v)
+            job.updated_at = time.time()
+            job.update_seq += 1
 
     def get(self, job_id: str) -> JobState | None:
         with self._lock:
@@ -85,6 +103,7 @@ class JobRegistry:
 def snapshot(job: JobState) -> dict:
     now = time.time()
     elapsed = ((job.finished_at or now) - job.started_at) if job.started_at else 0.0
+    seconds_since_update = (now - job.updated_at) if job.updated_at else 0.0
     eta = None
     if job.status == "running" and job.done_units and job.total_units:
         per_unit = elapsed / job.done_units
@@ -102,7 +121,18 @@ def snapshot(job: JobState) -> dict:
         "chunks": job.chunks,
         "embedded": job.embedded,
         "reused": job.reused,
-        "progress": {"done": job.done_units, "total": job.total_units},
+        "progress": {
+            "unit": job.progress_unit or None,
+            "done": job.done_units,
+            "total": job.total_units,
+        },
+        "created_at": job.created_at,
+        "started_at": job.started_at or None,
+        "updated_at": job.updated_at or None,
+        "finished_at": job.finished_at or None,
+        "duration_sec": round(elapsed, 2),
+        "seconds_since_update": round(seconds_since_update, 2),
+        "update_seq": job.update_seq,
         "elapsed_sec": round(elapsed, 2),
         "eta_sec": round(eta, 1) if eta is not None else None,
         "error": job.error,

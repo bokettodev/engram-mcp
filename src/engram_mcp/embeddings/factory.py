@@ -17,8 +17,9 @@ import importlib.util
 import os
 import threading
 from functools import lru_cache
+from typing import Any, Callable
 
-from engram_mcp import errors
+from engram_mcp import errors, paths
 from engram_mcp.embeddings.fastembed_provider import FastEmbedProvider
 
 GRANITE_MODEL = "ibm-granite/granite-embedding-97m-multilingual-r2"
@@ -36,6 +37,7 @@ _REMOVED_EMBEDDER_HINT = (
 
 _LOADED_BACKEND_IDS: set[str] = set()
 _LOADED_LOCK = threading.Lock()
+ProgressSink = Callable[[dict[str, Any]], None]
 
 
 def _backend_id(provider) -> str:
@@ -130,6 +132,41 @@ def default_index_device() -> str:
     return resolve_index_device(None)
 
 
+def _emit_progress(progress: ProgressSink | None, stage: str, **fields) -> None:
+    if progress is None:
+        return
+    event = {"stage": stage, **fields}
+    try:
+        progress(event)
+    except TypeError:
+        # Factory progress is event-only. Ignore old embedding-only callbacks.
+        return
+
+
+def acquire_gpu_index_lock(progress: ProgressSink | None = None, timeout: float = -1):
+    """Acquire the machine-wide CUDA indexing lock.
+
+    The lock is blocking by default. Passing a short timeout is useful in tests
+    and diagnostics.
+    """
+
+    _emit_progress(
+        progress,
+        "waiting_for_gpu",
+        unit="lock",
+        done=0,
+        total=None,
+    )
+    lock = paths.gpu_index_lock()
+    lock.acquire(timeout=timeout)
+    return lock
+
+
+def release_gpu_index_lock(lock) -> None:
+    if lock is not None:
+        lock.release()
+
+
 @lru_cache(maxsize=1)
 def _fastembed_granite_cpu() -> FastEmbedProvider:
     from engram_mcp.net import guard_download
@@ -173,7 +210,7 @@ def provider_for_model_id(model_id: str):
     return provider
 
 
-def make_index_provider(index_device: str | None = None):
+def make_index_provider(index_device: str | None = None, *, progress: ProgressSink | None = None):
     """Build an index-time provider.
 
     CPU providers are cached. CUDA providers are intentionally not cached so a
@@ -184,10 +221,17 @@ def make_index_provider(index_device: str | None = None):
     """
 
     device = effective_index_device(resolve_index_device(index_device))
+    gpu_lock = None
     if device == "cpu":
         provider = _fastembed_granite_cpu()
     elif device == "cuda":
-        provider = _sentence_transformers_granite_cuda()
+        gpu_lock = acquire_gpu_index_lock(progress)
+        try:
+            provider = _sentence_transformers_granite_cuda()
+        except Exception:
+            release_gpu_index_lock(gpu_lock)
+            raise
+        setattr(provider, "_engram_gpu_index_lock", gpu_lock)
     else:  # pragma: no cover - resolve_index_device validates the value
         raise AssertionError(f"unhandled index device: {device}")
     _remember_loaded(provider)
@@ -212,11 +256,20 @@ def release_index_provider(provider) -> None:
     try:
         provider.release_unused_cache()
     finally:
-        if getattr(provider, "device", None) == "cuda" and hasattr(provider, "unload"):
-            try:
-                provider.unload()
-            finally:
-                _forget_loaded(provider)
+        gpu_lock = getattr(provider, "_engram_gpu_index_lock", None)
+        try:
+            if getattr(provider, "device", None) == "cuda" and hasattr(provider, "unload"):
+                try:
+                    provider.unload()
+                finally:
+                    _forget_loaded(provider)
+        finally:
+            if gpu_lock is not None:
+                release_gpu_index_lock(gpu_lock)
+                try:
+                    setattr(provider, "_engram_gpu_index_lock", None)
+                except Exception:
+                    pass
 
 
 def provider_for_project(root):

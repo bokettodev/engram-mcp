@@ -55,6 +55,31 @@ def test_unknown_job_and_empty_list(tmp_path, monkeypatch):
     assert listed["data_home"] == str(tmp_path / "home")
 
 
+def test_job_snapshot_timestamps_and_update_sequence(tmp_path):
+    from engram_mcp.jobs import JobRegistry, snapshot
+
+    reg = JobRegistry()
+    job = reg.create(str(tmp_path))
+    first = snapshot(job)
+    assert first["created_at"]
+    assert first["updated_at"] == first["created_at"]
+    assert first["update_seq"] == 0
+    assert first["finished_at"] is None
+    assert first["progress"]["total"] is None
+
+    reg.update(job.job_id, status="running", stage="scanning", started_at=time.time())
+    second = snapshot(reg.get(job.job_id))
+    reg.update(job.job_id, stage="embedding", done_units=1, total_units=3)
+    third = snapshot(reg.get(job.job_id))
+
+    assert second["update_seq"] == 1
+    assert third["update_seq"] == 2
+    assert third["updated_at"] >= second["updated_at"]
+    assert third["duration_sec"] >= 0
+    assert third["seconds_since_update"] >= 0
+    assert third["progress"] == {"unit": None, "done": 1, "total": 3}
+
+
 def test_bad_path_raises(tmp_path):
     from engram_mcp import server
 

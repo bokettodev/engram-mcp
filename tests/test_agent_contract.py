@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -44,6 +47,13 @@ class FakeProvider:
         pass
 
 
+class CanonicalFakeProvider(FakeProvider):
+    from engram_mcp.embeddings import factory
+
+    model_id = factory.CANONICAL_EMBEDDER_ID
+    backend_id = model_id
+
+
 def _write_project(tmp_path: Path) -> Path:
     proj = tmp_path / "proj"
     proj.mkdir()
@@ -64,6 +74,13 @@ def _write_project(tmp_path: Path) -> Path:
 
 def _indexed_project(tmp_path: Path) -> tuple[Path, FakeProvider]:
     provider = FakeProvider()
+    proj = _write_project(tmp_path)
+    index_project(proj, provider, full_rebuild=True)
+    return proj, provider
+
+
+def _indexed_canonical_project(tmp_path: Path) -> tuple[Path, CanonicalFakeProvider]:
+    provider = CanonicalFakeProvider()
     proj = _write_project(tmp_path)
     index_project(proj, provider, full_rebuild=True)
     return proj, provider
@@ -308,6 +325,61 @@ def test_list_projects_reports_broken_inventory(tmp_path):
     assert out["errors"][0]["code"] == errors.E_INDEX_INVALID
 
 
+def test_list_projects_compact_pagination_and_orphan_prune(tmp_path):
+    from engram_mcp import server
+    from engram_mcp.embeddings import factory
+
+    roots = []
+    for name in ("alpha", "beta", "gamma"):
+        root = tmp_path / name
+        root.mkdir()
+        roots.append(root)
+        pdir = paths.project_dir(root)
+        manifest.save_project(
+            pdir,
+            manifest.ProjectManifest(
+                project_id=paths.project_id_for(root),
+                root_path=str(root.resolve()),
+                active_table="chunks",
+                generation=3,
+                embedder_id=factory.CANONICAL_EMBEDDER_ID,
+                dim=config.DEFAULT_EMBED_DIM,
+                chunker_version=config.CHUNKER_VERSION,
+                files=2,
+                chunks=7,
+                indexed_at=123.0,
+            ),
+        )
+
+    first = server.list_projects(limit=2, prune_orphans=False)
+    assert len(first["projects"]) == 2
+    assert first["cursor"] is not None
+    assert set(first["projects"][0]) == {
+        "project_id",
+        "root_path",
+        "root_exists",
+        "files",
+        "chunks",
+        "indexed_at",
+        "embedder_id",
+        "generation",
+    }
+    assert "table_rows" not in first["projects"][0]
+
+    second = server.list_projects(limit=2, cursor=first["cursor"], prune_orphans=False)
+    assert len(second["projects"]) == 1
+    assert second["cursor"] is None
+
+    orphan_root = roots[0]
+    orphan_pdir = paths.project_dir(orphan_root, create=False)
+    for child in orphan_root.iterdir():
+        child.unlink()
+    orphan_root.rmdir()
+    pruned = server.list_projects(limit=10, prune_orphans=True)
+    assert any(item["root_path"] == str(orphan_root.resolve()) for item in pruned["gc"]["pruned"])
+    assert not orphan_pdir.exists()
+
+
 def test_chunk_role_heuristics():
     assert derive_chunk_role("src/app.py", "python", "function_definition") == "executable"
     assert derive_chunk_role("tests/test_app.py", "python", "function_definition") == "test"
@@ -354,6 +426,48 @@ def test_model_status_rejects_removed_embedder_without_load(tmp_path):
     assert out["code"] == errors.E_UNKNOWN_PROFILE
 
 
+def test_do_search_waits_for_model_future_then_succeeds(tmp_path, monkeypatch):
+    from engram_mcp import server
+    from engram_mcp.embeddings import factory
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    server._model_loads.clear()
+    monkeypatch.setattr(factory, "is_model_loaded", lambda _backend_id: False)
+    monkeypatch.setenv("ENGRAM_SEARCH_WAIT_SEC", "1")
+
+    def load(_model_id):
+        time.sleep(0.05)
+        return provider
+
+    monkeypatch.setattr(server, "_provider_load_worker", load)
+    out = server.do_search(str(proj), "add numbers", k=1)
+    assert out["count"] == 1
+    assert out["results"][0]["symbol"] == "add_numbers"
+    server._model_loads.clear()
+
+
+def test_do_search_returns_model_loading_after_wait_budget(tmp_path, monkeypatch):
+    from engram_mcp import server
+    from engram_mcp.embeddings import factory
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    server._model_loads.clear()
+    monkeypatch.setattr(factory, "is_model_loaded", lambda _backend_id: False)
+    monkeypatch.setenv("ENGRAM_SEARCH_WAIT_SEC", "0.01")
+
+    def load(_model_id):
+        time.sleep(0.15)
+        return provider
+
+    monkeypatch.setattr(server, "_provider_load_worker", load)
+    out = server.do_search(str(proj), "add numbers", k=1)
+    assert out["code"] == errors.E_MODEL_LOADING
+    assert out["retry_after_sec"] > 0
+    for fut in list(server._model_loads.values()):
+        fut.result(timeout=1)
+    server._model_loads.clear()
+
+
 def test_manifest_compat_uses_canonical_model_id():
     from engram_mcp.embeddings import factory
 
@@ -391,9 +505,22 @@ def test_cpu_index_job_errors_are_structured(tmp_path, monkeypatch):
     assert status["hint"] == "install gpu"
 
 
-class _FakeProc:
-    def __init__(self, stdout="", returncode=0, stderr=""):
-        self.stdout, self.returncode, self.stderr = stdout, returncode, stderr
+class _StreamingStdout:
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+class _FakePopen:
+    def __init__(self, lines, returncode=0, stderr=""):
+        self.stdout = _StreamingStdout(lines)
+        self.stderr = io.StringIO(stderr)
+        self.returncode = returncode
+
+    def wait(self):
+        return self.returncode
 
 
 def test_gpu_index_job_error_from_subprocess_is_structured(tmp_path, monkeypatch):
@@ -401,8 +528,8 @@ def test_gpu_index_job_error_from_subprocess_is_structured(tmp_path, monkeypatch
     from engram_mcp import server
 
     job = server._registry.create(str(tmp_path))
-    out = '{"ok": false, "error": "missing extra", "code": "E_EXTRA_MISSING", "hint": "install gpu"}'
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _FakeProc(out, 2))
+    out = '{"event": "result", "version": 1, "ok": false, "error": "missing extra", "code": "E_EXTRA_MISSING", "hint": "install gpu"}\n'
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: _FakePopen([out], 2))
     server._index_worker(job.job_id, str(tmp_path), False, "cuda")
     status = server.get_status(job.job_id)
     assert status["status"] == "error"
@@ -410,16 +537,62 @@ def test_gpu_index_job_error_from_subprocess_is_structured(tmp_path, monkeypatch
     assert status["hint"] == "install gpu"
 
 
-def test_gpu_index_job_success_parses_subprocess_json(tmp_path, monkeypatch):
+def test_gpu_index_job_streams_progress_and_result(tmp_path, monkeypatch):
     from engram_mcp import server
 
     job = server._registry.create(str(tmp_path))
-    out = ('{"ok": true, "mode": "full", "files": 3, "chunks": 12, "embedded_unique": 12, '
-           '"reused_unique": 0, "embedder_id": "fastembed:granite", "backend_id": "st:granite:cuda", '
-           '"device": "cuda", "seconds": 0.1}')
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _FakeProc(out, 0))
+    lines = [
+        '{"event": "progress", "version": 1, "seq": 1, "stage": "waiting_for_gpu", "unit": "lock", "done": 0, "total": null}\n',
+        '{"event": "progress", "version": 1, "seq": 2, "stage": "embedding", "unit": "embeddings", "done": 4, "total": 12, "chunks": 12, "embedded": 4, "reused": 1}\n',
+        '{"event": "result", "version": 1, "ok": true, "mode": "full", "files": 3, "chunks": 12, "embedded_unique": 12, '
+        '"reused_unique": 1, "embedder_id": "fastembed:granite", "backend_id": "st:granite:cuda", '
+        '"device": "cuda", "seconds": 0.1}\n',
+    ]
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: _FakePopen(lines, 0))
     server._index_worker(job.job_id, str(tmp_path), False, "auto")  # auto also routes to the subprocess
     status = server.get_status(job.job_id)
     assert status["status"] == "done"
     assert status["chunks"] == 12
     assert status["embedder_id"] == "fastembed:granite"
+    assert status["progress"] == {"unit": "chunks", "done": 12, "total": 12}
+    assert status["update_seq"] >= 4
+
+
+def test_subprocess_progress_updates_registry_before_result(tmp_path, monkeypatch):
+    from engram_mcp import server
+
+    first_progress_seen = threading.Event()
+    allow_result = threading.Event()
+
+    class BlockingStdout:
+        def __iter__(self):
+            yield '{"event": "progress", "version": 1, "seq": 1, "stage": "embedding", "unit": "embeddings", "done": 2, "total": 5, "chunks": 5, "embedded": 2, "reused": 0}\n'
+            first_progress_seen.set()
+            assert allow_result.wait(timeout=2)
+            yield '{"event": "result", "version": 1, "ok": true, "mode": "full", "files": 1, "chunks": 5, "embedded_unique": 5, "reused_unique": 0, "embedder_id": "fastembed:granite", "backend_id": "st:granite:cuda", "device": "cuda", "seconds": 0.1}\n'
+
+    class BlockingPopen:
+        stdout = BlockingStdout()
+        stderr = io.StringIO("")
+        returncode = 0
+
+        def wait(self):
+            return self.returncode
+
+    job = server._registry.create(str(tmp_path))
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: BlockingPopen())
+
+    thread = threading.Thread(
+        target=server._subprocess_index,
+        args=(job.job_id, str(tmp_path), False, "cuda"),
+    )
+    thread.start()
+    assert first_progress_seen.wait(timeout=2)
+    mid = server.get_status(job.job_id)
+    assert mid["stage"] == "embedding"
+    assert mid["progress"] == {"unit": "embeddings", "done": 2, "total": 5}
+    allow_result.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    final = server.get_status(job.job_id)
+    assert final["status"] == "done"

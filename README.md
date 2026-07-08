@@ -58,6 +58,7 @@ uv run engram search   <path> "<query>" -k 8 [--mode auto|vector|hybrid] [--rera
 uv run engram find-def <path> <symbol>                    # exact symbol definition lookup
 uv run engram eval     <path> evals/self.json [--mode M]  # measure retrieval quality
 uv run engram remove   <path>                             # delete a project's index
+uv run engram gc       [--dry-run|--prune]                 # find/prune indexes whose root path is gone
 uv run engram chunk    <path> [--show N]                  # walk + chunk only (no embedding)
 ```
 
@@ -65,6 +66,14 @@ Indexing is **incremental by default** — only changed/added/deleted files are
 re-processed (detected by content hash + mtime), and unchanged chunks are served
 from a global embedding cache, so re-indexing is near-free. `--rebuild` forces a
 full atomic rebuild (a crash mid-rebuild leaves the previous index searchable).
+
+For operators, `engram index --json` emits line-delimited JSON as work proceeds:
+progress events use `{"event":"progress","version":1,"seq":N,"stage":"...",
+"unit":"...","done":n,"total":n|null,...}` and the last line is
+`{"event":"result","version":1,"ok":true,...}` or
+`{"event":"result","version":1,"ok":false,"error":"...","code":"...","hint":"..."}`.
+Stages include `waiting_for_gpu`, `waiting_for_lock`, `scanning`,
+`embedding_plan`, `embedding`, `writing_table`, `writing_fts`, and `done`.
 
 ## Use it as an MCP server
 
@@ -140,15 +149,20 @@ tool call never blocks for minutes):
 | Tool | Purpose |
 |---|---|
 | `index_project(project_path, full_rebuild=False, index_device=None)` | start a background index; returns `job_id`. `index_device`: `auto` (default, prefers GPU) / `cuda` (require GPU) / `cpu` (slow fallback) |
-| `index_status(job_id)` | current-process progress snapshot (stage, counts, ETA) |
+| `index_status(job_id)` | current-process progress snapshot (stage, counts, timestamps, update sequence, ETA) |
 | `search_code(project_path, query, k=8, language=None, mode="auto", rerank=False, content="preview", max_chars_per_result=800, min_relevance=None)` | compact ranked hits over static indexed source |
 | `get_chunk(project_path, chunk_id, max_chars=None)` | fetch full content for one search hit |
 | `find_definition(project_path, symbol)` | exact symbol definition lookup, with suggestions on miss (no embedding) |
 | `model_status(project_path=None)` | reports whether the project's recorded query model is loaded/loading/not_loaded in this process |
 | `reindex_file(project_path, rel_path)` | incrementally re-index/drop one file |
 | `remove_project(project_path)` | delete a project's index |
-| `list_indexed_projects()` | on-disk index inventory, `data_home`, and broken manifest/table `errors[]` |
+| `list_indexed_projects(limit=50, cursor=None, verbose=False, prune_orphans=True)` | compact paginated on-disk index inventory, `data_home`, broken manifest/table `errors[]`, and orphan-GC summary |
 | `server_info()` | data-home, read-only, canonical embedder, and index-device diagnostics |
+
+`index_status` includes `created_at`, `started_at`, `updated_at`,
+`finished_at`, `duration_sec`, `seconds_since_update`, and `update_seq`. The
+`progress` object is `{ "unit": "...", "done": n, "total": n|null }`; unknown
+totals are reported as `null`, not `0`.
 
 `search_code` is a decision tool first: by default each hit contains `chunk_id`,
 `rel_path`/`span`, `symbol`, `symbol_kind`, `chunk_role`, `preview`, `raw_score`,
@@ -158,6 +172,19 @@ tool call never blocks for minutes):
 "static_indexed_source"`, and a `dirty` freshness summary. Use
 `content="none"` to get metadata only, `content="full"` for bounded inline text,
 or `get_chunk` for exact full content by `chunk_id`. `k` is bounded to `1..50`.
+If the query model is not loaded yet, search waits up to
+`ENGRAM_SEARCH_WAIT_SEC` seconds (default `8`) for the FastEmbed/ONNX CPU load
+future before returning `E_MODEL_LOADING` with `retry_after_sec`.
+
+`list_indexed_projects` is compact by default and reads only `project.json`
+manifests, so it does not open LanceDB tables or count rows unless
+`verbose=true`. Each compact project has `project_id`, `root_path`,
+`root_exists`, `files`, `chunks`, `indexed_at`, `embedder_id`, `generation`, and
+git metadata if a future manifest records it. Pass the returned `cursor` to fetch
+the next page. With `prune_orphans=true`, list deletes index directories whose
+manifest `root_path` no longer exists and reports them under `gc.pruned`; use
+`engram gc --dry-run` or `engram gc --prune` for the same orphan rule from the
+CLI.
 
 All read-tool errors use a structural shape: `{ "error": "...", "code": "...",
 "hint": "..." }`. Codes include `E_PROJECT_NOT_INDEXED`, `E_INDEX_INVALID`,
@@ -243,6 +270,11 @@ process that frees everything on exit.
 - **`ENGRAM_ST_BATCH_SIZE`** (default 16) caps the encode batch — the real lever
   on activation VRAM during indexing. Lower it (e.g. 8) on a tight/shared GPU;
   raise it for throughput on a dedicated one.
+- GPU index jobs acquire a machine-wide lock at
+  `ENGRAM_HOME/locks/gpu-index.lock` before loading the CUDA model and release it
+  when the provider is cleaned up. While a job is blocked there,
+  `index_status` reports `stage="waiting_for_gpu"` and
+  `seconds_since_update` shows the wait age.
 - VRAM is held only for the duration of a GPU index job, by the child process,
   never by the always-on search server.
 

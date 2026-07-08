@@ -7,6 +7,7 @@ import sys
 import types
 
 import pytest
+from filelock import Timeout
 
 from engram_mcp import errors
 from engram_mcp.embeddings import factory
@@ -131,6 +132,29 @@ def test_make_index_provider_cpu_uses_fastembed(monkeypatch):
     p = factory.make_index_provider("cpu")
     assert p.model_id == factory.CANONICAL_EMBEDDER_ID
     assert p.backend_id == factory.CANONICAL_EMBEDDER_ID
+    assert p.device == "cpu"
+
+
+def test_gpu_index_lock_blocks_second_acquire():
+    first = factory.acquire_gpu_index_lock(timeout=0.1)
+    try:
+        with pytest.raises(Timeout):
+            factory.acquire_gpu_index_lock(timeout=0.05)
+    finally:
+        factory.release_gpu_index_lock(first)
+
+    second = factory.acquire_gpu_index_lock(timeout=0.1)
+    factory.release_gpu_index_lock(second)
+
+
+def test_cpu_index_provider_does_not_acquire_gpu_lock(monkeypatch):
+    monkeypatch.setattr(factory, "_fastembed_granite_cpu", lambda: _FakeFastEmbed())
+    monkeypatch.setattr(
+        factory,
+        "acquire_gpu_index_lock",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("cpu path must not lock gpu")),
+    )
+    p = factory.make_index_provider("cpu")
     assert p.device == "cpu"
 
 

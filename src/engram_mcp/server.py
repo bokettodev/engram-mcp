@@ -9,7 +9,7 @@ Tools:
   model_status(project_path?)            -> query-model load status
   reindex_file(project_path, rel_path)   -> incremental single-file re-index
   remove_project(project_path)           -> delete a project's index
-  list_indexed_projects()                -> on-disk index inventory
+  list_indexed_projects(limit, cursor)   -> compact on-disk index inventory
   server_info()                          -> data-home/server diagnostics
 
 Indexing runs on a single-worker background thread pool so a tool call returns
@@ -33,14 +33,14 @@ import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from threading import Lock, Thread
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from engram_mcp import errors
-from engram_mcp import paths
+from engram_mcp import errors, inventory, paths
 from engram_mcp.embeddings import factory
 from engram_mcp.jobs import JobRegistry, snapshot
 from engram_mcp.pipeline import MAX_SEARCH_K, ProjectNotIndexedError
@@ -67,11 +67,53 @@ _CONTENT_MODES = {"none", "preview", "full"}
 _DEFAULT_PREVIEW_CHARS = 800
 _MAX_RESULT_CHARS = 20_000
 _MODEL_RETRY_AFTER_SEC = 2
+_DEFAULT_SEARCH_WAIT_SEC = 8.0
 
 
 def _get_provider(index_device: str | None = None):
     """Index-time provider for the selected backend."""
     return factory.make_index_provider(index_device)
+
+
+def _apply_index_progress_event(job_id: str, event: dict) -> None:
+    fields = {}
+    stage = event.get("stage")
+    if isinstance(stage, str) and stage:
+        fields["stage"] = stage
+    if "unit" in event:
+        fields["progress_unit"] = event.get("unit") or ""
+    if "done" in event:
+        fields["done_units"] = int(event.get("done") or 0)
+    if "total" in event:
+        total = event.get("total")
+        fields["total_units"] = int(total) if total is not None else None
+    for event_key, job_key in (
+        ("files", "files"),
+        ("chunks", "chunks"),
+        ("embedded", "embedded"),
+        ("reused", "reused"),
+    ):
+        if event_key in event and event.get(event_key) is not None:
+            fields[job_key] = int(event[event_key])
+    if fields:
+        _registry.update(job_id, **fields)
+
+
+def _stderr_tail_text(lines: deque[str]) -> str | None:
+    text = "".join(lines).strip()
+    return text[-1000:] or None
+
+
+def _drain_stderr(stream, tail: deque[str]) -> None:
+    if stream is None:
+        return
+    try:
+        for line in iter(stream.readline, ""):
+            if not line:
+                break
+            tail.append(line)
+    except Exception:
+        return
 
 
 def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, setting: str) -> None:
@@ -84,13 +126,19 @@ def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, settin
     Explicit CPU indexing runs in-process (it never touches CUDA); search never
     touches this path.
     """
-    _registry.update(job_id, stage="embedding", index_device=setting)
+    _registry.update(job_id, stage="loading_model", index_device=setting)
     cmd = [sys.executable, "-m", "engram_mcp.cli", "index", project_path,
            "--index-device", setting, "--json"]
     if full_rebuild:
         cmd.append("--rebuild")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
     except Exception as exc:
         _registry.update(
             job_id, status="error", stage="error",
@@ -98,35 +146,81 @@ def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, settin
             code=errors.E_MODEL_LOAD_FAILED, finished_at=time.time(),
         )
         return
-    data = None
-    for line in reversed((proc.stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
+
+    stderr_tail: deque[str] = deque(maxlen=80)
+    stderr_thread = Thread(
+        target=_drain_stderr,
+        args=(proc.stderr, stderr_tail),
+        daemon=True,
+        name="cidx-index-stderr",
+    )
+    stderr_thread.start()
+    result = None
+    stdout = proc.stdout
+    if stdout is not None:
+        for line in stdout:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
             try:
                 data = json.loads(line)
-                break
             except ValueError:
                 continue
+            event = data.get("event")
+            if event == "progress":
+                _apply_index_progress_event(job_id, data)
+            elif event == "result" or "ok" in data:
+                result = data
+            elif "stage" in data:
+                _apply_index_progress_event(job_id, data)
+    returncode = proc.wait()
+    stderr_thread.join(timeout=1.0)
+
+    data = result
     if data is None:
+        # Back-compat for a mocked/older child that put a final object in a
+        # buffered stdout string instead of streaming line iteration.
+        buffered = getattr(proc, "stdout", None)
+        text = getattr(buffered, "getvalue", lambda: "")() if buffered is not None else ""
+        for line in reversed((text or "").splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                candidate = json.loads(line)
+            except ValueError:
+                continue
+            if candidate.get("event") == "result" or "ok" in candidate:
+                data = candidate
+                break
+    if data is None:
+        hint = _stderr_tail_text(stderr_tail)
+        if returncode == 0:
+            hint = hint or "The subprocess exited successfully but did not emit a result event."
         _registry.update(
             job_id, status="error", stage="error",
-            error=f"GPU index subprocess produced no result (exit {proc.returncode})",
-            hint=(proc.stderr or "")[-500:] or None,
+            error=f"GPU index subprocess produced no result (exit {returncode})",
+            hint=hint,
             code=errors.E_MODEL_LOAD_FAILED, finished_at=time.time(),
         )
         return
     if not data.get("ok"):
         _registry.update(
             job_id, status="error", stage="error", error=data.get("error"),
-            code=data.get("code"), hint=data.get("hint"), finished_at=time.time(),
+            code=data.get("code"), hint=data.get("hint") or _stderr_tail_text(stderr_tail),
+            finished_at=time.time(),
         )
         return
+    chunks = data.get("chunks")
     _registry.update(
         job_id, status="done", stage="done", error=None, code=None, hint=None,
         index_device=data.get("device") or setting,  # actual device the child used
         embedder_id=data.get("embedder_id"), backend_id=data.get("backend_id"),
         files=data.get("files"), chunks=data.get("chunks"),
         embedded=data.get("embedded_unique"), reused=data.get("reused_unique"),
+        progress_unit="chunks",
+        done_units=chunks or 0,
+        total_units=chunks,
         finished_at=time.time(),
     )
 
@@ -135,7 +229,7 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
     _registry.update(
         job_id,
         status="running",
-        stage="loading-model",
+        stage="loading_model",
         index_device=index_device,
         started_at=time.time(),
     )
@@ -149,13 +243,13 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
         provider = _get_provider(index_device)
         _registry.update(
             job_id,
-            stage="embedding",
+            stage="loading_model",
             embedder_id=provider.model_id,
             backend_id=provider.backend_id,
         )
 
-        def progress(done: int, total: int) -> None:
-            _registry.update(job_id, done_units=done, total_units=total)
+        def progress(event: dict) -> None:
+            _apply_index_progress_event(job_id, event)
 
         stats = _run_index(project_path, provider, full_rebuild=full_rebuild, progress=progress)
         _registry.update(
@@ -169,6 +263,9 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
             chunks=stats.chunks,
             embedded=stats.embedded_unique,
             reused=stats.reused_unique,
+            progress_unit="chunks",
+            done_units=stats.chunks,
+            total_units=stats.chunks,
             finished_at=time.time(),
         )
     except Exception as exc:  # surface failure via status, never crash the server
@@ -251,8 +348,27 @@ def _provider_load_worker(model_id: str):
     return factory.provider_for_model_id(model_id)
 
 
+def _search_wait_budget_sec() -> float:
+    raw = os.environ.get("ENGRAM_SEARCH_WAIT_SEC", "").strip()
+    if not raw:
+        return _DEFAULT_SEARCH_WAIT_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_SEARCH_WAIT_SEC
+    return max(0.0, value)
+
+
+def _model_loading_error(model_id: str) -> errors.EngramError:
+    return errors.EngramError(
+        f"model for this index is loading: {model_id}",
+        errors.E_MODEL_LOADING,
+        hint="Retry the search after the reported delay.",
+    )
+
+
 def _provider_for_query_model(model_id: str):
-    """Return a loaded provider or schedule warmup and raise E_MODEL_LOADING."""
+    """Return a loaded provider or wait briefly for the load future."""
 
     backend_id = factory.query_backend_id_for_model_id(model_id)
     if factory.is_model_loaded(backend_id):
@@ -264,11 +380,13 @@ def _provider_for_query_model(model_id: str):
             _model_loads[model_id] = fut
     if fut.done():
         return fut.result()
-    raise errors.EngramError(
-        f"model for this index is loading: {model_id}",
-        errors.E_MODEL_LOADING,
-        hint="Retry the search after the reported delay.",
-    )
+    budget = _search_wait_budget_sec()
+    if budget > 0:
+        try:
+            return fut.result(timeout=budget)
+        except FutureTimeoutError:
+            pass
+    raise _model_loading_error(model_id)
 
 
 def _model_status_for(model_id: str) -> dict:
@@ -416,84 +534,18 @@ def do_search(
         return _error_payload(exc, results=[])
 
 
-def list_projects() -> dict:
-    home = paths.data_home(create=False)
-    base = home / "projects"
-    out = []
-    errs = []
-    if not home.exists():
-        return {
-            "data_home": str(home),
-            "data_home_source": paths.data_home_source(),
-            "home_exists": False,
-            "projects_empty": True,
-            "projects": [],
-            "errors": [],
-        }
-    if not base.exists():
-        return {
-            "data_home": str(home),
-            "data_home_source": paths.data_home_source(),
-            "home_exists": True,
-            "projects_empty": True,
-            "projects": [],
-            "errors": [],
-        }
-    for d in sorted(base.iterdir()):
-        if not d.is_dir():
-            continue
-        pj = d / "project.json"
-        if not pj.is_file():
-            errs.append(
-                {
-                    "project_id": d.name,
-                    "manifest_path": str(pj),
-                    "code": errors.E_INDEX_INVALID,
-                    "error": "project manifest is missing",
-                }
-            )
-            continue
-        try:
-            raw = json.loads(pj.read_text(encoding="utf-8"))
-            root = raw.get("root_path")
-            if not root:
-                raise errors.EngramError(
-                    "root_path is missing", errors.E_INDEX_INVALID
-                )
-            qi = load_query_index(root)
-            out.append(raw | {
-                "project_id": d.name,
-                "table_rows": qi.count,
-                "valid": True,
-            })
-        except (OSError, json.JSONDecodeError) as exc:
-            errs.append(
-                {
-                    "project_id": d.name,
-                    "manifest_path": str(pj),
-                    "code": errors.E_INDEX_INVALID,
-                    "error": f"invalid project manifest: {exc}",
-                }
-            )
-        except Exception as exc:
-            payload = _error_payload(exc)
-            errs.append(
-                {
-                    "project_id": d.name,
-                    "manifest_path": str(pj),
-                    "code": payload.get("code", errors.E_INDEX_INVALID),
-                    "error": payload.get("error", str(exc)),
-                    **({"hint": payload["hint"]} if payload.get("hint") else {}),
-                }
-            )
-    return {
-        "data_home": str(home),
-        "data_home_source": paths.data_home_source(),
-        "home_exists": True,
-        "projects_empty": not out and not errs,
-        "projects": out,
-        "errors": errs,
-    }
+def list_projects(
+    limit: int = inventory.DEFAULT_LIST_LIMIT,
+    cursor: str | None = None,
+    verbose: bool = False,
+    prune_orphans: bool = True,
+) -> dict:
+    return inventory.list_indexed_projects(
+        limit=limit,
+        cursor=cursor,
+        verbose=verbose,
+        prune_orphans=prune_orphans,
+    )
 
 
 def do_get_chunk(project_path: str, chunk_id: str, max_chars: int | None = None) -> dict:
@@ -654,9 +706,24 @@ async def server_info() -> dict:
     return do_server_info()
 
 
-async def list_indexed_projects() -> dict:
-    """List on-disk indexes, data_home, and broken manifest/table errors."""
-    return list_projects()
+async def list_indexed_projects(
+    limit: int = inventory.DEFAULT_LIST_LIMIT,
+    cursor: str | None = None,
+    verbose: bool = False,
+    prune_orphans: bool = True,
+) -> dict:
+    """List indexed projects with compact pagination and optional health checks.
+
+    Compact mode reads manifests only. ``verbose=true`` may open LanceDB to add
+    table health. ``prune_orphans=true`` removes index dirs whose recorded root
+    path no longer exists and reports them under ``gc``.
+    """
+    return list_projects(
+        limit=limit,
+        cursor=cursor,
+        verbose=verbose,
+        prune_orphans=prune_orphans,
+    )
 
 
 def read_only_enabled() -> bool:

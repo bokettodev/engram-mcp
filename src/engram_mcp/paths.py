@@ -88,3 +88,16 @@ def project_lock(root: Path) -> FileLock:
     lock_dir = data_home() / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     return FileLock(str(lock_dir / f"{project_id_for(root)}.lock"))
+
+
+def gpu_index_lock() -> FileLock:
+    """Machine-wide CUDA index admission lock.
+
+    This intentionally exposes one blocking FileLock. ENGRAM_GPU_INDEX_SLOTS is
+    reserved for a future multi-slot implementation; the default and current
+    behavior is one CUDA indexing job per data home.
+    """
+
+    lock_dir = data_home() / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(lock_dir / "gpu-index.lock"))

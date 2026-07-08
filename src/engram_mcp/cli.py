@@ -29,6 +29,34 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
+class _JsonlWriter:
+    def __init__(self) -> None:
+        self.seq = 0
+
+    def progress(self, event: dict) -> None:
+        self.seq += 1
+        payload = {
+            "event": "progress",
+            "version": 1,
+            "seq": self.seq,
+            "stage": event.get("stage", ""),
+            "unit": event.get("unit"),
+            "done": event.get("done"),
+            "total": event.get("total"),
+        }
+        for key, value in event.items():
+            if key not in payload:
+                payload[key] = value
+        print(json.dumps(payload), flush=True)
+
+    def result(self, payload: dict) -> None:
+        print(json.dumps({"event": "result", "version": 1, **payload}), flush=True)
+
+
+def _json_result(payload: dict) -> None:
+    print(json.dumps({"event": "result", "version": 1, **payload}), flush=True)
+
+
 def cmd_chunk(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     if not root.is_dir():
@@ -80,10 +108,16 @@ def cmd_chunk(args: argparse.Namespace) -> int:
 
 def cmd_index(args: argparse.Namespace) -> int:
     as_json = getattr(args, "json", False)
+    writer = _JsonlWriter() if as_json else None
     root = Path(args.path).resolve()
     if not root.is_dir():
         if as_json:
-            print(json.dumps({"ok": False, "error": f"not a directory: {root}", "code": "E_BAD_REQUEST"}))
+            _json_result({
+                "ok": False,
+                "error": f"not a directory: {root}",
+                "code": "E_BAD_REQUEST",
+                "hint": None,
+            })
         else:
             print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
@@ -99,24 +133,37 @@ def cmd_index(args: argparse.Namespace) -> int:
         )
         if not as_json:
             print(f"loading embedder (index device {index_device}) ...", file=sys.stderr)
-        provider = factory.make_index_provider(index_device)
 
-        def _progress(done: int, total: int) -> None:
-            if not as_json:
-                print(f"\rembedding {done}/{total} ...", end="", file=sys.stderr, flush=True)
+        def _progress(event: dict) -> None:
+            if as_json and writer is not None:
+                writer.progress(event)
+                return
+            stage = event.get("stage")
+            if stage == "waiting_for_gpu":
+                print("waiting for GPU index slot ...", file=sys.stderr, flush=True)
+            elif stage == "embedding":
+                done = event.get("done") or 0
+                total = event.get("total")
+                if total is None:
+                    print(f"\rembedding {done} ...", end="", file=sys.stderr, flush=True)
+                else:
+                    print(f"\rembedding {done}/{total} ...", end="", file=sys.stderr, flush=True)
+
+        provider = factory.make_index_provider(index_device, progress=_progress)
 
         stats = index_project(root, provider, full_rebuild=args.rebuild, progress=_progress)
         if as_json:
             # machine-readable result (used when the MCP server runs a GPU index
             # in this short-lived subprocess so its own CUDA context fully exits).
-            print(json.dumps({
+            assert writer is not None
+            writer.result({
                 "ok": True, "mode": stats.mode, "files": stats.files, "chunks": stats.chunks,
                 "embedded_unique": stats.embedded_unique, "reused_unique": stats.reused_unique,
                 "added": stats.added, "changed": stats.changed, "deleted": stats.deleted,
                 "unchanged": stats.unchanged, "embedder_id": provider.model_id,
                 "backend_id": provider.backend_id, "device": provider.device,
                 "seconds": stats.seconds,
-            }))
+            })
             return 0
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
         print(f"root:            {root}")
@@ -134,11 +181,24 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 0
     except errors.EngramError as exc:
         if as_json:
-            print(json.dumps({"ok": False, "error": str(exc), "code": exc.code, "hint": exc.hint}))
+            assert writer is not None
+            writer.result({"ok": False, "error": str(exc), "code": exc.code, "hint": exc.hint})
         else:
             print(f"error: {exc}", file=sys.stderr)
             if exc.hint:
                 print(f"hint: {exc.hint}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        if as_json:
+            assert writer is not None
+            writer.result({
+                "ok": False,
+                "error": str(exc) or repr(exc),
+                "code": "E_MODEL_LOAD_FAILED",
+                "hint": None,
+            })
+        else:
+            print(f"error: {exc}", file=sys.stderr)
         return 2
     finally:
         if provider is not None:
@@ -152,6 +212,14 @@ def cmd_remove(args: argparse.Namespace) -> int:
     removed = remove_project(root)
     print(f"{'removed' if removed else 'nothing to remove'}: {root}")
     return 0
+
+
+def cmd_gc(args: argparse.Namespace) -> int:
+    from engram_mcp.inventory import gc_orphans
+
+    out = gc_orphans(prune=args.prune)
+    print(json.dumps(out, indent=2))
+    return 2 if out.get("errors") else 0
 
 
 def cmd_find_def(args: argparse.Namespace) -> int:
@@ -259,6 +327,14 @@ def main(argv: list[str] | None = None) -> int:
     prm = sub.add_parser("remove", help="delete a project's index from disk")
     prm.add_argument("path", help="project root directory")
     prm.set_defaults(func=cmd_remove)
+
+    pgc = sub.add_parser("gc", help="find or prune index dirs whose project root is missing")
+    gc_mode = pgc.add_mutually_exclusive_group()
+    gc_mode.add_argument("--dry-run", dest="prune", action="store_false",
+                         help="report orphaned index dirs without deleting them (default)")
+    gc_mode.add_argument("--prune", action="store_true",
+                         help="delete orphaned index dirs")
+    pgc.set_defaults(func=cmd_gc, prune=False)
 
     pf = sub.add_parser("find-def", help="exact symbol definition lookup (no embedding)")
     pf.add_argument("path", help="project root directory")

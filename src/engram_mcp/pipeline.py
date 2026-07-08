@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from engram_mcp import config, errors, manifest, paths, retrieval
 from engram_mcp.embeddings.base import EmbeddingProvider
@@ -57,6 +57,7 @@ class QueryIndex:
 
 MAX_SEARCH_K = 50
 MAX_RERANK_CANDIDATES = 100
+ProgressSink = Callable[[dict[str, Any]], None] | Callable[[int, int], None]
 
 _CONFIG_NAMES = {
     ".env", ".env.example", ".gitignore", ".dockerignore",
@@ -231,6 +232,65 @@ def _is_compatible(m: manifest.ProjectManifest | None, provider: EmbeddingProvid
     )
 
 
+def _emit_progress(
+    progress: ProgressSink | None,
+    stage: str,
+    *,
+    unit: str | None = None,
+    done: int | None = None,
+    total: int | None = None,
+    files: int | None = None,
+    chunks: int | None = None,
+    embedded: int | None = None,
+    reused: int | None = None,
+    **extra,
+) -> None:
+    if progress is None:
+        return
+    event = {
+        "stage": stage,
+        "unit": unit,
+        "done": done,
+        "total": total,
+    }
+    if files is not None:
+        event["files"] = files
+    if chunks is not None:
+        event["chunks"] = chunks
+    if embedded is not None:
+        event["embedded"] = embedded
+    if reused is not None:
+        event["reused"] = reused
+    event.update(extra)
+    try:
+        progress(event)  # type: ignore[misc]
+    except TypeError:
+        # Back-compat for the original embedding-only progress(done, total)
+        # callback. Non-embedding phases are intentionally invisible to it.
+        if stage == "embedding" and done is not None and total is not None:
+            progress(done, total)  # type: ignore[operator]
+
+
+def _maybe_emit_scanning(
+    progress: ProgressSink | None,
+    *,
+    scanned: int,
+    files: int,
+    chunks: int,
+    force: bool = False,
+) -> None:
+    if force or scanned == 0 or scanned % 100 == 0:
+        _emit_progress(
+            progress,
+            "scanning",
+            unit="files",
+            done=scanned,
+            total=None,
+            files=files,
+            chunks=chunks,
+        )
+
+
 def _embed(texts, provider, cache, batch_size, progress):
     """Embed only texts whose hash is not cached. Returns (vec_by_hash, hashes, n_new, n_reused)."""
     hashes = [embedding_input_hash(provider.model_id, config.CHUNKER_VERSION, t) for t in texts]
@@ -241,13 +301,43 @@ def _embed(texts, provider, cache, batch_size, progress):
             missing[h] = t
     new_vecs: dict[str, list[float]] = {}
     items = list(missing.items())
+    _emit_progress(
+        progress,
+        "embedding_plan",
+        unit="embeddings",
+        done=0,
+        total=len(items),
+        chunks=len(texts),
+        embedded=0,
+        reused=len(cached),
+    )
+    if not items:
+        _emit_progress(
+            progress,
+            "embedding",
+            unit="embeddings",
+            done=0,
+            total=0,
+            chunks=len(texts),
+            embedded=0,
+            reused=len(cached),
+        )
     for i in range(0, len(items), batch_size):
         batch = items[i : i + batch_size]
         vecs = provider.embed_passages([t for _, t in batch])
         for (h, _), v in zip(batch, vecs):
             new_vecs[h] = v
-        if progress:
-            progress(min(i + batch_size, len(items)), len(items))
+        done = min(i + batch_size, len(items))
+        _emit_progress(
+            progress,
+            "embedding",
+            unit="embeddings",
+            done=done,
+            total=len(items),
+            chunks=len(texts),
+            embedded=done,
+            reused=len(cached),
+        )
     cache.put_many(new_vecs)
     return {**cached, **new_vecs}, hashes, len(new_vecs), len(cached)
 
@@ -282,10 +372,11 @@ def index_project(
     *,
     full_rebuild: bool = False,
     batch_size: int = config.EMBED_BATCH_SIZE,
-    progress: Callable[[int, int], None] | None = None,
+    progress: ProgressSink | None = None,
 ) -> IndexStats:
     root = Path(root).resolve()
     pdir = paths.project_dir(root)
+    _emit_progress(progress, "waiting_for_lock", unit="lock", done=0, total=None)
     with paths.project_lock(root):
         m = manifest.load_project(pdir)
         compatible = _is_compatible(m, provider) and (pdir / "files.json").is_file()
@@ -298,9 +389,18 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
     t0 = time.time()
     files_meta: dict[str, dict] = {}
     chunks = []
+    scanned = 0
+    _maybe_emit_scanning(progress, scanned=0, files=0, chunks=0, force=True)
     for rec in walk(root):
+        scanned += 1
         text = _read_text(rec.abs_path)
         if text is None or looks_generated(text, rec.language):
+            _maybe_emit_scanning(
+                progress,
+                scanned=scanned,
+                files=len(files_meta),
+                chunks=len(chunks),
+            )
             continue
         cs = chunk_file(rec.rel_path, rec.language, text)
         chunks.extend(cs)
@@ -308,6 +408,19 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
             "file_hash": sha256_text(text), "mtime_ns": rec.mtime_ns, "size": rec.size,
             "language": rec.language or "", "chunks": len(cs),
         }
+        _maybe_emit_scanning(
+            progress,
+            scanned=scanned,
+            files=len(files_meta),
+            chunks=len(chunks),
+        )
+    _maybe_emit_scanning(
+        progress,
+        scanned=scanned,
+        files=len(files_meta),
+        chunks=len(chunks),
+        force=True,
+    )
     file_hash_by_path = {p: meta["file_hash"] for p, meta in files_meta.items()}
     search_texts = [_search_text(c) for c in chunks]
 
@@ -322,7 +435,53 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
     # active table so concurrent readers on the old pointer don't break.
     keep = {m.active_table} if m and m.active_table else set()
     LanceStore(db_dir, provider.dim).drop_stale_generations(keep)
-    LanceStore(db_dir, provider.dim, table=new_table).create(rows)
+    store = LanceStore(db_dir, provider.dim, table=new_table)
+    _emit_progress(
+        progress,
+        "writing_table",
+        unit="rows",
+        done=0,
+        total=len(rows),
+        files=len(files_meta),
+        chunks=len(chunks),
+        embedded=embedded,
+        reused=reused,
+    )
+    store.create(rows, refresh_fts=False)
+    _emit_progress(
+        progress,
+        "writing_table",
+        unit="rows",
+        done=len(rows),
+        total=len(rows),
+        files=len(files_meta),
+        chunks=len(chunks),
+        embedded=embedded,
+        reused=reused,
+    )
+    _emit_progress(
+        progress,
+        "writing_fts",
+        unit="tables",
+        done=0,
+        total=1,
+        files=len(files_meta),
+        chunks=len(chunks),
+        embedded=embedded,
+        reused=reused,
+    )
+    store.refresh_fts()
+    _emit_progress(
+        progress,
+        "writing_fts",
+        unit="tables",
+        done=1,
+        total=1,
+        files=len(files_meta),
+        chunks=len(chunks),
+        embedded=embedded,
+        reused=reused,
+    )
 
     # Commit the pointer FIRST (it references the fully-built new table), then
     # the file manifest. A crash in between leaves the new table active + a
@@ -342,6 +501,18 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
     # it is GC'd at the start of the next rebuild.
 
     elapsed = time.time() - t0
+    _emit_progress(
+        progress,
+        "done",
+        unit="chunks",
+        done=len(chunks),
+        total=len(chunks),
+        files=len(files_meta),
+        chunks=len(chunks),
+        embedded=embedded,
+        reused=reused,
+        mode="full",
+    )
     return IndexStats(
         files=len(files_meta), chunks=len(chunks), embedded_unique=embedded,
         reused_unique=reused, seconds=elapsed,
@@ -356,17 +527,32 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
     new_files: dict[str, dict] = {}
     touched = []
     added = changed = unchanged = 0
+    scanned = 0
 
+    _maybe_emit_scanning(progress, scanned=0, files=0, chunks=0, force=True)
     for rec in walk(root):
+        scanned += 1
         old = old_files.get(rec.rel_path)
         if old and old.get("size") == rec.size and old.get("mtime_ns") == rec.mtime_ns:
             new_files[rec.rel_path] = old
             unchanged += 1
+            _maybe_emit_scanning(
+                progress,
+                scanned=scanned,
+                files=len(new_files),
+                chunks=sum(int(meta.get("chunks", 0)) for meta in new_files.values()),
+            )
             continue
         text = _read_text(rec.abs_path)
         if text is None or looks_generated(text, rec.language):
             # Skipped (unreadable/generated): not added to new_files, so if it
             # was previously indexed it falls into deleted_paths below.
+            _maybe_emit_scanning(
+                progress,
+                scanned=scanned,
+                files=len(new_files),
+                chunks=sum(int(meta.get("chunks", 0)) for meta in new_files.values()),
+            )
             continue
         fh = sha256_text(text)
         if old and old.get("file_hash") == fh:
@@ -374,10 +560,22 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
             entry["mtime_ns"] = rec.mtime_ns
             new_files[rec.rel_path] = entry
             unchanged += 1
+            _maybe_emit_scanning(
+                progress,
+                scanned=scanned,
+                files=len(new_files),
+                chunks=sum(int(meta.get("chunks", 0)) for meta in new_files.values()),
+            )
             continue
         touched.append((rec, text, fh))
         changed += 1 if old else 0
         added += 0 if old else 1
+        _maybe_emit_scanning(
+            progress,
+            scanned=scanned,
+            files=len(new_files) + len(touched),
+            chunks=sum(int(meta.get("chunks", 0)) for meta in new_files.values()),
+        )
 
     chunks = []
     file_hash_by_path: dict[str, str] = {}
@@ -389,6 +587,13 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
             "file_hash": fh, "mtime_ns": rec.mtime_ns, "size": rec.size,
             "language": rec.language or "", "chunks": len(cs),
         }
+    _maybe_emit_scanning(
+        progress,
+        scanned=scanned,
+        files=len(new_files),
+        chunks=sum(int(meta.get("chunks", 0)) for meta in new_files.values()),
+        force=True,
+    )
 
     # Anything previously indexed but no longer kept (deleted, generated, or
     # unreadable) gets its rows removed.
@@ -401,12 +606,90 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
         with EmbeddingCache(paths.global_cache_dir() / "embeddings.sqlite") as cache:
             vec_by_hash, hashes, embedded, reused = _embed(search_texts, provider, cache, batch_size, progress)
         rows = _rows(chunks, search_texts, hashes, vec_by_hash, file_hash_by_path)
+    else:
+        _emit_progress(
+            progress,
+            "embedding_plan",
+            unit="embeddings",
+            done=0,
+            total=0,
+            chunks=0,
+            embedded=0,
+            reused=0,
+        )
+        _emit_progress(
+            progress,
+            "embedding",
+            unit="embeddings",
+            done=0,
+            total=0,
+            chunks=0,
+            embedded=0,
+            reused=0,
+        )
 
     store = LanceStore(pdir / "lancedb", provider.dim, table=m.active_table)
+    row_work = len(rows) + len(touched) + len(deleted_paths)
+    _emit_progress(
+        progress,
+        "writing_table",
+        unit="rows",
+        done=0,
+        total=row_work,
+        files=len(new_files),
+        chunks=m.chunks,
+        embedded=embedded,
+        reused=reused,
+    )
     store.delete_paths([rec.rel_path for rec, _, _ in touched] + deleted_paths)
     store.add(rows)
+    _emit_progress(
+        progress,
+        "writing_table",
+        unit="rows",
+        done=row_work,
+        total=row_work,
+        files=len(new_files),
+        chunks=m.chunks,
+        embedded=embedded,
+        reused=reused,
+    )
     if touched or deleted_paths:
+        _emit_progress(
+            progress,
+            "writing_fts",
+            unit="tables",
+            done=0,
+            total=1,
+            files=len(new_files),
+            chunks=m.chunks,
+            embedded=embedded,
+            reused=reused,
+        )
         store.refresh_fts()
+        _emit_progress(
+            progress,
+            "writing_fts",
+            unit="tables",
+            done=1,
+            total=1,
+            files=len(new_files),
+            chunks=m.chunks,
+            embedded=embedded,
+            reused=reused,
+        )
+    else:
+        _emit_progress(
+            progress,
+            "writing_fts",
+            unit="tables",
+            done=0,
+            total=0,
+            files=len(new_files),
+            chunks=m.chunks,
+            embedded=embedded,
+            reused=reused,
+        )
 
     manifest.save_files(pdir, new_files)
     m.files = len(new_files)
@@ -415,6 +698,18 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
     manifest.save_project(pdir, m)
 
     elapsed = time.time() - t0
+    _emit_progress(
+        progress,
+        "done",
+        unit="chunks",
+        done=m.chunks,
+        total=m.chunks,
+        files=len(new_files),
+        chunks=m.chunks,
+        embedded=embedded,
+        reused=reused,
+        mode="incremental",
+    )
     return IndexStats(
         files=len(new_files), chunks=m.chunks, embedded_unique=embedded,
         reused_unique=reused, seconds=elapsed,
