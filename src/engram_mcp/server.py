@@ -796,6 +796,15 @@ def do_project_map(
     symbol_kinds: list[str] | None = None,
     min_symbols: int = 0,
     non_empty: bool = True,
+    include_git: bool = False,
+    group_by: str = "commit",
+    ticket_regex: str | None = None,
+    window_hours: float = 2.0,
+    git_max_commits: int = 1000,
+    recent_days: int = 90,
+    max_files_per_change: int = 50,
+    cochange_limit: int = 5,
+    hotspots_limit: int = 25,
 ) -> dict:
     try:
         return _run_project_map(
@@ -819,6 +828,15 @@ def do_project_map(
             symbol_kinds=symbol_kinds,
             min_symbols=min_symbols,
             non_empty=non_empty,
+            include_git=include_git,
+            group_by=group_by,
+            ticket_regex=ticket_regex,
+            window_hours=window_hours,
+            git_max_commits=git_max_commits,
+            recent_days=recent_days,
+            max_files_per_change=max_files_per_change,
+            cochange_limit=cochange_limit,
+            hotspots_limit=hotspots_limit,
         )
     except Exception as exc:
         return _error_payload(exc)
@@ -1080,8 +1098,17 @@ async def project_map(
     symbol_kinds: list[str] | None = None,
     min_symbols: int = 0,
     non_empty: bool = True,
+    include_git: bool = False,
+    group_by: str = "commit",
+    ticket_regex: str | None = None,
+    window_hours: float = 2.0,
+    git_max_commits: int = 1000,
+    recent_days: int = 90,
+    max_files_per_change: int = 50,
+    cochange_limit: int = 5,
+    hotspots_limit: int = 25,
 ) -> dict:
-    """Body-free dirs map; opt into compact, paginated files and filters."""
+    """Body-free dirs map; opt into compact files, filters, and VCS analytics."""
     return await asyncio.to_thread(
         do_project_map,
         project_path=project_path,
@@ -1104,6 +1131,15 @@ async def project_map(
         symbol_kinds=symbol_kinds,
         min_symbols=min_symbols,
         non_empty=non_empty,
+        include_git=include_git,
+        group_by=group_by,
+        ticket_regex=ticket_regex,
+        window_hours=window_hours,
+        git_max_commits=git_max_commits,
+        recent_days=recent_days,
+        max_files_per_change=max_files_per_change,
+        cochange_limit=cochange_limit,
+        hotspots_limit=hotspots_limit,
     )
 
 

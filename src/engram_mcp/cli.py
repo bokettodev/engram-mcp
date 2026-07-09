@@ -148,7 +148,14 @@ def cmd_index(args: argparse.Namespace) -> int:
 
         provider = factory.make_index_provider(index_device, progress=_progress)
 
-        stats = index_project(root, provider, full_rebuild=args.rebuild, progress=_progress)
+        stats = index_project(
+            root,
+            provider,
+            full_rebuild=args.rebuild,
+            progress=_progress,
+            git_analytics=bool(getattr(args, "git_analytics", False)),
+            git_max_commits=int(getattr(args, "git_max_commits", 1000)),
+        )
         if as_json:
             # machine-readable result (used when the MCP server runs a GPU index
             # in this short-lived subprocess so its own CUDA context fully exits).
@@ -374,6 +381,27 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--index-device", choices=["auto", "cpu", "cuda"], default=None,
                     help=argparse.SUPPRESS)  # explicit setting; used by the MCP server subprocess
     pi.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # machine-readable; used by the MCP server's GPU subprocess
+    git_group = pi.add_mutually_exclusive_group()
+    git_group.add_argument(
+        "--git-analytics",
+        dest="git_analytics",
+        action="store_true",
+        help="capture raw git history in the catalog sidecar for VCS analytics (default: off)",
+    )
+    git_group.add_argument(
+        "--no-git-analytics",
+        dest="git_analytics",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    pi.add_argument(
+        "--git-max-commits",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="maximum commits to store when --git-analytics is enabled",
+    )
+    pi.set_defaults(git_analytics=False)
     pi.set_defaults(func=cmd_index)
 
     prm = sub.add_parser("remove", help="delete a project's index from disk")

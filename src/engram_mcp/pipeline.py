@@ -20,7 +20,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
-from engram_mcp import catalog, config, errors, gitmeta, manifest, paths, retrieval
+from engram_mcp import catalog, config, errors, gitanalytics, gitmeta, manifest, paths, retrieval
 from engram_mcp.embeddings.base import EmbeddingProvider
 from engram_mcp.embeddings.cache import EmbeddingCache
 from engram_mcp.indexing.chunker import chunk_file
@@ -341,6 +341,167 @@ def load_project_catalog(root: str | Path) -> tuple[QueryIndex, dict]:
     return qi, data
 
 
+def _ms_since(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000.0, 3)
+
+
+def _unavailable_git_analytics(
+    *,
+    group_by: str,
+    source_key: str,
+    log_ms: float,
+    total_start: float,
+    warning: str | None = None,
+) -> dict:
+    warnings = [warning] if warning else []
+    return {
+        "available": False,
+        "status": "unavailable",
+        "group_by": group_by,
+        "analyzed_changes": 0,
+        "skipped_changes": 0,
+        source_key: 0,
+        "timings_ms": {
+            "log": log_ms,
+            "group": 0.0,
+            "cochange": 0.0,
+            "churn": 0.0,
+            "total": _ms_since(total_start),
+        },
+        "warnings": warnings,
+        "hotspots": [],
+    }
+
+
+def _analytics_source(
+    root: Path,
+    data: dict,
+    *,
+    git_max_commits: int,
+) -> tuple[list[dict], str, str | None, float]:
+    t0 = time.perf_counter()
+    history = data.get("git_history")
+    if isinstance(history, dict):
+        if history.get("status") == "ready":
+            commits = [c for c in (history.get("commits") or []) if isinstance(c, dict)]
+            return commits, "cached_commits", None, _ms_since(t0)
+        warning = str(history.get("warning") or "cached git history unavailable")
+        return [], "cached_commits", warning, _ms_since(t0)
+    status = gitmeta.commit_log_with_status(root, max_commits=git_max_commits)
+    commits = [c for c in (status.get("commits") or []) if isinstance(c, dict)]
+    warning = None if status.get("status") == "ready" else str(status.get("warning") or "git log unavailable")
+    return commits, "scanned_commits", warning, _ms_since(t0)
+
+
+def _file_git_payload(
+    path: str,
+    *,
+    churn_by_file: dict[str, dict],
+    cochanges_by_file: dict[str, list[dict]],
+    hotspot_by_file: dict[str, dict],
+) -> dict:
+    churn_row = churn_by_file.get(path) or {}
+    hotspot = hotspot_by_file.get(path) or {}
+    return {
+        "changes": int(churn_row.get("changes", 0) or 0),
+        "churn_lines": int(churn_row.get("churn_lines", 0) or 0),
+        "last_touched_ts": int(churn_row.get("last_touched_ts", 0) or 0),
+        "authors_count": int(churn_row.get("authors_count", 0) or 0),
+        "fix_density": float(churn_row.get("fix_density", 0.0) or 0.0),
+        "hotspot_quadrant": hotspot.get("hotspot_quadrant") or "low_churn_low_complexity",
+        "cochanges": list(cochanges_by_file.get(path) or []),
+    }
+
+
+def _attach_git_analytics(
+    out: dict,
+    *,
+    root: Path,
+    data: dict,
+    group_by: str,
+    ticket_regex: str | None,
+    window_hours: float,
+    git_max_commits: int,
+    recent_days: int,
+    max_files_per_change: int,
+    cochange_limit: int,
+    hotspots_limit: int,
+) -> dict:
+    total_start = time.perf_counter()
+    warnings: list[str] = []
+    commits, source_key, source_warning, log_ms = _analytics_source(
+        root,
+        data,
+        git_max_commits=git_max_commits,
+    )
+    if source_warning:
+        out["git_analytics"] = _unavailable_git_analytics(
+            group_by=group_by,
+            source_key=source_key,
+            log_ms=log_ms,
+            total_start=total_start,
+            warning=source_warning,
+        )
+        return out
+
+    t_group = time.perf_counter()
+    grouped = gitanalytics.group_changes_result(
+        commits,
+        group_by=group_by,
+        ticket_regex=ticket_regex,
+        window_hours=window_hours,
+        max_files_per_change=max_files_per_change,
+    )
+    change_sets = grouped["change_sets"]
+    group_ms = _ms_since(t_group)
+
+    t_cochange = time.perf_counter()
+    cochanges_by_file = gitanalytics.cochange(change_sets, limit=cochange_limit)
+    cochange_ms = _ms_since(t_cochange)
+
+    t_churn = time.perf_counter()
+    churn_by_file = gitanalytics.churn(
+        change_sets,
+        now_ts=int(time.time()),
+        recent_days=recent_days,
+    )
+    hotspot_result = gitanalytics.hotspots(
+        churn_by_file,
+        data.get("files") or [],
+        limit=hotspots_limit,
+    )
+    churn_ms = _ms_since(t_churn)
+    hotspot_by_file = hotspot_result.get("files") or {}
+
+    for row in out.get("files") or []:
+        path = (row.get("path") or "").replace("\\", "/")
+        row["git"] = _file_git_payload(
+            path,
+            churn_by_file=churn_by_file,
+            cochanges_by_file=cochanges_by_file,
+            hotspot_by_file=hotspot_by_file,
+        )
+
+    out["git_analytics"] = {
+        "available": True,
+        "status": "ready",
+        "group_by": grouped.get("group_by") or group_by,
+        "analyzed_changes": len(change_sets),
+        "skipped_changes": int(grouped.get("skipped_changes", 0) or 0),
+        source_key: len(commits),
+        "timings_ms": {
+            "log": log_ms,
+            "group": group_ms,
+            "cochange": cochange_ms,
+            "churn": churn_ms,
+            "total": _ms_since(total_start),
+        },
+        "warnings": warnings,
+        "hotspots": list(hotspot_result.get("hotspots") or []),
+    }
+    return out
+
+
 def project_map(
     root: str | Path,
     depth: int = 2,
@@ -362,11 +523,20 @@ def project_map(
     symbol_kinds: list[str] | None = None,
     min_symbols: int = 0,
     non_empty: bool = True,
+    include_git: bool = False,
+    group_by: str = "commit",
+    ticket_regex: str | None = None,
+    window_hours: float = 2.0,
+    git_max_commits: int = 1000,
+    recent_days: int = 90,
+    max_files_per_change: int = 50,
+    cochange_limit: int = 5,
+    hotspots_limit: int = 25,
 ) -> dict:
     """Return a body-free project map from the catalog sidecar."""
 
-    _qi, data = load_project_catalog(root)
-    return catalog.project_map(
+    qi, data = load_project_catalog(root)
+    out = catalog.project_map(
         data,
         depth=depth,
         sort=sort,
@@ -387,6 +557,21 @@ def project_map(
         symbol_kinds=symbol_kinds,
         min_symbols=min_symbols,
         non_empty=non_empty,
+    )
+    if not include_git:
+        return out
+    return _attach_git_analytics(
+        out,
+        root=qi.root,
+        data=data,
+        group_by=group_by,
+        ticket_regex=ticket_regex,
+        window_hours=window_hours,
+        git_max_commits=git_max_commits,
+        recent_days=recent_days,
+        max_files_per_change=max_files_per_change,
+        cochange_limit=cochange_limit,
+        hotspots_limit=hotspots_limit,
     )
 
 
@@ -434,6 +619,7 @@ def _save_catalog_from_rows(
     rows: list[dict],
     indexed_at: float,
     store: LanceStore,
+    git_history: dict | None = None,
 ) -> None:
     table_rows = store.count()
     if len(rows) != table_rows:
@@ -448,12 +634,41 @@ def _save_catalog_from_rows(
         files_meta=files_meta,
         rows=rows,
         indexed_at=indexed_at,
+        git_history=git_history,
     )
     if _catalog_ref_count(data) != table_rows:
         raise RuntimeError(
             f"refusing to write catalog: catalog refs={_catalog_ref_count(data)} table rows={table_rows}"
         )
     catalog.save_catalog(pdir, data)
+
+
+def _maybe_git_history_for_catalog(
+    root: Path,
+    *,
+    enabled: bool,
+    max_commits: int,
+    previous: dict | None = None,
+    head: str | None = None,
+) -> dict | None:
+    if not enabled:
+        return None
+    try:
+        return gitmeta.history_for_catalog(
+            root,
+            max_commits=max_commits,
+            previous=previous,
+            head=head,
+        )
+    except Exception as exc:
+        return {
+            "schema_version": 1,
+            "status": "unavailable",
+            "max_commits": max(1, int(max_commits or 1000)),
+            "head_commit": head or "",
+            "commits": [],
+            "warning": f"git history unavailable: {exc}",
+        }
 
 
 def _mark_catalog_stale_for_update(
@@ -701,6 +916,8 @@ def index_project(
     full_rebuild: bool = False,
     batch_size: int = config.EMBED_BATCH_SIZE,
     progress: ProgressSink | None = None,
+    git_analytics: bool = False,
+    git_max_commits: int = 1000,
 ) -> IndexStats:
     root = Path(root).resolve()
     pdir = paths.project_dir(root)
@@ -709,11 +926,39 @@ def index_project(
         m = manifest.load_project(pdir)
         compatible = _is_compatible(m, provider) and (pdir / "files.json").is_file()
         if full_rebuild or not compatible:
-            return _full_rebuild(root, pdir, provider, m, batch_size, progress)
-        return _incremental(root, pdir, provider, m, batch_size, progress)
+            return _full_rebuild(
+                root,
+                pdir,
+                provider,
+                m,
+                batch_size,
+                progress,
+                git_analytics=git_analytics,
+                git_max_commits=git_max_commits,
+            )
+        return _incremental(
+            root,
+            pdir,
+            provider,
+            m,
+            batch_size,
+            progress,
+            git_analytics=git_analytics,
+            git_max_commits=git_max_commits,
+        )
 
 
-def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
+def _full_rebuild(
+    root,
+    pdir,
+    provider,
+    m,
+    batch_size,
+    progress,
+    *,
+    git_analytics: bool,
+    git_max_commits: int,
+) -> IndexStats:
     t0 = time.time()
     files_meta: dict[str, dict] = {}
     chunks = []
@@ -812,6 +1057,14 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
     )
 
     indexed_at = time.time()
+    git = gitmeta.snapshot(root)
+    git_history = _maybe_git_history_for_catalog(
+        root,
+        enabled=git_analytics,
+        max_commits=git_max_commits,
+        previous=None,
+        head=git.get("indexed_commit") or None,
+    )
     _save_catalog_from_rows(
         pdir=pdir,
         project_id=paths.project_id_for(root),
@@ -822,8 +1075,8 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
         rows=rows,
         indexed_at=indexed_at,
         store=store,
+        git_history=git_history,
     )
-    git = gitmeta.snapshot(root)
     # Commit the pointer FIRST (it references the fully-built new table), then
     # the file manifest. A crash in between leaves the new table active + a
     # stale files manifest, which the next incremental reconciles cheaply.
@@ -863,8 +1116,20 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
     )
 
 
-def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
+def _incremental(
+    root,
+    pdir,
+    provider,
+    m,
+    batch_size,
+    progress,
+    *,
+    git_analytics: bool,
+    git_max_commits: int,
+) -> IndexStats:
     t0 = time.time()
+    old_catalog = catalog.load_catalog(pdir, m.generation) if git_analytics else None
+    old_git_history = old_catalog.get("git_history") if isinstance(old_catalog, dict) else None
     old_files = manifest.load_files(pdir)
     new_files: dict[str, dict] = {}
     touched = []
@@ -1041,6 +1306,14 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
         )
 
     indexed_at = time.time()
+    git = gitmeta.snapshot(root)
+    git_history = _maybe_git_history_for_catalog(
+        root,
+        enabled=git_analytics,
+        max_commits=git_max_commits,
+        previous=old_git_history if isinstance(old_git_history, dict) else None,
+        head=git.get("indexed_commit") or None,
+    )
     catalog_rows = _strict_catalog_rows(store)
     _save_catalog_from_rows(
         pdir=pdir,
@@ -1052,12 +1325,13 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
         rows=catalog_rows,
         indexed_at=indexed_at,
         store=store,
+        git_history=git_history,
     )
     manifest.save_files(pdir, new_files)
     m.files = len(new_files)
     m.chunks = store.count()
     m.indexed_at = indexed_at
-    for key, value in gitmeta.snapshot(root).items():
+    for key, value in git.items():
         setattr(m, key, value)
     manifest.save_project(pdir, m)
 

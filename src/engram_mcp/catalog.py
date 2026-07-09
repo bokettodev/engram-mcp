@@ -186,6 +186,7 @@ def build_catalog(
     files_meta: dict[str, dict],
     rows: Iterable[dict],
     indexed_at: float,
+    git_history: dict | None = None,
 ) -> dict:
     by_file: dict[str, dict] = {}
     role_counts: dict[str, Counter] = defaultdict(Counter)
@@ -249,7 +250,7 @@ def build_catalog(
         "chunks": sum(int(f.get("chunks", 0) or 0) for f in files),
         "symbols": sum(len(f.get("symbols", [])) for f in files),
     }
-    return {
+    data = {
         "schema_version": SCHEMA_VERSION,
         "project_id": project_id,
         "root_path": root_path,
@@ -259,6 +260,9 @@ def build_catalog(
         "totals": totals,
         "files": files,
     }
+    if isinstance(git_history, dict):
+        data["git_history"] = git_history
+    return data
 
 
 def file_by_path(data: dict) -> dict[str, dict]:
