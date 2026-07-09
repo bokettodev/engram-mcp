@@ -775,9 +775,51 @@ def list_projects(
     )
 
 
-def do_project_map(project_path: str, depth: int = 2, sort: str = "path", limit: int = 200) -> dict:
+def do_project_map(
+    project_path: str,
+    depth: int = 2,
+    sort: str = "path",
+    limit: int | None = 200,
+    dirs_limit: int | None = None,
+    dirs_offset: int = 0,
+    include_files: bool = False,
+    files_limit: int | None = 50,
+    files_offset: int = 0,
+    include_symbols: bool = False,
+    symbols_limit: int | None = 20,
+    code_only: bool = False,
+    languages: list[str] | None = None,
+    chunk_roles: list[str] | None = None,
+    kinds: list[str] | None = None,
+    path_prefix: str | None = None,
+    path_glob: str | None = None,
+    symbol_kinds: list[str] | None = None,
+    min_symbols: int = 0,
+    non_empty: bool = True,
+) -> dict:
     try:
-        return _run_project_map(Path(project_path).expanduser().resolve(), depth=depth, sort=sort, limit=limit)
+        return _run_project_map(
+            Path(project_path).expanduser().resolve(),
+            depth=depth,
+            sort=sort,
+            limit=limit,
+            dirs_limit=dirs_limit,
+            dirs_offset=dirs_offset,
+            include_files=include_files,
+            files_limit=files_limit,
+            files_offset=files_offset,
+            include_symbols=include_symbols,
+            symbols_limit=symbols_limit,
+            code_only=code_only,
+            languages=languages,
+            chunk_roles=chunk_roles,
+            kinds=kinds,
+            path_prefix=path_prefix,
+            path_glob=path_glob,
+            symbol_kinds=symbol_kinds,
+            min_symbols=min_symbols,
+            non_empty=non_empty,
+        )
     except Exception as exc:
         return _error_payload(exc)
 
@@ -1018,10 +1060,51 @@ async def get_chunk(
 
 
 async def project_map(
-    project_path: str, depth: int = 2, sort: str = "path", limit: int = 200
+    project_path: str,
+    depth: int = 2,
+    sort: str = "path",
+    limit: int | None = 200,
+    dirs_limit: int | None = None,
+    dirs_offset: int = 0,
+    include_files: bool = False,
+    files_limit: int | None = 50,
+    files_offset: int = 0,
+    include_symbols: bool = False,
+    symbols_limit: int | None = 20,
+    code_only: bool = False,
+    languages: list[str] | None = None,
+    chunk_roles: list[str] | None = None,
+    kinds: list[str] | None = None,
+    path_prefix: str | None = None,
+    path_glob: str | None = None,
+    symbol_kinds: list[str] | None = None,
+    min_symbols: int = 0,
+    non_empty: bool = True,
 ) -> dict:
-    """Body-free file/dir/symbol map served from the catalog sidecar."""
-    return await asyncio.to_thread(do_project_map, project_path, depth, sort, limit)
+    """Body-free dirs map; opt into compact, paginated files and filters."""
+    return await asyncio.to_thread(
+        do_project_map,
+        project_path=project_path,
+        depth=depth,
+        sort=sort,
+        limit=limit,
+        dirs_limit=dirs_limit,
+        dirs_offset=dirs_offset,
+        include_files=include_files,
+        files_limit=files_limit,
+        files_offset=files_offset,
+        include_symbols=include_symbols,
+        symbols_limit=symbols_limit,
+        code_only=code_only,
+        languages=languages,
+        chunk_roles=chunk_roles,
+        kinds=kinds,
+        path_prefix=path_prefix,
+        path_glob=path_glob,
+        symbol_kinds=symbol_kinds,
+        min_symbols=min_symbols,
+        non_empty=non_empty,
+    )
 
 
 async def doctor_project(project_path: str, check_git: bool = True) -> dict:

@@ -342,12 +342,52 @@ def load_project_catalog(root: str | Path) -> tuple[QueryIndex, dict]:
 
 
 def project_map(
-    root: str | Path, depth: int = 2, sort: str = "path", limit: int = 200
+    root: str | Path,
+    depth: int = 2,
+    sort: str = "path",
+    limit: int | None = 200,
+    dirs_limit: int | None = None,
+    dirs_offset: int = 0,
+    include_files: bool = False,
+    files_limit: int | None = 50,
+    files_offset: int = 0,
+    include_symbols: bool = False,
+    symbols_limit: int | None = 20,
+    code_only: bool = False,
+    languages: list[str] | None = None,
+    chunk_roles: list[str] | None = None,
+    kinds: list[str] | None = None,
+    path_prefix: str | None = None,
+    path_glob: str | None = None,
+    symbol_kinds: list[str] | None = None,
+    min_symbols: int = 0,
+    non_empty: bool = True,
 ) -> dict:
     """Return a body-free project map from the catalog sidecar."""
 
     _qi, data = load_project_catalog(root)
-    return catalog.project_map(data, depth=depth, sort=sort, limit=limit)
+    return catalog.project_map(
+        data,
+        depth=depth,
+        sort=sort,
+        limit=limit,
+        dirs_limit=dirs_limit,
+        dirs_offset=dirs_offset,
+        include_files=include_files,
+        files_limit=files_limit,
+        files_offset=files_offset,
+        include_symbols=include_symbols,
+        symbols_limit=symbols_limit,
+        code_only=code_only,
+        languages=languages,
+        chunk_roles=chunk_roles,
+        kinds=kinds,
+        path_prefix=path_prefix,
+        path_glob=path_glob,
+        symbol_kinds=symbol_kinds,
+        min_symbols=min_symbols,
+        non_empty=non_empty,
+    )
 
 
 def _search_text(c) -> str:

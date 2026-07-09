@@ -306,6 +306,22 @@ def test_search_shape_facets_budget_and_catalog_tools(tmp_path, monkeypatch):
     mapped = server.do_project_map(str(proj), depth=1)
     assert mapped["totals"]["files"] == 2
     assert mapped["dirs"]
+    assert mapped["files"] == []
+    assert mapped["files_page"]["included"] is False
+
+    mapped_files = server.do_project_map(str(proj), depth=1, include_files=True, files_limit=1)
+    assert len(mapped_files["files"]) == 1
+    assert "symbols" not in mapped_files["files"][0]
+    assert "symbols_count" in mapped_files["files"][0]
+
+    mapped_symbols = server.do_project_map(
+        str(proj),
+        depth=1,
+        include_files=True,
+        include_symbols=True,
+        symbols_limit=1,
+    )
+    assert len(mapped_symbols["files"][0]["symbols"]) <= 1
 
     health = server.do_doctor_project(str(proj), check_git=False)
     assert health["ok"] is True

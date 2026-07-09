@@ -236,7 +236,7 @@ tool call never blocks for minutes):
 | `search_code(project_path, query, k=8, language=None, mode="auto", rerank=False, content="preview", max_chars_per_result=800, max_total_chars=None, candidate_k=None, facets=None, min_relevance=None)` | compact ranked hits over static indexed source |
 | `get_chunk(project_path, chunk_id, max_chars=None, include_neighbors=False, neighbor_window=1, include_parent=False)` | fetch full content for one search hit, optionally adjacent/parent context |
 | `find_definition(project_path, symbol)` | exact symbol definition lookup, with suggestions on miss (no embedding) |
-| `project_map(project_path, depth=2, sort="path", limit=200)` | body-free `totals`, `dirs`, and `files`; `depth=0..20`, `limit=1..1000`, `sort=path|files|chunks|symbols` |
+| `project_map(project_path, depth=2, sort="path", limit=200, dirs_limit=None, dirs_offset=0, include_files=False, files_limit=50, files_offset=0, include_symbols=False, symbols_limit=20, code_only=False, languages=None, chunk_roles=None, kinds=None, path_prefix=None, path_glob=None, symbol_kinds=None, min_symbols=0, non_empty=True)` | body-free dirs by default; compact file rows are opt-in and paginated; `limit` is the legacy alias for `dirs_limit`; filters compose and report `filtered_totals` |
 | `doctor_project(project_path, check_git=True)` | use before debugging empty/odd results; returns `ok`, `summary`, `git`, and `issues[]` |
 | `grep_index(project_path, pattern, ...)` | bounded Python regex probe; counts/line numbers by default, snippets with `include_lines=true` |
 | `model_status(project_path=None)` | reports whether the project's recorded query model is loaded/loading/not_loaded in this process |

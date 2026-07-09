@@ -11,6 +11,7 @@ import json
 import os
 import re
 import tempfile
+from fnmatch import fnmatchcase
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
@@ -274,13 +275,200 @@ def chunk_lookup(data: dict) -> dict[str, tuple[dict, dict, int]]:
     return out
 
 
-def project_map(data: dict, *, depth: int = 2, sort: str = "path", limit: int = 200) -> dict:
+_MAX_MAP_LIMIT = 1000
+
+
+def _coerce_limit(value: int | None, *, default: int) -> int:
+    if value is None:
+        value = default
+    return max(0, min(int(value), _MAX_MAP_LIMIT))
+
+
+def _coerce_offset(value: int) -> int:
+    return max(0, int(value))
+
+
+def _normalize_values(values: Iterable[str] | str | None) -> set[str]:
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    return {str(value) for value in values if str(value)}
+
+
+def _normalize_rel_filter(value: str | None) -> str:
+    if not value:
+        return ""
+    rel = str(value).replace("\\", "/").strip()
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel.strip("/")
+
+
+def _matches_prefix(path: str, prefix: str) -> bool:
+    if not prefix or prefix == ".":
+        return True
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def _kind_values(file_row: dict) -> set[str]:
+    out: set[str] = set()
+    for kind in file_row.get("kinds") or []:
+        value = kind.get("kind") if isinstance(kind, dict) else kind
+        if value:
+            out.add(str(value))
+    return out
+
+
+def _symbol_kind_values(file_row: dict) -> set[str]:
+    out: set[str] = set()
+    for symbol in file_row.get("symbols") or []:
+        value = symbol.get("symbol_kind") if isinstance(symbol, dict) else ""
+        if value:
+            out.add(str(value))
+    return out
+
+
+def _symbols_count(file_row: dict) -> int:
+    return len(file_row.get("symbols") or [])
+
+
+def _filtered_totals(files: list[dict]) -> dict:
+    return {
+        "files": len(files),
+        "chunks": sum(int(f.get("chunks", 0) or 0) for f in files),
+        "symbols": sum(_symbols_count(f) for f in files),
+    }
+
+
+def _page(items: list[dict], *, offset: int, limit: int) -> tuple[list[dict], dict]:
+    total = len(items)
+    selected = items[offset : offset + limit]
+    return selected, {
+        "offset": offset,
+        "limit": limit,
+        "count": len(selected),
+        "total": total,
+        "has_more": offset + len(selected) < total,
+    }
+
+
+def _compact_file_row(file_row: dict, *, include_symbols: bool, symbols_limit: int) -> dict:
+    symbols = file_row.get("symbols") or []
+    row = {
+        "path": file_row.get("path") or "",
+        "dir": file_row.get("dir") or ".",
+        "language": file_row.get("language") or "",
+        "chunks": int(file_row.get("chunks", 0) or 0),
+        "symbols_count": len(symbols),
+        "chunk_roles": dict(sorted((file_row.get("chunk_roles") or {}).items())),
+        "kinds": list(file_row.get("kinds") or []),
+    }
+    if include_symbols:
+        row["symbols"] = list(symbols[:symbols_limit])
+        row["symbols_has_more"] = len(symbols) > symbols_limit
+    return row
+
+
+def _filter_files(
+    files: Iterable[dict],
+    *,
+    code_only: bool,
+    languages: Iterable[str] | str | None,
+    chunk_roles: Iterable[str] | str | None,
+    kinds: Iterable[str] | str | None,
+    path_prefix: str | None,
+    path_glob: str | None,
+    symbol_kinds: Iterable[str] | str | None,
+    min_symbols: int,
+    non_empty: bool,
+) -> list[dict]:
+    language_filter = _normalize_values(languages)
+    role_filter = _normalize_values(chunk_roles)
+    kind_filter = _normalize_values(kinds)
+    symbol_kind_filter = _normalize_values(symbol_kinds)
+    prefix = _normalize_rel_filter(path_prefix)
+    glob = _normalize_rel_filter(path_glob)
+    min_symbols = max(0, int(min_symbols))
+
+    out: list[dict] = []
+    for file_row in files:
+        path = (file_row.get("path") or "").replace("\\", "/")
+        roles = {
+            str(role)
+            for role, count in (file_row.get("chunk_roles") or {}).items()
+            if role and int(count or 0) > 0
+        }
+        symbol_count = _symbols_count(file_row)
+
+        if non_empty and int(file_row.get("chunks", 0) or 0) <= 0:
+            continue
+        if code_only and not roles.intersection({"executable", "test"}):
+            continue
+        if language_filter and (file_row.get("language") or "") not in language_filter:
+            continue
+        if role_filter and not roles.intersection(role_filter):
+            continue
+        if kind_filter and not _kind_values(file_row).intersection(kind_filter):
+            continue
+        if prefix and not _matches_prefix(path, prefix):
+            continue
+        if glob and not fnmatchcase(path, glob):
+            continue
+        if symbol_kind_filter and not _symbol_kind_values(file_row).intersection(symbol_kind_filter):
+            continue
+        if symbol_count < min_symbols:
+            continue
+        out.append(file_row)
+    return out
+
+
+def project_map(
+    data: dict,
+    *,
+    depth: int = 2,
+    sort: str = "path",
+    limit: int | None = 200,
+    dirs_limit: int | None = None,
+    dirs_offset: int = 0,
+    include_files: bool = False,
+    files_limit: int | None = 50,
+    files_offset: int = 0,
+    include_symbols: bool = False,
+    symbols_limit: int | None = 20,
+    code_only: bool = False,
+    languages: Iterable[str] | str | None = None,
+    chunk_roles: Iterable[str] | str | None = None,
+    kinds: Iterable[str] | str | None = None,
+    path_prefix: str | None = None,
+    path_glob: str | None = None,
+    symbol_kinds: Iterable[str] | str | None = None,
+    min_symbols: int = 0,
+    non_empty: bool = True,
+) -> dict:
     depth = max(0, min(int(depth), 20))
-    limit = max(1, min(int(limit), 1000))
+    dirs_limit_value = _coerce_limit(dirs_limit if dirs_limit is not None else limit, default=200)
+    dirs_offset_value = _coerce_offset(dirs_offset)
+    files_limit_value = _coerce_limit(files_limit, default=50)
+    files_offset_value = _coerce_offset(files_offset)
+    symbols_limit_value = _coerce_limit(symbols_limit, default=20)
     sort = sort if sort in {"path", "files", "chunks", "symbols"} else "path"
 
+    filtered_files = _filter_files(
+        data.get("files", []),
+        code_only=code_only,
+        languages=languages,
+        chunk_roles=chunk_roles,
+        kinds=kinds,
+        path_prefix=path_prefix,
+        path_glob=path_glob,
+        symbol_kinds=symbol_kinds,
+        min_symbols=min_symbols,
+        non_empty=non_empty,
+    )
+
     dirs: dict[str, dict] = {}
-    for f in data.get("files", []):
+    for f in filtered_files:
         path = f.get("path") or ""
         parts = path.split("/")[:-1]
         if depth == 0 or not parts:
@@ -325,8 +513,39 @@ def project_map(data: dict, *, depth: int = 2, sort: str = "path", limit: int = 
         row["chunk_roles"] = dict(sorted(row["chunk_roles"].items()))
         row["kinds"] = {k: v for k, v in sorted(row["kinds"].items()) if k}
 
-    files = list(data.get("files", []))
+    dirs_page_rows, dirs_page = _page(
+        rows,
+        offset=dirs_offset_value,
+        limit=dirs_limit_value,
+    )
+
+    files = list(filtered_files)
     files.sort(key=lambda f: f.get("path") or "")
+    if include_files:
+        files_page_rows, files_page = _page(
+            files,
+            offset=files_offset_value,
+            limit=files_limit_value,
+        )
+        file_rows = [
+            _compact_file_row(
+                file_row,
+                include_symbols=include_symbols,
+                symbols_limit=symbols_limit_value,
+            )
+            for file_row in files_page_rows
+        ]
+    else:
+        file_rows = []
+        files_page = {
+            "offset": files_offset_value,
+            "limit": files_limit_value,
+            "count": 0,
+            "total": len(files),
+            "has_more": False,
+        }
+    files_page["included"] = bool(include_files)
+
     return {
         "project_id": data.get("project_id"),
         "project_path": data.get("root_path"),
@@ -335,13 +554,18 @@ def project_map(data: dict, *, depth: int = 2, sort: str = "path", limit: int = 
         "catalog_schema_version": data.get("schema_version"),
         "depth": depth,
         "sort": sort,
-        "limit": limit,
-        "count": len(rows[:limit]),
-        "total_dirs": len(rows),
-        "has_more": len(rows) > limit,
+        "limit": dirs_limit_value,
+        "dirs_limit": dirs_limit_value,
+        "files_limit": files_limit_value,
+        "count": dirs_page["count"],
+        "total_dirs": dirs_page["total"],
+        "has_more": bool(dirs_page["has_more"] or files_page["has_more"]),
         "totals": data.get("totals", {}),
-        "dirs": rows[:limit],
-        "files": files[:limit],
+        "filtered_totals": _filtered_totals(files),
+        "dirs_page": dirs_page,
+        "files_page": files_page,
+        "dirs": dirs_page_rows,
+        "files": file_rows,
     }
 
 
