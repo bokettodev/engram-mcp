@@ -18,7 +18,6 @@ from typing import Iterable
 
 SCHEMA_VERSION = 1
 SUPPORTED_FACETS = {"dir", "language", "chunk_role", "kind"}
-SZZ_STATUSES = {"computing", "partial", "ready", "unavailable"}
 
 _CONFIG_NAMES = {
     ".env",
@@ -40,10 +39,6 @@ def catalog_path(pdir: Path, generation: int) -> Path:
     return pdir / f"catalog_g{generation}.json"
 
 
-def szz_path(pdir: Path, generation: int) -> Path:
-    return pdir / f"szz_g{generation}.json"
-
-
 def _atomic_write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -61,32 +56,6 @@ def _atomic_write_json(path: Path, data) -> None:
 
 def save_catalog(pdir: Path, data: dict) -> None:
     _atomic_write_json(catalog_path(pdir, int(data.get("generation", 0))), data)
-
-
-def save_szz(pdir: Path, data: dict) -> None:
-    _atomic_write_json(szz_path(pdir, int(data.get("generation", 0))), data)
-
-
-def load_szz(pdir: Path, generation: int) -> dict | None:
-    f = szz_path(pdir, generation)
-    if not f.is_file():
-        return None
-    try:
-        data = json.loads(f.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    if data.get("schema_version") != SCHEMA_VERSION:
-        return None
-    try:
-        if int(data.get("generation", -1)) != int(generation):
-            return None
-    except (TypeError, ValueError):
-        return None
-    if str(data.get("status") or "") not in SZZ_STATUSES:
-        return None
-    return data
 
 
 def mark_catalog_stale(
@@ -217,7 +186,6 @@ def build_catalog(
     files_meta: dict[str, dict],
     rows: Iterable[dict],
     indexed_at: float,
-    git_history: dict | None = None,
 ) -> dict:
     by_file: dict[str, dict] = {}
     role_counts: dict[str, Counter] = defaultdict(Counter)
@@ -293,8 +261,6 @@ def build_catalog(
         "totals": totals,
         "files": files,
     }
-    if isinstance(git_history, dict):
-        data["git_history"] = git_history
     return data
 
 

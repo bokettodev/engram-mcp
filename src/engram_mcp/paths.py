@@ -110,6 +110,29 @@ def project_lock(root: Path) -> FileLock:
     return FileLock(str(lock_dir / f"{project_id_for(root)}.lock"))
 
 
+def git_analytics_dir(logical_project_id: str, *, create: bool = True) -> Path:
+    """Shared repo-history analytics directory keyed by logical project id."""
+
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(logical_project_id or "")).strip("-")
+    if not safe_id:
+        safe_id = "project"
+    d = data_home(create=create) / "git-analytics" / safe_id
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def git_analytics_lock(logical_project_id: str) -> FileLock:
+    """Cross-process write lock for one logical project's git analytics store."""
+
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(logical_project_id or "")).strip("-")
+    if not safe_id:
+        safe_id = "project"
+    lock_dir = data_home() / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(lock_dir / f"git-analytics-{safe_id}.lock"))
+
+
 def gpu_index_lock() -> FileLock:
     """Machine-wide CUDA index admission lock.
 

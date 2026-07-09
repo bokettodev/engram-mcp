@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from engram_mcp import catalog, gitanalytics, gitmeta, manifest, paths, pipeline
+from engram_mcp import catalog, gitanalytics, gitmeta, gitstore, manifest, paths, pipeline
 
 
 def _size_bytes(payload: dict) -> int:
@@ -66,7 +66,6 @@ def _sidecar_size_delta(sidecar: dict | None) -> dict:
     if not isinstance(sidecar, dict):
         return {"with_analytics_bytes": 0, "without_analytics_bytes": 0, "delta_bytes": 0}
     stripped = copy.deepcopy(sidecar)
-    stripped.pop("git_history", None)
     for item in stripped.get("files") or []:
         if isinstance(item, dict):
             item.pop("indent_complexity", None)
@@ -79,26 +78,16 @@ def _sidecar_size_delta(sidecar: dict | None) -> dict:
     }
 
 
-def _freshen_probe(root: Path, sidecar: dict | None, max_commits: int | None) -> dict:
-    if not isinstance(sidecar, dict):
-        return {"available": False, "reason": "catalog unavailable"}
-    current = gitmeta.head_commit(root)
-    if not current:
-        return {"available": False, "reason": "HEAD unavailable"}
-    parent = gitmeta._git(root, "rev-parse", "HEAD~1")
-    if not parent:
-        return {"available": False, "reason": "HEAD~1 unavailable"}
-    simulated = copy.deepcopy(sidecar)
-    simulated["git_history"] = {
-        "schema_version": 1,
-        "status": "ready",
-        "max_commits": max_commits,
-        "head_commit": parent,
-        "fix_regex": gitmeta.DEFAULT_FIX_REGEX,
-        "commits": [],
-    }
+def _freshen_probe(root: Path, m: manifest.ProjectManifest | None) -> dict:
+    if m is None:
+        return {"available": False, "reason": "manifest unavailable"}
     source, ms = _timed(
-        lambda: pipeline._analytics_source(root, simulated, git_max_commits=max_commits)
+        lambda: pipeline._analytics_source(
+            root,
+            logical_project_id=m.logical_project_id,
+            checkout_kind=m.checkout_kind,
+            git_max_commits=None,
+        )
     )
     return {
         "available": True,
@@ -111,12 +100,14 @@ def _freshen_probe(root: Path, sidecar: dict | None, max_commits: int | None) ->
     }
 
 
-def _load_szz_sidecar(root: Path, sidecar: dict | None) -> tuple[dict | None, float]:
-    if not isinstance(sidecar, dict):
-        return None, 0.0
+def _load_shared_store(root: Path) -> tuple[manifest.ProjectManifest | None, dict | None, float, dict | None, float]:
     pdir = paths.project_dir(root, create=False)
-    generation = int(sidecar.get("generation", 0) or 0)
-    return _timed(lambda: catalog.load_szz(pdir, generation))
+    m = manifest.load_project(pdir)
+    if m is None:
+        return None, None, 0.0, None, 0.0
+    history, history_ms = _timed(lambda: gitstore.load_history(m.logical_project_id))
+    szz, szz_ms = _timed(lambda: gitstore.load_szz(m.logical_project_id))
+    return m, history, history_ms, szz, szz_ms
 
 
 def _first_pass_szz_with_search_probe(root: Path, commits: list[dict]) -> dict:
@@ -157,15 +148,36 @@ def main() -> int:
     parser.add_argument("project_path", help="indexed project root")
     parser.add_argument("--git-max-commits", type=int, default=None)
     parser.add_argument("--recent-days", type=int, default=90)
+    parser.add_argument(
+        "--second-project-path",
+        default=None,
+        help="optional second checkout/worktree to verify shared-store reuse",
+    )
     args = parser.parse_args()
 
     root = Path(args.project_path).expanduser().resolve()
     if not root.is_dir():
         raise SystemExit(f"not a directory: {root}")
 
-    commits, log_ms = _timed(lambda: gitmeta.commit_log(root, max_commits=args.git_max_commits))
+    fingerprint = gitmeta.repo_ref_fingerprint(root)
+    common_dir = fingerprint.get("common_dir") or root
+    commits, log_ms = _timed(
+        lambda: gitmeta.commit_log_with_status(common_dir, all_refs=True, git_dir=bool(fingerprint.get("common_dir"))).get(
+            "commits",
+            [],
+        )
+    )
+    pdir = paths.project_dir(root, create=False)
+    manifest_data = manifest.load_project(pdir)
+    logical_project_id = manifest_data.logical_project_id if manifest_data is not None else ""
+    checkout_kind = manifest_data.checkout_kind if manifest_data is not None else ""
     history, history_ms = _timed(
-        lambda: gitmeta.history_for_catalog(root, max_commits=args.git_max_commits)
+        lambda: gitmeta.history_for_shared_store(
+            root,
+            logical_project_id=logical_project_id,
+            checkout_kind=checkout_kind,
+            fingerprint=fingerprint,
+        )
     )
     first_szz = _first_pass_szz_with_search_probe(root, commits)
     incremental_szz, incremental_szz_ms = _timed(
@@ -199,22 +211,79 @@ def main() -> int:
     )
 
     sidecar, parse_ms = _load_catalog_with_timing(root)
-    szz_sidecar, szz_sidecar_ms = _load_szz_sidecar(root, sidecar)
-    has_history = bool(isinstance(sidecar, dict) and isinstance(sidecar.get("git_history"), dict))
+    store_manifest, shared_history, shared_history_ms, shared_szz, shared_szz_ms = _load_shared_store(root)
+    has_history = isinstance(shared_history, dict)
     base_with_history_ms = None
     if has_history:
         _base_with_history, base_with_history_ms = _timed(lambda: pipeline.project_map(root, include_git=False))
 
+    reuse_probe = None
+    if args.second_project_path:
+        second = Path(args.second_project_path).expanduser().resolve()
+        if not second.is_dir():
+            raise SystemExit(f"not a directory: {second}")
+        second_manifest = manifest.load_project(paths.project_dir(second, create=False))
+        first_ensure, first_ensure_ms = _timed(
+            lambda: pipeline._ensure_shared_git_analytics(
+                root=root,
+                logical_project_id=logical_project_id,
+                checkout_kind=checkout_kind,
+                enabled=True,
+                fix_regex=None,
+            )
+        )
+        pipeline.wait_for_szz_tasks(timeout=None)
+        second_logical = second_manifest.logical_project_id if second_manifest is not None else ""
+        second_kind = second_manifest.checkout_kind if second_manifest is not None else ""
+        second_ensure, second_ensure_ms = _timed(
+            lambda: pipeline._ensure_shared_git_analytics(
+                root=second,
+                logical_project_id=second_logical,
+                checkout_kind=second_kind,
+                enabled=True,
+                fix_regex=None,
+            )
+        )
+        pipeline.wait_for_szz_tasks(timeout=None)
+        first_szz = gitstore.load_szz(logical_project_id) if logical_project_id else None
+        second_szz = gitstore.load_szz(second_logical) if second_logical else None
+        reuse_probe = {
+            "second_project_path": str(second),
+            "same_logical_project_id": bool(logical_project_id and logical_project_id == second_logical),
+            "first_ensure_ms": first_ensure_ms,
+            "second_ensure_ms": second_ensure_ms,
+            "first_ensure_return": first_ensure,
+            "second_ensure_return": second_ensure,
+            "first_szz_blamed_commits": (first_szz or {}).get("blamed_commits"),
+            "second_szz_blamed_commits": (second_szz or {}).get("blamed_commits"),
+            "second_reused_without_reblame": bool(
+                logical_project_id
+                and logical_project_id == second_logical
+                and second_ensure_ms < max(100.0, first_ensure_ms * 0.25)
+            ),
+        }
+
     out = {
         "project_path": str(root),
-        "git_max_commits": args.git_max_commits,
+        "git_max_commits": None,
         "szz_workers_chosen": gitmeta.szz_worker_count(),
+        "shared_store": {
+            "logical_project_id": logical_project_id,
+            "checkout_kind": checkout_kind,
+            "history_path": str(gitstore.history_path(logical_project_id, create=False))
+            if logical_project_id
+            else "",
+            "szz_path": str(gitstore.szz_path(logical_project_id, create=False))
+            if logical_project_id
+            else "",
+            "reuse_probe": reuse_probe,
+        },
         "commit_log": {
             "ms": log_ms,
             "commits": len(commits),
         },
         "index_time_analytics_build": {
-            "git_history_cheap_ms": history_ms,
+            "git_history_shared_ms": history_ms,
             "status": history.get("status"),
             "commits": len(history.get("commits") or []),
             "indentation_scan": _indentation_scan(root, sidecar),
@@ -253,28 +322,29 @@ def main() -> int:
             "analyzed_changes": (ticket_map.get("git_analytics") or {}).get("analyzed_changes"),
             "szz": (ticket_map.get("git_analytics") or {}).get("szz"),
         },
-        "sidecar_git_history": {
+        "shared_git_history": {
             "present": has_history,
-            "parse_ms": parse_ms if has_history else None,
-            "status": (sidecar.get("git_history") or {}).get("status") if isinstance(sidecar, dict) else None,
-            "commits": len((sidecar.get("git_history") or {}).get("commits") or [])
-            if isinstance(sidecar, dict)
-            else 0,
+            "parse_ms": shared_history_ms if has_history else None,
+            "status": shared_history.get("status") if isinstance(shared_history, dict) else None,
+            "fingerprint": (shared_history.get("fingerprint") or {}).get("hash")
+            if isinstance(shared_history, dict)
+            else "",
+            "commits": len((shared_history or {}).get("commits") or []),
             "base_map_ms_with_history_present": base_with_history_ms,
         },
-        "sidecar_szz": {
-            "present": isinstance(szz_sidecar, dict),
-            "parse_ms": szz_sidecar_ms if isinstance(szz_sidecar, dict) else None,
-            "status": szz_sidecar.get("status") if isinstance(szz_sidecar, dict) else None,
-            "workers": szz_sidecar.get("workers") if isinstance(szz_sidecar, dict) else None,
-            "cached_commits": szz_sidecar.get("cached_commits") if isinstance(szz_sidecar, dict) else None,
-            "blamed_commits": szz_sidecar.get("blamed_commits") if isinstance(szz_sidecar, dict) else None,
-            "attributions": len(szz_sidecar.get("attributions") or [])
-            if isinstance(szz_sidecar, dict)
+        "shared_szz": {
+            "present": isinstance(shared_szz, dict),
+            "parse_ms": shared_szz_ms if isinstance(shared_szz, dict) else None,
+            "status": shared_szz.get("status") if isinstance(shared_szz, dict) else None,
+            "workers": shared_szz.get("workers") if isinstance(shared_szz, dict) else None,
+            "cached_commits": shared_szz.get("cached_commits") if isinstance(shared_szz, dict) else None,
+            "blamed_commits": shared_szz.get("blamed_commits") if isinstance(shared_szz, dict) else None,
+            "attributions": len(shared_szz.get("attributions") or [])
+            if isinstance(shared_szz, dict)
             else 0,
         },
         "sidecar_size_delta": _sidecar_size_delta(sidecar),
-        "read_time_freshen_probe": _freshen_probe(root, sidecar, args.git_max_commits),
+        "read_time_freshen_probe": _freshen_probe(root, store_manifest),
     }
     print(json.dumps(out, indent=2))
     return 0

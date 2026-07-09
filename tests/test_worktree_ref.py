@@ -8,8 +8,8 @@ from typing import Sequence
 
 import pytest
 
-from engram_mcp import manifest, paths, server
-from engram_mcp.pipeline import index_project, search_project
+from engram_mcp import gitmeta, gitstore, manifest, paths, server
+from engram_mcp.pipeline import index_project, search_project, wait_for_szz_tasks
 
 
 class _BranchProvider:
@@ -170,6 +170,71 @@ def test_git_worktree_indexes_share_logical_project_id_and_ref_query(tmp_path, m
     missing_def = server.do_find_definition(str(main), "branch_marker", ref="missing/ref")
     assert missing_def["project_id"] == main_manifest.project_id
     assert any("no index for ref 'missing/ref'" in warning for warning in missing_def["warnings"])
+
+
+def test_git_worktree_reuses_shared_repo_analytics(tmp_path, monkeypatch):
+    main, worktree, _branch = _tiny_worktree_repo(tmp_path)
+    calls: list[dict] = []
+
+    def fake_szz(root, commits, **kwargs):
+        calls.append(
+            {
+                "root": str(root),
+                "commits": [commit.get("commit") for commit in commits],
+                "previous": kwargs.get("previous"),
+            }
+        )
+        return {
+            "status": "ready",
+            "warning": "",
+            "fix_regex": gitmeta.DEFAULT_FIX_REGEX,
+            "fix_commits": 0,
+            "blamed_lines": 0,
+            "attributions": [],
+            "commit_attributions": {},
+            "workers": 1,
+            "cached_commits": 0,
+            "blamed_commits": 0,
+            "timings_ms": {"total": 1.0, "blame": 0.0},
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(gitmeta, "szz_attributions_with_status", fake_szz)
+
+    index_project(main, _BranchProvider("test:shared-main"), full_rebuild=True)
+    wait_for_szz_tasks(timeout=5)
+    main_manifest = manifest.load_project(paths.project_dir(main, create=False))
+    assert main_manifest is not None
+    history = gitstore.load_history(main_manifest.logical_project_id)
+    szz = gitstore.load_szz(main_manifest.logical_project_id)
+    assert history is not None
+    assert szz is not None
+    assert history["status"] == "ready"
+    assert szz["status"] == "ready"
+    assert len(calls) == 1
+
+    index_project(worktree, _BranchProvider("test:shared-worktree"), full_rebuild=True)
+    wait_for_szz_tasks(timeout=5)
+    worktree_manifest = manifest.load_project(paths.project_dir(worktree, create=False))
+    assert worktree_manifest is not None
+    assert worktree_manifest.logical_project_id == main_manifest.logical_project_id
+    assert len(calls) == 1
+
+    main_map = server.do_project_map(str(main), include_files=True, include_git=True)
+    worktree_map = server.do_project_map(str(worktree), include_files=True, include_git=True)
+    assert main_map["git_analytics"]["cache_fingerprint"]
+    assert main_map["git_analytics"]["cache_fingerprint"] == worktree_map["git_analytics"]["cache_fingerprint"]
+    assert main_map["git_analytics"]["analyzed_changes"] == worktree_map["git_analytics"]["analyzed_changes"]
+
+    (worktree / "extra.py").write_text("def extra_marker():\n    return 'extra marker'\n", encoding="utf-8")
+    _git(worktree, "add", "extra.py")
+    _git(worktree, "commit", "-m", "fix extra marker")
+    index_project(worktree, _BranchProvider("test:shared-worktree-refresh"), full_rebuild=True)
+    wait_for_szz_tasks(timeout=5)
+    refreshed = gitstore.load_history(main_manifest.logical_project_id)
+    assert refreshed is not None
+    assert refreshed["fingerprint"]["hash"] != history["fingerprint"]["hash"]
+    assert len(calls) == 2
 
 
 def test_non_git_identity_is_path_based_and_query_unchanged(tmp_path):

@@ -6,6 +6,7 @@ can report staleness, but it never uses churn or recency as a relevance prior.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -137,6 +138,54 @@ def _git(root: Path, *args: str) -> str | None:
     return out.strip()
 
 
+def _git_dir(git_dir: Path, *args: str) -> str | None:
+    """Run a read-only git command directly against a git common dir."""
+
+    if _staleness_disabled():
+        return None
+    cmd = [
+        "git",
+        f"--git-dir={git_dir}",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "core.quotePath=false",
+        *args,
+    ]
+    creation = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_GIT_ENV,
+            **creation,
+        )
+    except OSError:
+        return None
+    try:
+        out, _ = proc.communicate(timeout=_GIT_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        return None
+    except (OSError, ValueError, UnicodeError):
+        _kill_tree(proc)
+        return None
+    if proc.returncode != 0:
+        return None
+    return out.strip()
+
+
 def _normalize_git_path(value: str | None) -> str:
     text = (value or "").replace("\\", "/").strip()
     while text.startswith("./"):
@@ -159,6 +208,67 @@ def _canonical_git_path(value: str | None, *, base: Path) -> str:
 
 def _path_key(value: str) -> str:
     return os.path.normcase(value.replace("\\", "/"))
+
+
+def common_dir_for_worktree(root: str | Path) -> str:
+    """Return the resolved git common dir for a worktree, or ``""``."""
+
+    try:
+        path = Path(root).expanduser().resolve()
+    except OSError:
+        return ""
+    common = _git(path, "rev-parse", "--git-common-dir")
+    if not common:
+        return ""
+    return _canonical_git_path(common, base=path)
+
+
+def _fingerprint_from_refs(common_dir: Path) -> dict:
+    refs = _git_dir(common_dir, "for-each-ref", "--format=%(refname)%00%(objectname)", "refs")
+    if refs is None:
+        return {"status": "unavailable", "warning": "git refs unavailable"}
+    lines = sorted(line.strip() for line in refs.splitlines() if line.strip())
+    if not lines:
+        head = _git_dir(common_dir, "rev-parse", "--verify", "HEAD")
+        if head:
+            lines = [f"HEAD\x00{head}"]
+    digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    tip_raw = _git_dir(common_dir, "log", "--all", "-1", "--format=%H%x1f%ct") or ""
+    tip_commit = ""
+    max_commit_ts = 0
+    if tip_raw:
+        parts = tip_raw.split("\x1f", 1)
+        tip_commit = parts[0].strip()
+        if len(parts) > 1:
+            try:
+                max_commit_ts = int(parts[1].strip() or "0")
+            except ValueError:
+                max_commit_ts = 0
+    return {
+        "status": "ready",
+        "algorithm": "git-refs-sha256-v1",
+        "hash": digest,
+        "refs": len(lines),
+        "max_commit_ts": max_commit_ts,
+        "tip_commit": tip_commit,
+    }
+
+
+def repo_ref_fingerprint(root: str | Path) -> dict:
+    """Return a repo-wide fingerprint of all refs reachable from the common dir."""
+
+    if _staleness_disabled():
+        return {
+            "status": "unavailable",
+            "warning": "git disabled by ENGRAM_GIT_STALENESS=0",
+            "common_dir": "",
+        }
+    common = common_dir_for_worktree(root)
+    if not common:
+        return {"status": "unavailable", "warning": "not a git worktree", "common_dir": ""}
+    fp = _fingerprint_from_refs(Path(common))
+    fp["common_dir"] = common
+    return fp
 
 
 def _non_git_snapshot(root: Path | None) -> dict:
@@ -787,6 +897,9 @@ def commit_log_with_status(
     root: str | Path,
     max_commits: int | None = None,
     rev_range: str | None = None,
+    *,
+    all_refs: bool = False,
+    git_dir: bool = False,
 ) -> dict:
     """Return a compact parsed git history or an unavailable status.
 
@@ -805,7 +918,7 @@ def commit_log_with_status(
     except OSError as exc:
         return {"status": "unavailable", "warning": str(exc), "commits": []}
     max_commits = _coerce_max_commits(max_commits)
-    if not (_git(path, "rev-parse", "--is-inside-work-tree") or "").strip():
+    if not git_dir and not (_git(path, "rev-parse", "--is-inside-work-tree") or "").strip():
         return {"status": "unavailable", "warning": "not a git worktree", "commits": []}
     fmt = f"{_LOG_RECORD_SEP}%H{_LOG_FIELD_SEP}%P{_LOG_FIELD_SEP}%ct{_LOG_FIELD_SEP}%an{_LOG_FIELD_SEP}%s"
     args = [
@@ -817,12 +930,14 @@ def commit_log_with_status(
         "--numstat",
         f"--format={fmt}",
     ]
+    if all_refs:
+        args.append("--all")
     if max_commits is not None:
         args.extend(["-n", str(max_commits)])
     if rev_range:
         args.append(rev_range)
     args.append("--")
-    out = _git(path, *args)
+    out = _git_dir(path, *args) if git_dir else _git(path, *args)
     if out is None:
         return {"status": "unavailable", "warning": "git log unavailable", "commits": []}
     return {"status": "ready", "warning": "", "commits": _parse_log_output(out)}
@@ -918,6 +1033,52 @@ def history_for_catalog(
     return base | {
         "status": "ready",
         "commits": _limit_commits(list(full.get("commits") or []), max_commits),
+    }
+
+
+def history_for_shared_store(
+    root: str | Path,
+    *,
+    logical_project_id: str,
+    checkout_kind: str = "",
+    fingerprint: dict | None = None,
+    fix_regex: str | None = None,
+) -> dict:
+    """Build the repo-wide git-history payload for the shared analytics store."""
+
+    fp = fingerprint if isinstance(fingerprint, dict) else repo_ref_fingerprint(root)
+    fix_regex_value = fix_regex or DEFAULT_FIX_REGEX
+    common_dir = str(fp.get("common_dir") or "")
+    base = {
+        "schema_version": 1,
+        "logical_project_id": logical_project_id,
+        "checkout_kind": checkout_kind,
+        "status": "unavailable",
+        "max_commits": None,
+        "head_commit": str(fp.get("tip_commit") or ""),
+        "git_common_dir": common_dir,
+        "fingerprint": {
+            "algorithm": str(fp.get("algorithm") or "git-refs-sha256-v1"),
+            "hash": str(fp.get("hash") or ""),
+            "refs": int(fp.get("refs", 0) or 0),
+            "max_commit_ts": int(fp.get("max_commit_ts", 0) or 0),
+            "tip_commit": str(fp.get("tip_commit") or ""),
+        },
+        "fix_regex": fix_regex_value,
+        "commits": [],
+    }
+    if fp.get("status") != "ready" or not common_dir:
+        return base | {"warning": str(fp.get("warning") or "git refs unavailable")}
+    status = commit_log_with_status(Path(common_dir), all_refs=True, git_dir=True)
+    if status.get("status") != "ready":
+        return base | {"warning": status.get("warning") or "git log --all unavailable"}
+    commits = [c for c in (status.get("commits") or []) if isinstance(c, dict)]
+    head_commit = str(fp.get("tip_commit") or (commits[0].get("commit") if commits else "") or "")
+    return base | {
+        "status": "ready",
+        "warning": "",
+        "head_commit": head_commit,
+        "commits": commits,
     }
 
 

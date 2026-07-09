@@ -403,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         metavar="N",
-        help="maximum commits to store for git analytics (default: all commits)",
+        help=argparse.SUPPRESS,
     )
     pi.add_argument(
         "--git-fix-regex",
