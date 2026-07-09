@@ -104,7 +104,7 @@ def _compact_project(d: Path, raw: dict) -> dict:
         "generation": raw.get("generation", 0),
     }
     for key in _GIT_KEYS:
-        if key in raw:
+        if raw.get(key) not in ("", None, False):
             item[key] = raw[key]
     return item
 

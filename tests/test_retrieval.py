@@ -73,11 +73,15 @@ def test_evaluation_harness(tmp_path, monkeypatch, provider):
     index_project(proj, provider)
     cases = [
         {"query": "add two numbers", "expected_path": "math_utils.py",
-         "expected_symbol": "add_numbers", "category": "nl"},
+         "expected_symbol": "add_numbers", "category": "nl",
+         "distractor_paths": ["missing.py"]},
         {"query": "function add_numbers", "expected_paths": ["math_utils.py"], "category": "exact_symbol"},
     ]
     report = evaluate.run_evaluation(proj, provider, cases, k=5)
     assert report.overall.n == 2
     assert report.overall.hit5 == 1.0
+    assert report.overall.hnsr5 == 1.0
+    assert report.rows[0]["delta_rank"] is not None
+    assert report.by_overlap_bucket
     assert "nl" in report.by_category and "exact_symbol" in report.by_category
     assert all(r["rank"] is not None for r in report.rows)

@@ -235,11 +235,48 @@ def test_canonical_st_provider_identity_and_loaded_tracking(monkeypatch):
     importlib.util.find_spec("sentence_transformers") is not None,
     reason="gpu extra installed; loading the reranker would be heavy",
 )
-def test_reranker_without_extra_raises_helpful_error():
+def test_sentence_transformers_backend_without_extra_raises_helpful_error():
+    # The opt-in torch backend still needs the 'gpu' extra; the default
+    # fastembed ONNX backend does not (covered separately).
     from engram_mcp.rerankers import get_reranker
 
+    get_reranker.cache_clear()
     with pytest.raises(ImportError):
-        get_reranker()
+        get_reranker(backend="sentence_transformers")
+    get_reranker.cache_clear()
+
+
+def test_fastembed_onnx_reranker_is_default_and_torch_free(monkeypatch):
+    # Default backend is the torch-free ONNX cross-encoder; verify selection,
+    # scoring order, and metadata without downloading the real 1.11 GB model.
+    import sys
+    import types
+
+    from engram_mcp import rerankers
+
+    class _FakeTCE:
+        def __init__(self, model_name, cuda=False, **_kwargs):
+            self.model_name = model_name
+            assert cuda is False  # must stay on the CPU onnxruntime provider
+
+        def rerank(self, query, documents, **_kwargs):
+            # ascending score by position, so the last candidate ranks first
+            return [float(i + 1) for i, _ in enumerate(documents)]
+
+    mod = types.ModuleType("fastembed.rerank.cross_encoder")
+    mod.TextCrossEncoder = _FakeTCE
+    monkeypatch.setitem(sys.modules, "fastembed.rerank.cross_encoder", mod)
+    monkeypatch.setenv("ENGRAM_RERANKER_BACKEND", "sentence_transformers")
+
+    rerankers.get_reranker.cache_clear()
+    r = rerankers.get_reranker()  # default backend ignores ENGRAM_RERANKER_BACKEND
+    assert r.backend == "fastembed"
+    assert r.model_id == rerankers.DEFAULT_ONNX_RERANKER
+    cands = [{"content": "a"}, {"content": "b"}, {"content": "c"}]
+    ranked = r.rerank("q", cands, top_k=2)
+    assert len(ranked) == 2
+    assert ranked[0]["content"] == "c" and ranked[0]["reranked"] is True
+    rerankers.get_reranker.cache_clear()
 
 
 def test_make_index_provider_loads_and_reports_dim(provider):

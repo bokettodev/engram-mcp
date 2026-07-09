@@ -270,5 +270,275 @@
       "src/engram_mcp/indexing/languages.py",
       "src/engram_mcp/pipeline.py"
     ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where is a freshly prepared corpus made visible all at once after a rebuild",
+    "expected_path": "src/engram_mcp/pipeline.py",
+    "distractor_paths": [
+      "src/engram_mcp/manifest.py",
+      "src/engram_mcp/store/lancedb_store.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which module chooses the private storage home and names mutual-exclusion marker files",
+    "expected_path": "src/engram_mcp/paths.py",
+    "distractor_paths": [
+      "src/engram_mcp/config.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where are parsed program regions sliced into compact passages for later retrieval",
+    "expected_path": "src/engram_mcp/indexing/chunker.py",
+    "distractor_paths": [
+      "src/engram_mcp/indexing/languages.py",
+      "src/engram_mcp/indexing/walker.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which code remembers numeric representations keyed by a stable document fingerprint",
+    "expected_path": "src/engram_mcp/embeddings/cache.py",
+    "distractor_paths": [
+      "src/engram_mcp/indexing/hash.py",
+      "src/engram_mcp/embeddings/factory.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where are two ranked candidate streams blended so shared answers move upward",
+    "expected_path": "src/engram_mcp/retrieval.py",
+    "distractor_paths": [
+      "src/engram_mcp/pipeline.py",
+      "src/engram_mcp/store/lancedb_store.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which module surveys a tree while avoiding vendored clutter and huge artifacts",
+    "expected_path": "src/engram_mcp/indexing/walker.py",
+    "distractor_paths": [
+      "src/engram_mcp/indexing/ignore.py",
+      "src/engram_mcp/config.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where do remote tool requests become background work or compact structured replies",
+    "expected_path": "src/engram_mcp/server.py",
+    "distractor_paths": [
+      "src/engram_mcp/pipeline.py",
+      "src/engram_mcp/cli.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "what enforces the single approved encoder profile and picks cpu versus accelerator construction",
+    "expected_path": "src/engram_mcp/embeddings/factory.py",
+    "distractor_paths": [
+      "src/engram_mcp/embeddings/fastembed_provider.py",
+      "src/engram_mcp/embeddings/sentence_transformers_provider.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which adapter keeps rows in an embedded columnar database and exposes keyword lookup",
+    "expected_path": "src/engram_mcp/store/lancedb_store.py",
+    "distractor_paths": [
+      "src/engram_mcp/retrieval.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where is the small project state record saved by replacing a temporary file",
+    "expected_path": "src/engram_mcp/manifest.py",
+    "distractor_paths": [
+      "src/engram_mcp/paths.py",
+      "src/engram_mcp/catalog.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which table maps filename endings to parser choices for source dialects",
+    "expected_path": "src/engram_mcp/indexing/languages.py",
+    "distractor_paths": [
+      "src/engram_mcp/indexing/chunker.py",
+      "src/engram_mcp/indexing/walker.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "grade answer order and separation from tempting wrong files",
+    "expected_path": "src/engram_mcp/evaluate.py",
+    "distractor_paths": [
+      "src/engram_mcp/retrieval.py",
+      "src/engram_mcp/cli.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where are terminal subcommands connected to their execution routines",
+    "expected_path": "src/engram_mcp/cli.py",
+    "distractor_paths": [
+      "src/engram_mcp/server.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "produce repeatable fingerprints combining passage material with encoder choice",
+    "expected_path": "src/engram_mcp/indexing/hash.py",
+    "distractor_paths": [
+      "src/engram_mcp/embeddings/cache.py",
+      "src/engram_mcp/config.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which component filters paths using cascading rules from ancestor directories",
+    "expected_path": "src/engram_mcp/indexing/ignore.py",
+    "distractor_paths": [
+      "src/engram_mcp/indexing/walker.py",
+      "src/engram_mcp/config.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "what builds a body-free sidecar summarizing directories files and symbols",
+    "expected_path": "src/engram_mcp/catalog.py",
+    "distractor_paths": [
+      "src/engram_mcp/pipeline.py",
+      "src/engram_mcp/store/lancedb_store.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where are saved project records listed without opening heavy vector tables",
+    "expected_path": "src/engram_mcp/inventory.py",
+    "distractor_paths": [
+      "src/engram_mcp/manifest.py",
+      "src/engram_mcp/paths.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "remember submitted tasks through lifecycle timing and unit counts",
+    "expected_path": "src/engram_mcp/jobs.py",
+    "distractor_paths": [
+      "src/engram_mcp/server.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "what handles corporate certificate interception before fetching model weights",
+    "expected_path": "src/engram_mcp/net.py",
+    "distractor_paths": [
+      "src/engram_mcp/embeddings/factory.py",
+      "src/engram_mcp/embeddings/fastembed_provider.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where are failures normalized into a machine code plus optional guidance",
+    "expected_path": "src/engram_mcp/errors.py",
+    "distractor_paths": [
+      "src/engram_mcp/server.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which cpu provider wraps onnx encoders for documents and questions",
+    "expected_path": "src/engram_mcp/embeddings/fastembed_provider.py",
+    "distractor_paths": [
+      "src/engram_mcp/embeddings/factory.py",
+      "src/engram_mcp/embeddings/sentence_transformers_provider.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which optional accelerator provider batches documents through torch",
+    "expected_path": "src/engram_mcp/embeddings/sentence_transformers_provider.py",
+    "distractor_paths": [
+      "src/engram_mcp/embeddings/factory.py",
+      "src/engram_mcp/embeddings/fastembed_provider.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "what local scorer reorders shortlisted passages with a cross encoder",
+    "expected_path": "src/engram_mcp/rerankers.py",
+    "distractor_paths": [
+      "src/engram_mcp/retrieval.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where are default size ceilings and skipped folder names collected",
+    "expected_path": "src/engram_mcp/config.py",
+    "distractor_paths": [
+      "src/engram_mcp/indexing/walker.py",
+      "src/engram_mcp/indexing/chunker.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which helper compares recorded revision facts with the current checkout",
+    "expected_path": "src/engram_mcp/gitmeta.py",
+    "distractor_paths": [
+      "src/engram_mcp/manifest.py",
+      "src/engram_mcp/pipeline.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where does a missed name lookup receive nearby alternative symbols",
+    "expected_path": "src/engram_mcp/pipeline.py",
+    "distractor_paths": [
+      "src/engram_mcp/retrieval.py",
+      "src/engram_mcp/inventory.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "what keeps the always-on process from owning accelerator memory during lookup",
+    "expected_path": "src/engram_mcp/embeddings/factory.py",
+    "distractor_paths": [
+      "src/engram_mcp/embeddings/sentence_transformers_provider.py",
+      "src/engram_mcp/server.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which health probe checks stored rows sidecars freshness and optional revision drift",
+    "expected_path": "src/engram_mcp/pipeline.py",
+    "distractor_paths": [
+      "src/engram_mcp/catalog.py",
+      "src/engram_mcp/gitmeta.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "where are previews clipped around the matching text for compact results",
+    "expected_path": "src/engram_mcp/server.py",
+    "distractor_paths": [
+      "src/engram_mcp/pipeline.py",
+      "src/engram_mcp/retrieval.py"
+    ]
+  },
+  {
+    "category": "paraphrase",
+    "query": "which routine searches stored source with a bounded regular expression scan",
+    "expected_path": "src/engram_mcp/pipeline.py",
+    "distractor_paths": [
+      "src/engram_mcp/store/lancedb_store.py",
+      "src/engram_mcp/server.py"
+    ]
   }
 ]

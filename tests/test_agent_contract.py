@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import types
 import threading
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ from engram_mcp.pipeline import (
     index_project,
     load_query_index,
     search_project,
+    _search_count_metadata,
     _is_compatible,
 )
 from engram_mcp.store.lancedb_store import LanceStore
@@ -236,7 +238,7 @@ def test_invalid_env_index_device_is_index_time_only(tmp_path, monkeypatch):
         factory.default_index_device()
     assert exc.value.code == errors.E_BAD_REQUEST
 
-    proj, provider = _indexed_project(tmp_path)
+    proj, provider = _indexed_canonical_project(tmp_path)
     monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
     out = server.do_search(str(proj), "add numbers", k=1)
     assert "error" not in out
@@ -246,7 +248,7 @@ def test_invalid_env_index_device_is_index_time_only(tmp_path, monkeypatch):
 def test_compact_search_get_chunk_relevance_and_stale(tmp_path, monkeypatch):
     from engram_mcp import server
 
-    proj, provider = _indexed_project(tmp_path)
+    proj, provider = _indexed_canonical_project(tmp_path)
     monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
 
     out = server.do_search(str(proj), "add numbers", k=2)
@@ -272,6 +274,373 @@ def test_compact_search_get_chunk_relevance_and_stale(tmp_path, monkeypatch):
     assert stale["results"][0]["stale"] is True
 
 
+def test_search_shape_facets_budget_and_catalog_tools(tmp_path, monkeypatch):
+    from engram_mcp import catalog, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+
+    out = server.do_search(
+        str(proj),
+        "add numbers",
+        k=2,
+        facets=["language", "kind", "chunk_role"],
+        max_total_chars=12,
+    )
+    assert out["count"] == 2
+    assert out["map"][0]["chunk_id"] == out["results"][0]["chunk_id"]
+    assert out["body_chars"] <= 12
+    assert out["truncated"] is True
+    assert "total_matches" in out
+    assert out["total_matches"]["vector_estimate"]["exact"] is False
+    assert out["facets"]["fields"]["language"]["python"] >= 1
+    assert "matched_in" in out["results"][0]
+
+    pdir = paths.project_dir(proj, create=False)
+    m = manifest.load_project(pdir)
+    data = catalog.load_catalog(pdir, m.generation)
+    assert data is not None
+    assert data["totals"]["files"] == 2
+    assert "content" not in json.dumps(data)
+
+    mapped = server.do_project_map(str(proj), depth=1)
+    assert mapped["totals"]["files"] == 2
+    assert mapped["dirs"]
+
+    health = server.do_doctor_project(str(proj), check_git=False)
+    assert health["ok"] is True
+    assert health["summary"]["manifest_files"] == 2
+
+    grep = server.do_grep_index(str(proj), "EmbeddingCache")
+    assert grep["total_matches"] >= 1
+    assert grep["results"][0]["path"] == "cache.py"
+
+
+def test_incremental_catalog_crash_window_leaves_unavailable_catalog(tmp_path, monkeypatch):
+    from engram_mcp import catalog, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    (proj / "new_file.py").write_text("def new_marker():\n    return 3\n", encoding="utf-8")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("simulated catalog write crash")
+
+    monkeypatch.setattr(catalog, "save_catalog", boom)
+    with pytest.raises(RuntimeError, match="simulated catalog write crash"):
+        index_project(proj, provider)
+
+    pdir = paths.project_dir(proj, create=False)
+    m = manifest.load_project(pdir)
+    assert catalog.load_catalog(pdir, m.generation) is None
+
+    out = server.do_search(str(proj), "new marker", k=2)
+    assert out["count"] >= 1
+    assert any("catalog sidecar unavailable" in w for w in out["warnings"])
+
+    mapped = server.do_project_map(str(proj), depth=1)
+    assert mapped["code"] == errors.E_INDEX_INVALID
+
+
+def test_same_generation_catalog_drift_is_rejected_against_active_table(tmp_path, monkeypatch):
+    from engram_mcp import catalog, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    pdir = paths.project_dir(proj, create=False)
+    m = manifest.load_project(pdir)
+    stale_catalog = catalog.load_catalog(pdir, m.generation)
+    assert stale_catalog is not None
+
+    LanceStore(pdir / "lancedb", provider.dim, table=m.active_table).add(
+        [
+            {
+                "chunk_id": "drift-row",
+                "rel_path": "drift.py",
+                "language": "python",
+                "symbol": "drift",
+                "symbol_kind": "function_definition",
+                "chunk_role": "executable",
+                "start_line": 1,
+                "end_line": 2,
+                "content": "def drift():\n    return 4\n",
+                "search_text": "path: drift.py\nsymbol: drift\n\ndef drift():\n    return 4\n",
+                "file_hash": "drift-file",
+                "chunk_hash": "drift-chunk",
+                "vector": [0.0, 0.0, 0.0, 1.0],
+            }
+        ]
+    )
+
+    mapped = server.do_project_map(str(proj), depth=1)
+    assert mapped["code"] == errors.E_INDEX_INVALID
+    assert "active table row count" in mapped["hint"]
+
+    health = server.do_doctor_project(str(proj), check_git=False)
+    assert any(issue["code"] == "catalog_count_mismatch" for issue in health["issues"])
+
+
+def test_malformed_catalog_warns_but_search_returns_hits(tmp_path, monkeypatch):
+    from engram_mcp import catalog, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    pdir = paths.project_dir(proj, create=False)
+    m = manifest.load_project(pdir)
+    catalog.catalog_path(pdir, m.generation).write_text(
+        json.dumps(
+            {
+                "schema_version": catalog.SCHEMA_VERSION,
+                "generation": None,
+                "active_table": m.active_table,
+                "totals": {"files": 0, "chunks": 0, "symbols": 0},
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    out = server.do_search(str(proj), "add numbers", k=1)
+    assert out["count"] == 1
+    assert "error" not in out
+    assert any("catalog sidecar unavailable" in w for w in out["warnings"])
+
+
+def test_grep_index_pathological_regex_times_out(tmp_path, monkeypatch):
+    from engram_mcp import server
+
+    monkeypatch.setenv("ENGRAM_GREP_REGEX_TIMEOUT_SEC", "0.2")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    pdir = _write_manifest_only(proj, chunks=1)
+    content = ("a" * 5000) + "!"
+    LanceStore(pdir / "lancedb", 4, table="chunks").create(
+        [
+            {
+                "chunk_id": "slow",
+                "rel_path": "slow.py",
+                "language": "python",
+                "symbol": "",
+                "symbol_kind": "",
+                "chunk_role": "comment",
+                "start_line": 1,
+                "end_line": 1,
+                "content": content,
+                "search_text": content,
+                "file_hash": "h",
+                "chunk_hash": "ch",
+                "vector": [0.0, 0.0, 0.0, 1.0],
+            }
+        ]
+    )
+    manifest.save_files(
+        pdir,
+        {
+            "slow.py": {
+                "file_hash": "h",
+                "mtime_ns": 1,
+                "size": len(content),
+                "language": "python",
+                "chunks": 1,
+            }
+        },
+    )
+
+    out = server.do_grep_index(str(proj), r"(a+)+$")
+    assert out["code"] == errors.E_BAD_REQUEST
+    assert "timed out" in out["error"]
+
+
+def test_rerank_candidate_k_env_default_and_validation(tmp_path, monkeypatch):
+    from engram_mcp import server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    monkeypatch.setenv("ENGRAM_RERANK_CANDIDATE_K", "7")
+
+    out = server.do_search(str(proj), "add numbers", k=1)
+    assert out["candidate_k"] == 7
+
+    explicit = server.do_search(str(proj), "add numbers", k=1, candidate_k=9)
+    assert explicit["candidate_k"] == 9
+
+
+def test_rerank_failure_degrades_to_base_ranking(tmp_path, monkeypatch):
+    # Rerank is best-effort: a non-ImportError failure (e.g. model download
+    # race, onnxruntime error) must NOT nuke the search — return base ranking.
+    from engram_mcp import rerankers, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    monkeypatch.setenv("ENGRAM_RERANK_ENABLED", "1")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("onnxruntime exploded mid-rerank")
+
+    monkeypatch.setattr(rerankers, "get_reranker", boom)
+
+    out = server.do_search(str(proj), "add numbers", k=2, mode="vector", rerank=True)
+    assert out["count"] == 2  # results survived, not an empty error payload
+    assert out["rerank_applied"] is False
+    assert any("rerank unavailable" in w for w in out["warnings"])
+
+
+def test_rerank_master_switch_off_by_default(tmp_path, monkeypatch):
+    # ENGRAM_RERANK_ENABLED is the master switch: off by default, and when off a
+    # per-call rerank=true must NOT construct/load any reranker model.
+    from engram_mcp import rerankers, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    monkeypatch.delenv("ENGRAM_RERANK_ENABLED", raising=False)
+
+    def must_not_load(*_a, **_k):
+        raise AssertionError("reranker must not load when ENGRAM_RERANK_ENABLED is off")
+
+    monkeypatch.setattr(rerankers, "get_reranker", must_not_load)
+
+    out = server.do_search(str(proj), "add numbers", k=2, mode="vector", rerank=True)
+    assert out["rerank_applied"] is False
+    assert "ENGRAM_RERANK_ENABLED" in (out["rerank_skipped_reason"] or "")
+    assert out["count"] == 2
+
+    # flip the switch on -> vector-mode rerank now runs
+    monkeypatch.setenv("ENGRAM_RERANK_ENABLED", "1")
+    calls = {"n": 0}
+
+    class _FakeReranker:
+        model_id = "fake"
+
+        def rerank(self, query, hits, top_k=None):
+            calls["n"] += 1
+            return hits[:top_k] if top_k else hits
+
+    monkeypatch.setattr(rerankers, "get_reranker", lambda **_k: _FakeReranker())
+    on = server.do_search(str(proj), "add numbers", k=2, mode="vector", rerank=True)
+    assert on["rerank_applied"] is True
+    assert calls["n"] == 1
+
+
+def test_rerank_gated_to_vector_mode(tmp_path, monkeypatch):
+    # Rerank must be skipped for hybrid-routed (identifier/literal) queries and
+    # only run for vector mode. Reranking hybrid demotes exact symbol defs.
+    from engram_mcp import rerankers, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    monkeypatch.setenv("ENGRAM_RERANK_ENABLED", "1")
+
+    calls = {"n": 0}
+
+    class _FakeReranker:
+        model_id = "fake-reranker"
+
+        def rerank(self, query, hits, top_k=None):
+            calls["n"] += 1
+            return list(reversed(hits))[:top_k] if top_k else list(reversed(hits))
+
+    monkeypatch.setattr(rerankers, "get_reranker", lambda **_k: _FakeReranker())
+
+    hybrid = server.do_search(str(proj), "add numbers", k=2, mode="hybrid", rerank=True)
+    assert hybrid["rerank_applied"] is False
+    assert hybrid["rerank_skipped_reason"] is not None
+    assert calls["n"] == 0  # reranker never constructed/called for hybrid
+
+    vector = server.do_search(str(proj), "add numbers", k=2, mode="vector", rerank=True)
+    assert vector["rerank_applied"] is True
+    assert vector["rerank_skipped_reason"] is None
+    assert calls["n"] == 1
+
+    monkeypatch.setenv("ENGRAM_RERANK_CANDIDATE_K", "999")
+    assert server._rerank_candidate_k_default() == 50
+    monkeypatch.setenv("ENGRAM_RERANK_CANDIDATE_K", "0")
+    assert server._rerank_candidate_k_default() == 1
+    monkeypatch.setenv("ENGRAM_RERANK_CANDIDATE_K", "bad")
+    assert server._rerank_candidate_k_default() == 20
+
+    bad = server.do_search(str(proj), "add numbers", k=1, candidate_k=51)
+    assert bad["code"] == errors.E_BAD_REQUEST
+
+
+def test_fts_count_metadata_labels_capped_lower_bound(monkeypatch):
+    from engram_mcp.store import lancedb_store
+
+    monkeypatch.setenv("ENGRAM_FTS_COUNT_MAX_SCAN", "3")
+    assert lancedb_store.fts_count_max_scan() == 3
+    monkeypatch.setenv("ENGRAM_FTS_COUNT_MAX_SCAN", "0")
+    assert lancedb_store.fts_count_max_scan() == 1
+    monkeypatch.setenv("ENGRAM_FTS_COUNT_MAX_SCAN", "bad")
+    assert lancedb_store.fts_count_max_scan() == lancedb_store.DEFAULT_FTS_COUNT_MAX_SCAN
+
+    class CappedStore:
+        def fts_metadata(self, query, columns, where=None):
+            return (
+                [
+                    {"chunk_id": "a", "rel_path": "a.py", "language": "python", "chunk_role": "executable"},
+                    {"chunk_id": "b", "rel_path": "b.py", "language": "python", "chunk_role": "comment"},
+                ],
+                None,
+                {"capped": True, "cap": 2, "limit": 2, "table_rows": 10},
+            )
+
+    qi = types.SimpleNamespace(store=CappedStore())
+    total, facets, warnings = _search_count_metadata(
+        qi,
+        "needle",
+        None,
+        "hybrid",
+        [],
+        ["language", "chunk_role"],
+        None,
+    )
+    assert total["fts_exact"] == {
+        "available": True,
+        "count": 2,
+        "exact": False,
+        "capped": True,
+        "method": "lancedb_0_33_fts_metadata_scan",
+    }
+    assert facets["scope"] == "fts_capped_lower_bound"
+    assert facets["exact"] is False
+    assert facets["fields"]["language"]["python"] == 2
+    assert "lower bound" in warnings[0]
+
+    class ExactStore:
+        def fts_metadata(self, query, columns, where=None):
+            return (
+                [{"chunk_id": "a", "rel_path": "a.py", "language": "python", "chunk_role": "executable"}],
+                None,
+                {"capped": False, "cap": 50, "limit": 10, "table_rows": 10},
+            )
+
+    total, facets, warnings = _search_count_metadata(
+        types.SimpleNamespace(store=ExactStore()),
+        "needle",
+        None,
+        "hybrid",
+        [],
+        ["language"],
+        None,
+    )
+    assert total["fts_exact"]["exact"] is True
+    assert total["fts_exact"]["capped"] is False
+    assert facets["scope"] == "fts_exact"
+    assert warnings == []
+
+
+def test_get_chunk_neighbors_are_opt_in(tmp_path):
+    from engram_mcp import server
+
+    proj, _provider = _indexed_project(tmp_path)
+    found = server.do_find_definition(str(proj), "EmbeddingCache")
+    chunk_id = found["results"][0]["chunk_id"]
+    plain = server.do_get_chunk(str(proj), chunk_id)
+    assert "neighbors" not in plain
+    expanded = server.do_get_chunk(str(proj), chunk_id, include_neighbors=True, include_parent=True)
+    assert "neighbors" in expanded
+    assert isinstance(expanded["neighbors"], list)
+
+
 def test_content_modes_and_min_relevance_filter(tmp_path, monkeypatch):
     from engram_mcp import server
 
@@ -287,6 +656,52 @@ def test_content_modes_and_min_relevance_filter(tmp_path, monkeypatch):
 
     high = server.do_search(str(proj), "unknown thing", min_relevance="high")
     assert all(r["relevance"] == "high" for r in high["results"])
+
+
+def test_plan_index_reports_missing_unique_without_loading_model(tmp_path):
+    proj = _write_project(tmp_path)
+    from engram_mcp.pipeline import index_project, plan_index
+
+    provider = FakeProvider()
+    before = plan_index(proj, model_id=provider.model_id, dim=provider.dim)
+    assert before.mode == "full"
+    assert before.missing_unique_chunks >= 1
+    index_project(proj, provider)
+    after = plan_index(proj, model_id=provider.model_id, dim=provider.dim)
+    assert after.mode == "incremental"
+    assert after.missing_unique_chunks == 0
+
+
+def test_start_index_job_auto_routes_small_delta_to_cpu(tmp_path, monkeypatch):
+    from engram_mcp import server
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    plan = types.SimpleNamespace(
+        mode="incremental",
+        files=1,
+        chunks=1,
+        added=0,
+        changed=1,
+        deleted=0,
+        unchanged=0,
+        missing_unique_chunks=1,
+    )
+    submitted = []
+
+    class Pool:
+        def submit(self, fn, *args):
+            submitted.append((fn, args))
+
+    monkeypatch.setattr(server, "_plan_index", lambda *a, **k: plan)
+    monkeypatch.setattr(server, "_index_pool", Pool())
+    monkeypatch.setenv("ENGRAM_DELTA_CPU_MAX", "5")
+    out = server.start_index_job(str(proj), index_device="auto")
+    assert out["index_device"] == "cpu"
+    assert out["index_device_requested"] == "auto"
+    assert out["routing"] == "delta_cpu"
+    assert submitted[0][1][-1] == "cpu"
 
 
 def test_relevance_bucket_thresholds():

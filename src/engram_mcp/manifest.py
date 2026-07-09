@@ -31,6 +31,10 @@ class ProjectManifest:
     files: int = 0
     chunks: int = 0
     indexed_at: float = 0.0
+    git_worktree_root: str = ""
+    indexed_ref: str = ""
+    indexed_commit: str = ""
+    indexed_dirty: bool = False
     schema_version: int = SCHEMA_VERSION
 
 

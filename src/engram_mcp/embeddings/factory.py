@@ -4,11 +4,10 @@ Engram stores one canonical embedder id in manifests and cache keys:
 
     fastembed:ibm-granite/granite-embedding-97m-multilingual-r2
 
-Search always replays that id with FastEmbed/ONNX on CPU. Indexing uses the
-same FastEmbed CPU backend by default, or a one-shot sentence-transformers CUDA
-backend when explicitly requested. The CUDA backend reports the canonical
-``model_id`` for compatibility/cache semantics and a distinct ``backend_id`` for
-loaded-model accounting.
+Search always uses FastEmbed/ONNX CPU. Indexing defaults to ``auto``, preferring
+CUDA and falling back/routing to CPU when appropriate. The CUDA backend reports
+the canonical ``model_id`` for compatibility/cache semantics and a distinct
+``backend_id`` for loaded-model accounting.
 """
 
 from __future__ import annotations

@@ -10,14 +10,17 @@ separately for display. All writers hold a per-project file lock.
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import time
+import multiprocessing as mp
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
-from engram_mcp import config, errors, manifest, paths, retrieval
+from engram_mcp import catalog, config, errors, gitmeta, manifest, paths, retrieval
 from engram_mcp.embeddings.base import EmbeddingProvider
 from engram_mcp.embeddings.cache import EmbeddingCache
 from engram_mcp.indexing.chunker import chunk_file
@@ -55,8 +58,25 @@ class QueryIndex:
     count: int
 
 
+@dataclass(slots=True)
+class IndexPlan:
+    root: Path
+    mode: str
+    compatible: bool
+    files: int
+    chunks: int
+    added: int
+    changed: int
+    deleted: int
+    unchanged: int
+    missing_unique_chunks: int
+
+
 MAX_SEARCH_K = 50
-MAX_RERANK_CANDIDATES = 100
+MAX_RERANK_CANDIDATES = 50
+DEFAULT_RERANK_CANDIDATE_K = 20
+VECTOR_ESTIMATE_RELATIVE_FRACTION = 0.85
+DEFAULT_GREP_REGEX_TIMEOUT_SEC = 2.0
 ProgressSink = Callable[[dict[str, Any]], None] | Callable[[int, int], None]
 
 _CONFIG_NAMES = {
@@ -139,6 +159,30 @@ def _validate_search_k(k: int) -> int:
     return k
 
 
+def rerank_enabled() -> bool:
+    """Master switch for reranking. Off unless ENGRAM_RERANK_ENABLED is truthy.
+
+    When off, a per-call ``rerank=true`` is ignored and NO reranker model is
+    constructed or downloaded — a hard guarantee that the heavy ONNX cross-encoder
+    never loads on the always-on server unless the operator opts in.
+    """
+    return os.environ.get("ENGRAM_RERANK_ENABLED", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def rerank_candidate_k_default() -> int:
+    raw = os.environ.get("ENGRAM_RERANK_CANDIDATE_K", "").strip()
+    if not raw:
+        value = DEFAULT_RERANK_CANDIDATE_K
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = DEFAULT_RERANK_CANDIDATE_K
+    return max(1, min(value, MAX_RERANK_CANDIDATES))
+
+
 def load_query_index(root: str | Path) -> QueryIndex:
     """Validate a project's readable index before any model/provider load."""
 
@@ -207,13 +251,110 @@ def load_query_index(root: str | Path) -> QueryIndex:
     return QueryIndex(root=root, pdir=pdir, manifest=m, store=store, count=count)
 
 
+def _catalog_chunk_ids(data: dict) -> set[str]:
+    ids: set[str] = set()
+    files = data.get("files") or []
+    if not isinstance(files, list):
+        return ids
+    for file_entry in files:
+        if not isinstance(file_entry, dict):
+            continue
+        refs = file_entry.get("chunk_refs") or []
+        if not isinstance(refs, list):
+            continue
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            chunk_id = ref.get("chunk_id")
+            if chunk_id:
+                ids.add(chunk_id)
+    return ids
+
+
+def _catalog_ref_count(data: dict) -> int:
+    files = data.get("files") or []
+    if not isinstance(files, list):
+        return -1
+    total = 0
+    for file_entry in files:
+        if not isinstance(file_entry, dict):
+            return -1
+        refs = file_entry.get("chunk_refs") or []
+        if not isinstance(refs, list):
+            return -1
+        total += len(refs)
+    return total
+
+
+def _catalog_validation_error(data: dict, qi: QueryIndex) -> str | None:
+    if data.get("active_table") != qi.manifest.active_table:
+        return "catalog sidecar does not match the active table"
+    try:
+        table_rows = qi.store.count()
+    except Exception as exc:
+        return f"active table row count unavailable while validating catalog: {exc}"
+    totals = data.get("totals") or {}
+    if not isinstance(totals, dict):
+        return "catalog totals are malformed"
+    try:
+        total_chunks = int(totals.get("chunks", -1) or -1)
+    except (TypeError, ValueError):
+        return "catalog totals are malformed"
+    if total_chunks != table_rows:
+        return "catalog totals differ from active table row count"
+    if _catalog_ref_count(data) != table_rows:
+        return "catalog chunk refs differ from active table row count"
+    try:
+        rows = qi.store.metadata_rows_strict(columns=("chunk_id",))
+    except Exception as exc:
+        return f"active table metadata unavailable while validating catalog: {exc}"
+    table_ids = {row.get("chunk_id") for row in rows if row.get("chunk_id")}
+    catalog_ids = _catalog_chunk_ids(data)
+    if len(table_ids) != table_rows:
+        return "active table chunk ids differ from active table row count"
+    if len(catalog_ids) != table_rows:
+        return "catalog chunk ids differ from active table row count"
+    if catalog_ids != table_ids:
+        return "catalog chunk refs disagree with active table rows"
+    return None
+
+
+def _load_valid_catalog(qi: QueryIndex) -> tuple[dict | None, str | None]:
+    data = catalog.load_catalog(qi.pdir, qi.manifest.generation)
+    if data is None:
+        return None, "catalog sidecar unavailable"
+    reason = _catalog_validation_error(data, qi)
+    if reason is not None:
+        return None, reason
+    return data, None
+
+
+def load_project_catalog(root: str | Path) -> tuple[QueryIndex, dict]:
+    qi = load_query_index(root)
+    data, reason = _load_valid_catalog(qi)
+    if data is None:
+        raise errors.EngramError(
+            f"catalog sidecar for generation {qi.manifest.generation} is missing or invalid",
+            errors.E_INDEX_INVALID,
+            hint=(reason or "Rebuild the index to regenerate the body-free catalog."),
+        )
+    return qi, data
+
+
+def project_map(
+    root: str | Path, depth: int = 2, sort: str = "path", limit: int = 200
+) -> dict:
+    """Return a body-free project map from the catalog sidecar."""
+
+    _qi, data = load_project_catalog(root)
+    return catalog.project_map(data, depth=depth, sort=sort, limit=limit)
+
+
 def _search_text(c) -> str:
     """The text actually embedded + full-text indexed: a contextual header
     (path / symbol / language) followed by the raw chunk content.
 
-    (A richer header with file-level imports was tried and measured slightly
-    WORSE on the eval set — the extra tokens diluted the signal — so the lean
-    header stands.)"""
+    v3 retained lean path/symbol/language headers."""
     header = [f"path: {c.rel_path}"]
     if c.symbol:
         header.append(f"symbol: {c.symbol}")
@@ -229,6 +370,66 @@ def _is_compatible(m: manifest.ProjectManifest | None, provider: EmbeddingProvid
         and m.embedder_id == provider.model_id
         and m.dim == provider.dim
         and m.chunker_version == config.CHUNKER_VERSION
+    )
+
+
+def _strict_catalog_rows(store: LanceStore) -> list[dict]:
+    rows = store.metadata_rows_strict()
+    count = store.count()
+    if len(rows) != count:
+        raise RuntimeError(
+            f"metadata scan read {len(rows)} rows from {store.table!r}, expected {count}"
+        )
+    return rows
+
+
+def _save_catalog_from_rows(
+    *,
+    pdir: Path,
+    project_id: str,
+    root: Path,
+    generation: int,
+    active_table: str,
+    files_meta: dict[str, dict],
+    rows: list[dict],
+    indexed_at: float,
+    store: LanceStore,
+) -> None:
+    table_rows = store.count()
+    if len(rows) != table_rows:
+        raise RuntimeError(
+            f"refusing to write catalog: metadata rows={len(rows)} table rows={table_rows}"
+        )
+    data = catalog.build_catalog(
+        project_id=project_id,
+        root_path=str(root),
+        generation=generation,
+        active_table=active_table,
+        files_meta=files_meta,
+        rows=rows,
+        indexed_at=indexed_at,
+    )
+    if _catalog_ref_count(data) != table_rows:
+        raise RuntimeError(
+            f"refusing to write catalog: catalog refs={_catalog_ref_count(data)} table rows={table_rows}"
+        )
+    catalog.save_catalog(pdir, data)
+
+
+def _mark_catalog_stale_for_update(
+    *,
+    pdir: Path,
+    root: Path,
+    m: manifest.ProjectManifest,
+    reason: str,
+) -> None:
+    catalog.mark_catalog_stale(
+        pdir,
+        project_id=m.project_id,
+        root_path=str(root),
+        generation=m.generation,
+        active_table=m.active_table or "chunks",
+        reason=reason,
     )
 
 
@@ -340,6 +541,93 @@ def _embed(texts, provider, cache, batch_size, progress):
         )
     cache.put_many(new_vecs)
     return {**cached, **new_vecs}, hashes, len(new_vecs), len(cached)
+
+
+def plan_index(
+    root: str | Path,
+    *,
+    full_rebuild: bool = False,
+    model_id: str,
+    dim: int,
+) -> IndexPlan:
+    """Torch-free index plan used for delta-aware server routing.
+
+    The plan walks/chunks/hashes source and checks the content-addressed
+    embedding cache. It never constructs an embedding provider.
+    """
+
+    root = Path(root).resolve()
+    pdir = paths.project_dir(root)
+    m = manifest.load_project(pdir)
+    compatible = bool(
+        m is not None
+        and m.active_table
+        and m.embedder_id == model_id
+        and m.dim == dim
+        and m.chunker_version == config.CHUNKER_VERSION
+        and (pdir / "files.json").is_file()
+    )
+    old_files = manifest.load_files(pdir) if compatible else {}
+    force_full = full_rebuild or not compatible
+
+    new_files: dict[str, dict] = {}
+    texts: list[str] = []
+    added = changed = unchanged = 0
+
+    for rec in walk(root):
+        old = old_files.get(rec.rel_path)
+        if not force_full and old and old.get("size") == rec.size and old.get("mtime_ns") == rec.mtime_ns:
+            new_files[rec.rel_path] = old
+            unchanged += 1
+            continue
+        text = _read_text(rec.abs_path)
+        if text is None or looks_generated(text, rec.language):
+            continue
+        fh = sha256_text(text)
+        if not force_full and old and old.get("file_hash") == fh:
+            entry = dict(old)
+            entry["mtime_ns"] = rec.mtime_ns
+            new_files[rec.rel_path] = entry
+            unchanged += 1
+            continue
+        chunks = chunk_file(rec.rel_path, rec.language, text)
+        new_files[rec.rel_path] = {
+            "file_hash": fh,
+            "mtime_ns": rec.mtime_ns,
+            "size": rec.size,
+            "language": rec.language or "",
+            "chunks": len(chunks),
+        }
+        texts.extend(_search_text(c) for c in chunks)
+        if force_full or not old:
+            added += 1
+        else:
+            changed += 1
+
+    deleted = 0 if force_full else sum(1 for p in old_files if p not in new_files)
+    total_chunks = sum(int(meta.get("chunks", 0) or 0) for meta in new_files.values())
+    hashes = {
+        embedding_input_hash(model_id, config.CHUNKER_VERSION, text)
+        for text in texts
+    }
+    if hashes:
+        with EmbeddingCache(paths.global_cache_dir() / "embeddings.sqlite") as cache:
+            cached = cache.get_many(hashes, dim=dim)
+        missing = len(hashes - set(cached))
+    else:
+        missing = 0
+    return IndexPlan(
+        root=root,
+        mode="full" if force_full else "incremental",
+        compatible=compatible,
+        files=len(new_files),
+        chunks=total_chunks,
+        added=added,
+        changed=changed,
+        deleted=deleted,
+        unchanged=unchanged,
+        missing_unique_chunks=missing,
+    )
 
 
 def _rows(chunks, search_texts, hashes, vec_by_hash, file_hash_by_path) -> list[dict]:
@@ -483,6 +771,19 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
         reused=reused,
     )
 
+    indexed_at = time.time()
+    _save_catalog_from_rows(
+        pdir=pdir,
+        project_id=paths.project_id_for(root),
+        root=root,
+        generation=gen,
+        active_table=new_table,
+        files_meta=files_meta,
+        rows=rows,
+        indexed_at=indexed_at,
+        store=store,
+    )
+    git = gitmeta.snapshot(root)
     # Commit the pointer FIRST (it references the fully-built new table), then
     # the file manifest. A crash in between leaves the new table active + a
     # stale files manifest, which the next incremental reconciles cheaply.
@@ -493,7 +794,8 @@ def _full_rebuild(root, pdir, provider, m, batch_size, progress) -> IndexStats:
             active_table=new_table, generation=gen,
             embedder_id=provider.model_id, dim=provider.dim,
             chunker_version=config.CHUNKER_VERSION,
-            files=len(files_meta), chunks=len(chunks), indexed_at=time.time(),
+            files=len(files_meta), chunks=len(chunks), indexed_at=indexed_at,
+            **git,
         ),
     )
     manifest.save_files(pdir, files_meta)
@@ -641,6 +943,13 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
         embedded=embedded,
         reused=reused,
     )
+    if touched or deleted_paths:
+        _mark_catalog_stale_for_update(
+            pdir=pdir,
+            root=root,
+            m=m,
+            reason="incremental update mutating active table",
+        )
     store.delete_paths([rec.rel_path for rec, _, _ in touched] + deleted_paths)
     store.add(rows)
     _emit_progress(
@@ -691,10 +1000,25 @@ def _incremental(root, pdir, provider, m, batch_size, progress) -> IndexStats:
             reused=reused,
         )
 
+    indexed_at = time.time()
+    catalog_rows = _strict_catalog_rows(store)
+    _save_catalog_from_rows(
+        pdir=pdir,
+        project_id=m.project_id,
+        root=root,
+        generation=m.generation,
+        active_table=m.active_table or "chunks",
+        files_meta=new_files,
+        rows=catalog_rows,
+        indexed_at=indexed_at,
+        store=store,
+    )
     manifest.save_files(pdir, new_files)
     m.files = len(new_files)
     m.chunks = store.count()
-    m.indexed_at = time.time()
+    m.indexed_at = indexed_at
+    for key, value in gitmeta.snapshot(root).items():
+        setattr(m, key, value)
     manifest.save_project(pdir, m)
 
     elapsed = time.time() - t0
@@ -735,6 +1059,12 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
 
         old_files = manifest.load_files(pdir)
         store = LanceStore(pdir / "lancedb", provider.dim, table=m.active_table)
+        _mark_catalog_stale_for_update(
+            pdir=pdir,
+            root=root,
+            m=m,
+            reason="single-file reindex mutating active table",
+        )
         store.delete_paths([rel])
         chunks = []
         # Apply the same admission rules as a normal walk (skip symlink, binary,
@@ -770,10 +1100,25 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
             action = "deleted"
 
         store.refresh_fts()
+        indexed_at = time.time()
+        catalog_rows = _strict_catalog_rows(store)
+        _save_catalog_from_rows(
+            pdir=pdir,
+            project_id=m.project_id,
+            root=root,
+            generation=m.generation,
+            active_table=m.active_table or "chunks",
+            files_meta=old_files,
+            rows=catalog_rows,
+            indexed_at=indexed_at,
+            store=store,
+        )
         manifest.save_files(pdir, old_files)
         m.files = len(old_files)
         m.chunks = store.count()
-        m.indexed_at = time.time()
+        m.indexed_at = indexed_at
+        for key, value in gitmeta.snapshot(root).items():
+            setattr(m, key, value)
         manifest.save_project(pdir, m)
         return {"rel_path": rel, "action": action, "chunks": len(chunks)}
 
@@ -804,6 +1149,7 @@ def _annotate_hits(
     query: str,
     mode_used: str,
     min_relevance: str | None,
+    git_stale: bool = False,
 ) -> tuple[list[dict], dict, dict]:
     files_meta = manifest.load_files(pdir)
     annotated: list[dict] = []
@@ -823,6 +1169,8 @@ def _annotate_hits(
         h["match_reason"] = retrieval.match_reason(h, query, mode_used)
         stale, reason = _freshness_for_hit(root, files_meta, h)
         h["stale"] = stale
+        h["index_stale"] = stale
+        h["git_stale"] = git_stale
         h["freshness_reason"] = reason
         if stale:
             stale_paths.add(h.get("rel_path") or "")
@@ -845,6 +1193,153 @@ def _annotate_hits(
     return annotated, dirty, tail
 
 
+def _parse_facets(facets: list[str] | tuple[str, ...] | None) -> list[str]:
+    if not facets:
+        return []
+    out: list[str] = []
+    for item in facets:
+        if item not in catalog.SUPPORTED_FACETS:
+            raise ValueError(
+                "facets must be drawn from: " + ", ".join(sorted(catalog.SUPPORTED_FACETS))
+            )
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _vector_similarity(hit: dict) -> float:
+    if "_distance" in hit:
+        distance = max(0.0, float(hit.get("_distance") or 0.0))
+        return 1.0 / (1.0 + distance)
+    raw = float(hit.get("score", 0.0) or 0.0)
+    return max(0.0, raw)
+
+
+def _vector_candidate_estimate(candidates: list[dict]) -> dict:
+    if not candidates:
+        return {
+            "count": 0,
+            "exact": False,
+            "scope": "candidate_pool",
+            "candidate_count": 0,
+            "relative_score_fraction": VECTOR_ESTIMATE_RELATIVE_FRACTION,
+        }
+    sims = [_vector_similarity(h) for h in candidates]
+    top = max(sims)
+    threshold = top * VECTOR_ESTIMATE_RELATIVE_FRACTION
+    return {
+        "count": sum(1 for s in sims if s >= threshold),
+        "exact": False,
+        "scope": "candidate_pool",
+        "candidate_count": len(candidates),
+        "relative_score_fraction": VECTOR_ESTIMATE_RELATIVE_FRACTION,
+        "top_similarity": round(top, 6),
+        "threshold": round(threshold, 6),
+    }
+
+
+def _metadata_facet_counts(rows: list[dict], catalog_data: dict | None, requested: list[str]) -> dict:
+    if not requested:
+        return {}
+    counts: dict[str, dict[str, int]] = {f: {} for f in requested}
+    by_path = catalog.file_by_path(catalog_data) if catalog_data else {}
+
+    def inc(field: str, value: str, n: int = 1) -> None:
+        if field not in counts:
+            return
+        bucket = value or "(none)"
+        counts[field][bucket] = counts[field].get(bucket, 0) + n
+
+    seen_paths: set[str] = set()
+    for row in rows:
+        rel = row.get("rel_path") or ""
+        file_meta = by_path.get(rel, {})
+        if "chunk_role" in counts:
+            inc("chunk_role", row.get("chunk_role") or "(none)")
+        if rel in seen_paths:
+            continue
+        seen_paths.add(rel)
+        if "dir" in counts:
+            inc("dir", file_meta.get("dir") or catalog._dir_for(rel))
+        if "language" in counts:
+            inc("language", row.get("language") or file_meta.get("language") or "(none)")
+        if "kind" in counts:
+            for kind in file_meta.get("kinds") or catalog.derive_file_kinds(rel, row.get("language")):
+                value = kind.get("kind") or ""
+                if value:
+                    inc("kind", value)
+    return {field: dict(sorted(values.items())) for field, values in counts.items()}
+
+
+def _search_count_metadata(
+    qi: QueryIndex,
+    query: str,
+    where: str | None,
+    mode_used: str,
+    vector_candidates: list[dict],
+    requested_facets: list[str],
+    catalog_data: dict | None,
+) -> tuple[dict, dict | None, list[str]]:
+    warnings: list[str] = []
+    total = {
+        "fts_exact": {
+            "available": False,
+            "count": None,
+            "exact": True,
+            "capped": False,
+            "method": "lancedb_0_33_fts_metadata_scan",
+        },
+        "vector_estimate": _vector_candidate_estimate(vector_candidates),
+    }
+    facet_payload: dict | None = None
+    fts_rows: list[dict] = []
+    fts_exact = False
+    if mode_used == "hybrid":
+        fts_rows, warning, fts_meta = qi.store.fts_metadata(
+            query,
+            columns=("chunk_id", "rel_path", "language", "chunk_role"),
+            where=where,
+        )
+        if warning:
+            warnings.append(warning)
+        else:
+            capped = bool(fts_meta.get("capped"))
+            fts_exact = not capped
+            total["fts_exact"] = {
+                "available": True,
+                "count": len(fts_rows),
+                "exact": fts_exact,
+                "capped": capped,
+                "method": "lancedb_0_33_fts_metadata_scan",
+            }
+            if capped:
+                cap = fts_meta.get("cap", len(fts_rows))
+                warnings.append(
+                    f"FTS metadata scan hit ENGRAM_FTS_COUNT_MAX_SCAN={cap}; "
+                    "total_matches.fts_exact.count is a lower bound."
+                )
+    if requested_facets:
+        if mode_used == "hybrid" and total["fts_exact"]["available"]:
+            facet_payload = {
+                "scope": "fts_exact" if fts_exact else "fts_capped_lower_bound",
+                "exact": fts_exact,
+                "fields": _metadata_facet_counts(fts_rows, catalog_data, requested_facets),
+            }
+        else:
+            estimated_rows = [
+                row for row in vector_candidates
+                if _vector_similarity(row) >= (
+                    (total["vector_estimate"].get("threshold") or 0.0)
+                )
+            ]
+            facet_payload = {
+                "scope": "vector_candidate_estimate",
+                "exact": False,
+                "fields": _metadata_facet_counts(estimated_rows, catalog_data, requested_facets),
+            }
+    return total, facet_payload, warnings
+
+
 def search_project(
     root: str | Path,
     provider: EmbeddingProvider,
@@ -852,8 +1347,9 @@ def search_project(
     k: int = 8,
     language: str | None = None,
     mode: str = "auto",
-    candidate_k: int = 50,
+    candidate_k: int | None = None,
     rerank: bool = False,
+    facets: list[str] | tuple[str, ...] | None = None,
     min_relevance: str | None = None,
     return_meta: bool = False,
 ) -> list[dict] | dict:
@@ -865,6 +1361,7 @@ def search_project(
         raise ValueError(f"unknown language filter: {language!r}")
     if mode not in ("auto", "hybrid", "vector"):
         raise ValueError(f"unknown search mode: {mode!r}")
+    requested_facets = _parse_facets(facets)
     if min_relevance is not None and min_relevance not in retrieval.RELEVANCE_ORDER:
         retrieval.relevance_at_least("low", min_relevance)  # raises the canonical message
     resolved_mode = retrieval.classify_query(query) if mode == "auto" else mode
@@ -883,18 +1380,25 @@ def search_project(
 
     where = f"language = '{language}'" if language else None  # language is whitelisted above
     qv = provider.embed_queries([query])[0]
+    if candidate_k is None:
+        candidate_k = rerank_candidate_k_default()
+    if not isinstance(candidate_k, int):
+        raise ValueError("candidate_k must be an integer")
     candidate_k = max(k, min(candidate_k, MAX_RERANK_CANDIDATES))
-    n = candidate_k if rerank else k
+    n = candidate_k
     warnings: list[str] = []
     mode_used = resolved_mode
+    vector_candidates: list[dict] = []
     if resolved_mode == "hybrid":
         hits, meta = retrieval.hybrid_search(
             qi.store, query, qv, k=n, where=where, candidate_k=candidate_k, return_meta=True
         )
         warnings.extend(meta["warnings"])
         mode_used = meta["mode_used"]
+        vector_candidates = [dict(h) for h in meta.get("vector_candidates", [])]
     else:
         hits = qi.store.search(qv, k=n, where=where)
+        vector_candidates = [dict(h) for h in hits]
         for h in hits:
             _ensure_chunk_role(h)
             h["score"] = -float(h.get("_distance", 0.0)) + retrieval._role_boost(
@@ -902,21 +1406,81 @@ def search_project(
             )
         hits = sorted(hits, key=lambda h: h.get("score", 0.0), reverse=True)
     rerank_applied = False
-    if rerank:
+    rerank_model = None
+    rerank_latency_ms = None
+    rerank_skipped_reason = None
+    if rerank and not rerank_enabled():
+        # Master switch: reranking must be explicitly enabled by the operator.
+        # Off by default so a stray rerank=true never loads the ONNX model.
+        rerank_skipped_reason = "reranking disabled (set ENGRAM_RERANK_ENABLED=1 to enable)"
+        warnings.append(f"rerank skipped: {rerank_skipped_reason}")
+        hits = hits[:k]
+    elif rerank and mode_used != "vector":
+        # Skip hybrid rerank because measured quality regresses for exact
+        # identifier/literal queries; callers can force mode="vector".
+        rerank_skipped_reason = f"mode_used={mode_used} (rerank applies to vector mode only)"
+        warnings.append(f"rerank skipped: {rerank_skipped_reason}")
+        hits = hits[:k]
+    elif rerank:
+        t_rerank = time.time()
         try:
             from engram_mcp.rerankers import get_reranker
 
-            hits = get_reranker().rerank(query, hits, top_k=k)
+            reranker = get_reranker(backend="fastembed")
+            hits = reranker.rerank(query, hits, top_k=k)
             rerank_applied = True
-        except ImportError as exc:
-            warnings.append(str(exc))
+            rerank_model = getattr(reranker, "model_id", None)
+        except Exception as exc:
+            # Rerank is best-effort: on ANY failure (missing extra, model
+            # download race, onnxruntime error) degrade to the base ranking
+            # instead of failing the whole search.
+            warnings.append(f"rerank unavailable, returning base ranking: {exc}")
             hits = hits[:k]
+        finally:
+            rerank_latency_ms = round((time.time() - t_rerank) * 1000, 3)
     else:
         hits = hits[:k]
 
+    indexed_git = {
+        "git_worktree_root": m.git_worktree_root,
+        "indexed_ref": m.indexed_ref,
+        "indexed_commit": m.indexed_commit,
+        "indexed_dirty": m.indexed_dirty,
+    }
+    try:
+        git_status = gitmeta.current_staleness(root, indexed_git)
+    except Exception as exc:
+        git_status = {
+            "available": False,
+            "git_stale": False,
+            "reasons": [],
+            "indexed": indexed_git,
+            "current": {},
+            "warning": f"git metadata unavailable: {exc}",
+        }
+        warnings.append(f"git metadata unavailable: {exc}")
     annotated, dirty, tail = _annotate_hits(
-        root, qi.pdir, hits[:k], query, mode_used, min_relevance
+        root, qi.pdir, hits[:k], query, mode_used, min_relevance,
+        git_stale=bool(git_status.get("git_stale")),
     )
+    catalog_data, catalog_reason = _load_valid_catalog(qi)
+    if catalog_data is None:
+        if catalog_reason == "catalog sidecar unavailable":
+            warnings.append("catalog sidecar unavailable; project_map/facets may require rebuild")
+        else:
+            warnings.append(
+                f"catalog sidecar unavailable; project_map/facets may require rebuild ({catalog_reason})"
+            )
+    total_matches, facet_payload, count_warnings = _search_count_metadata(
+        qi,
+        query,
+        where,
+        mode_used,
+        vector_candidates,
+        requested_facets,
+        catalog_data,
+    )
+    warnings.extend(count_warnings)
     if not return_meta:
         return annotated
     return {
@@ -931,7 +1495,16 @@ def search_project(
         "warnings": warnings,
         "rerank_requested": rerank,
         "rerank_applied": rerank_applied,
+        "rerank_skipped_reason": rerank_skipped_reason,
+        "rerank_model": rerank_model,
+        "rerank_latency_ms": rerank_latency_ms,
+        "candidate_k": candidate_k,
+        "facets_requested": requested_facets,
+        "facets": facet_payload,
+        "total_matches": total_matches,
         "dirty": dirty,
+        "index_stale": dirty["stale"],
+        "git": git_status,
         **tail,
         "hits": annotated,
     }
@@ -993,7 +1566,14 @@ def find_definition(
     }
 
 
-def get_chunk(root: str | Path, chunk_id: str) -> dict:
+def get_chunk(
+    root: str | Path,
+    chunk_id: str,
+    *,
+    include_neighbors: bool = False,
+    neighbor_window: int = 1,
+    include_parent: bool = False,
+) -> dict:
     """Fetch the full stored content for one chunk id."""
 
     if not chunk_id or not chunk_id.strip():
@@ -1010,7 +1590,333 @@ def get_chunk(root: str | Path, chunk_id: str) -> dict:
     row["project_id"] = qi.manifest.project_id
     row["index_generation"] = qi.manifest.generation
     row["source_type"] = "static_indexed_source"
+    if include_neighbors or include_parent:
+        data, reason = _load_valid_catalog(qi)
+        if data is None:
+            detail = f": {reason}" if reason else ""
+            row["warnings"] = [f"catalog sidecar unavailable; cannot expand neighborhood{detail}"]
+            return row
+        lookup = catalog.chunk_lookup(data)
+        current = lookup.get(chunk_id)
+        if current is None:
+            row["warnings"] = ["chunk not found in catalog sidecar; cannot expand neighborhood"]
+            return row
+        file_entry, chunk_entry, idx = current
+        refs = file_entry.get("chunk_refs") or []
+        neighbor_window = max(0, min(int(neighbor_window), 5))
+        if include_neighbors and neighbor_window:
+            start = max(0, idx - neighbor_window)
+            end = min(len(refs), idx + neighbor_window + 1)
+            neighbors = []
+            for nidx in range(start, end):
+                ref = refs[nidx]
+                cid = ref.get("chunk_id")
+                if not cid or cid == chunk_id:
+                    continue
+                body = qi.store.by_chunk_id(cid)
+                if body is None:
+                    continue
+                _ensure_chunk_role(body)
+                body["relative_position"] = nidx - idx
+                neighbors.append(body)
+            row["neighbors"] = neighbors
+        if include_parent:
+            symbol = chunk_entry.get("symbol") or ""
+            parent_symbol = symbol.rsplit(".", 1)[0] if "." in symbol else ""
+            parent = None
+            if parent_symbol:
+                for ref in refs:
+                    if ref.get("symbol") == parent_symbol and ref.get("chunk_id") != chunk_id:
+                        parent = qi.store.by_chunk_id(ref.get("chunk_id") or "")
+                        if parent is not None:
+                            _ensure_chunk_role(parent)
+                        break
+            row["parent"] = parent
     return row
+
+
+def doctor_project(root: str | Path, *, check_git: bool = True) -> dict:
+    """Read-only index health check. Does not load the embedding model."""
+
+    root = Path(root).expanduser().resolve()
+    pdir = paths.project_dir(root, create=False)
+    issues: list[dict] = []
+    if not pdir.exists():
+        raise ProjectNotIndexedError(f"project not indexed: {root}")
+
+    def issue(code: str, severity: str, message: str, hint: str | None = None) -> None:
+        item = {"code": code, "severity": severity, "message": message}
+        if hint:
+            item["hint"] = hint
+        issues.append(item)
+
+    try:
+        m = manifest.load_project_strict(pdir)
+    except errors.EngramError as exc:
+        issue(exc.code, "error", str(exc), exc.hint)
+        return {
+            "project_path": str(root),
+            "source_type": "static_indexed_source",
+            "ok": False,
+            "summary": {"issues": len(issues), "errors": 1, "warnings": 0},
+            "issues": issues,
+        }
+    if m is None:
+        raise ProjectNotIndexedError(f"project not indexed: {root}")
+
+    if m.root_path and not Path(m.root_path).exists():
+        issue("root_missing", "error", "manifest root_path no longer exists")
+    if m.embedder_id != "fastembed:ibm-granite/granite-embedding-97m-multilingual-r2":
+        issue("model_drift", "error", f"manifest embedder_id is {m.embedder_id!r}")
+    if m.chunker_version != config.CHUNKER_VERSION:
+        issue("chunker_drift", "error", f"manifest chunker_version is {m.chunker_version!r}")
+    if m.schema_version != manifest.SCHEMA_VERSION:
+        issue("manifest_schema", "error", f"manifest schema_version is {m.schema_version!r}")
+
+    files_meta = manifest.load_files(pdir)
+    if len(files_meta) != m.files:
+        issue("files_manifest_mismatch", "warning", "files.json count differs from project manifest")
+
+    table_rows = None
+    expected_schema = set(LanceStore(pdir / "lancedb", max(1, m.dim or 1), table=m.active_table or "chunks")._schema.names)
+    store = LanceStore(pdir / "lancedb", max(1, m.dim or 1), table=m.active_table or "chunks")
+    if not store.exists():
+        issue("table_missing", "error", f"active table {m.active_table!r} is missing")
+    else:
+        try:
+            table_rows = store.count()
+            if table_rows != m.chunks:
+                issue("table_count_mismatch", "error", "active table row count differs from manifest chunks")
+        except Exception as exc:
+            issue("table_unreadable", "error", str(exc))
+        schema_names = set(store.schema_names())
+        missing_cols = sorted(expected_schema - schema_names)
+        if missing_cols:
+            issue("table_schema_mismatch", "error", "active table is missing columns: " + ", ".join(missing_cols))
+        _rows, fts_warning = store.search_text_with_status("engram", k=1)
+        if fts_warning:
+            issue("fts_unavailable", "warning", fts_warning)
+
+    cat = catalog.load_catalog(pdir, m.generation)
+    if cat is None:
+        issue("catalog_missing", "error", f"catalog_g{m.generation}.json is missing or invalid")
+    else:
+        catalog_qi = QueryIndex(root=root, pdir=pdir, manifest=m, store=store, count=table_rows or 0)
+        catalog_problem = _catalog_validation_error(cat, catalog_qi)
+        if catalog_problem:
+            issue("catalog_count_mismatch", "error", catalog_problem)
+        else:
+            totals = cat.get("totals") or {}
+            if totals.get("files") != m.files or totals.get("chunks") != m.chunks:
+                issue("catalog_count_mismatch", "error", "catalog totals differ from manifest")
+
+    stale_files = []
+    for rel in files_meta:
+        stale, reason = _freshness_for_hit(root, files_meta, {"rel_path": rel})
+        if stale:
+            stale_files.append({"path": rel, "reason": reason})
+    if stale_files:
+        issue("index_stale", "warning", f"{len(stale_files)} indexed files differ from the working tree")
+
+    git_status = None
+    if check_git:
+        indexed_git = {
+            "git_worktree_root": m.git_worktree_root,
+            "indexed_ref": m.indexed_ref,
+            "indexed_commit": m.indexed_commit,
+            "indexed_dirty": m.indexed_dirty,
+        }
+        try:
+            git_status = gitmeta.current_staleness(root, indexed_git)
+        except Exception as exc:
+            git_status = {
+                "available": False,
+                "git_stale": False,
+                "reasons": [],
+                "indexed": indexed_git,
+                "current": {},
+                "warning": f"git metadata unavailable: {exc}",
+            }
+            issue("git_unavailable", "warning", f"git metadata unavailable: {exc}")
+        if git_status.get("git_stale"):
+            issue("git_stale", "warning", "current git state differs from indexed git state")
+
+    errors_count = sum(1 for i in issues if i["severity"] == "error")
+    warnings_count = sum(1 for i in issues if i["severity"] == "warning")
+    return {
+        "project_path": str(root),
+        "project_id": m.project_id,
+        "index_generation": m.generation,
+        "source_type": "static_indexed_source",
+        "ok": errors_count == 0,
+        "summary": {
+            "issues": len(issues),
+            "errors": errors_count,
+            "warnings": warnings_count,
+            "manifest_files": m.files,
+            "manifest_chunks": m.chunks,
+            "table_rows": table_rows,
+            "stale_files": len(stale_files),
+        },
+        "git": git_status,
+        "issues": issues,
+    }
+
+
+def grep_regex_timeout_seconds() -> float:
+    raw = os.environ.get("ENGRAM_GREP_REGEX_TIMEOUT_SEC", "").strip()
+    if not raw:
+        value = DEFAULT_GREP_REGEX_TIMEOUT_SEC
+    else:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = DEFAULT_GREP_REGEX_TIMEOUT_SEC
+    return max(0.05, min(value, 30.0))
+
+
+def _grep_rows_worker(conn, pattern, flags, rows, include_lines, max_matches) -> None:
+    try:
+        rx = re.compile(pattern, flags)
+        by_path: dict[str, dict] = {}
+        total_matches = 0
+        stopped = False
+        for row in rows:
+            rel = row.get("rel_path") or ""
+            content = row.get("content") or ""
+            start = int(row.get("start_line") or 1)
+            line_cache = None
+            for match in rx.finditer(content):
+                item = by_path.setdefault(
+                    rel,
+                    {"path": rel, "match_count": 0, "line_numbers": set(), "lines": []},
+                )
+                total_matches += 1
+                item["match_count"] += 1
+                line_no = start + content[: match.start()].count("\n")
+                item["line_numbers"].add(line_no)
+                if include_lines:
+                    if line_cache is None:
+                        line_cache = content.splitlines()
+                    idx = max(0, min(line_no - start, len(line_cache) - 1))
+                    line_text = line_cache[idx] if line_cache else ""
+                    item["lines"].append({"line": line_no, "text": line_text[:300]})
+                if total_matches >= max_matches:
+                    stopped = True
+                    break
+            if stopped:
+                break
+        conn.send(("ok", {"by_path": by_path, "total_matches": total_matches, "stopped": stopped}))
+    except Exception as exc:
+        conn.send(("error", str(exc) or repr(exc)))
+    finally:
+        conn.close()
+
+
+def _grep_rows_with_timeout(
+    *,
+    pattern: str,
+    flags: int,
+    rows: list[dict],
+    include_lines: bool,
+    max_matches: int,
+    timeout_sec: float,
+) -> dict:
+    ctx = mp.get_context("spawn")
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_grep_rows_worker,
+        args=(send_conn, pattern, flags, rows, include_lines, max_matches),
+    )
+    proc.start()
+    send_conn.close()
+    try:
+        if recv_conn.poll(timeout_sec):
+            status, payload = recv_conn.recv()
+            proc.join(timeout=1)
+            if status == "ok":
+                return payload
+            raise ValueError(f"regex execution failed: {payload}")
+        proc.terminate()
+        proc.join(timeout=1)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=1)
+        raise ValueError(f"regex execution timed out after {timeout_sec:.2f}s")
+    finally:
+        recv_conn.close()
+
+
+def grep_index(
+    root: str | Path,
+    pattern: str,
+    *,
+    ignore_case: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    max_matches: int = 500,
+    max_scan_chunks: int = 10000,
+    include_lines: bool = False,
+) -> dict:
+    """Bounded regex/count probe over indexed chunk text."""
+
+    if not pattern or not pattern.strip():
+        raise ValueError("pattern must not be empty")
+    if len(pattern) > 500:
+        raise ValueError("pattern must be at most 500 characters")
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        re.compile(pattern, flags)
+    except re.error as exc:
+        raise ValueError(f"invalid regex: {exc}") from exc
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    max_matches = max(1, min(int(max_matches), 5000))
+    max_scan_chunks = max(1, min(int(max_scan_chunks), 100000))
+
+    qi = load_query_index(root)
+    rows = qi.store.metadata_rows(
+        columns=("rel_path", "start_line", "content"),
+        limit=min(qi.count, max_scan_chunks),
+    )
+    regex_result = _grep_rows_with_timeout(
+        pattern=pattern,
+        flags=flags,
+        rows=rows,
+        include_lines=include_lines,
+        max_matches=max_matches,
+        timeout_sec=grep_regex_timeout_seconds(),
+    )
+    by_path = regex_result["by_path"]
+    total_matches = int(regex_result["total_matches"])
+    stopped = bool(regex_result["stopped"])
+    items = []
+    for item in by_path.values():
+        item["line_numbers"] = sorted(item["line_numbers"])
+        if not include_lines:
+            item.pop("lines", None)
+        items.append(item)
+    items.sort(key=lambda r: (-r["match_count"], r["path"]))
+    page = items[offset : offset + limit]
+    return {
+        "project_path": str(qi.root),
+        "project_id": qi.manifest.project_id,
+        "index_generation": qi.manifest.generation,
+        "source_type": "static_indexed_source",
+        "pattern": pattern,
+        "ignore_case": ignore_case,
+        "limit": limit,
+        "offset": offset,
+        "count": len(page),
+        "total_paths": len(items),
+        "total_matches": total_matches,
+        "max_matches": max_matches,
+        "scanned_chunks": len(rows),
+        "max_scan_chunks": max_scan_chunks,
+        "truncated": stopped or len(rows) >= max_scan_chunks,
+        "has_more": offset + limit < len(items),
+        "results": page,
+    }
 
 
 def remove_project(root: str | Path) -> bool:

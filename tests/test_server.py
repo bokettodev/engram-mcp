@@ -55,6 +55,22 @@ def test_unknown_job_and_empty_list(tmp_path, monkeypatch):
     assert listed["data_home"] == str(tmp_path / "home")
 
 
+def test_server_info_reports_fastembed_reranker_without_loading(monkeypatch):
+    from engram_mcp import server
+    from engram_mcp.rerankers import DEFAULT_ONNX_RERANKER
+
+    monkeypatch.delenv("ENGRAM_RERANKER_MODEL", raising=False)
+    monkeypatch.setenv("ENGRAM_RERANK_CANDIDATE_K", "13")
+    out = server.do_server_info()
+    assert "reranker_default_backend" not in out
+    assert "fastembed_onnx_reranker" not in out
+    assert out["reranker"]["default_backend"] == "fastembed"
+    assert out["reranker"]["onnx_model"] == DEFAULT_ONNX_RERANKER
+    assert out["reranker"]["onnx_available"] is True
+    assert out["reranker"]["candidate_k_default"] == 13
+    assert "CC-BY-NC-4.0" in out["reranker"]["license_note"]
+
+
 def test_job_snapshot_timestamps_and_update_sequence(tmp_path):
     from engram_mcp.jobs import JobRegistry, snapshot
 

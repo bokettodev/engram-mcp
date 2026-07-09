@@ -7,15 +7,31 @@ Incremental updates delete a file's rows by ``rel_path`` and add the new ones.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import Iterable
 
 import lancedb
 import pyarrow as pa
+
+DEFAULT_FTS_COUNT_MAX_SCAN = 50000
 
 
 def _sql_str(value: str) -> str:
     """Quote a string as a SQL literal (single quotes doubled)."""
     return "'" + value.replace("'", "''") + "'"
+
+
+def fts_count_max_scan() -> int:
+    raw = os.environ.get("ENGRAM_FTS_COUNT_MAX_SCAN", "").strip()
+    if not raw:
+        value = DEFAULT_FTS_COUNT_MAX_SCAN
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = DEFAULT_FTS_COUNT_MAX_SCAN
+    return max(1, value)
 
 
 class LanceStore:
@@ -120,6 +136,125 @@ class LanceStore:
 
     def count(self) -> int:
         return self.db.open_table(self.table).count_rows() if self.exists() else 0
+
+    def schema_names(self) -> list[str]:
+        if not self.exists():
+            return []
+        return list(self.db.open_table(self.table).schema.names)
+
+    def metadata_rows(
+        self,
+        columns: Iterable[str] | None = None,
+        *,
+        limit: int | None = None,
+        where: str | None = None,
+    ) -> list[dict]:
+        """Scan selected metadata columns without vectors or bodies by default."""
+
+        if not self.exists():
+            return []
+        default = (
+            "chunk_id",
+            "rel_path",
+            "language",
+            "symbol",
+            "symbol_kind",
+            "chunk_role",
+            "start_line",
+            "end_line",
+            "file_hash",
+            "chunk_hash",
+        )
+        selected = list(columns or default)
+        tbl = self.db.open_table(self.table)
+        q = tbl.search().select(selected)
+        if where:
+            q = q.where(where)
+        cap = self.count() if limit is None else max(0, int(limit))
+        if cap <= 0:
+            return []
+        try:
+            return q.limit(cap).to_list()
+        except Exception:
+            return []
+
+    def metadata_rows_strict(
+        self,
+        columns: Iterable[str] | None = None,
+        *,
+        limit: int | None = None,
+        where: str | None = None,
+    ) -> list[dict]:
+        """Scan metadata rows and raise if the active table cannot be read fully."""
+
+        if not self.exists():
+            raise RuntimeError(f"active LanceDB table {self.table!r} is missing")
+        default = (
+            "chunk_id",
+            "rel_path",
+            "language",
+            "symbol",
+            "symbol_kind",
+            "chunk_role",
+            "start_line",
+            "end_line",
+            "file_hash",
+            "chunk_hash",
+        )
+        selected = list(columns or default)
+        tbl = self.db.open_table(self.table)
+        q = tbl.search().select(selected)
+        if where:
+            q = q.where(where)
+        expected = self.count() if limit is None else max(0, int(limit))
+        if expected <= 0:
+            return []
+        rows = q.limit(expected).to_list()
+        if where is None and limit is None and len(rows) != expected:
+            raise RuntimeError(
+                f"metadata scan read {len(rows)} rows from {self.table!r}, expected {expected}"
+            )
+        return rows
+
+    def fts_metadata(
+        self, query: str, columns: Iterable[str], where: str | None = None
+    ) -> tuple[list[dict], str | None, dict]:
+        """Return all FTS matches projected to metadata columns.
+
+        LanceDB 0.33 exposes no FTS count API. This scan is body-free and capped
+        by ENGRAM_FTS_COUNT_MAX_SCAN; hitting that cap makes the count a lower
+        bound rather than an exact total.
+        """
+
+        meta = {
+            "method": "lancedb_0_33_fts_metadata_scan",
+            "cap": fts_count_max_scan(),
+            "limit": 0,
+            "table_rows": 0,
+            "capped": False,
+        }
+        if not self.exists():
+            return [], "active LanceDB table is missing", meta
+        try:
+            table_rows = self.count()
+            cap = fts_count_max_scan()
+            limit = min(table_rows, cap)
+            meta.update({"cap": cap, "limit": limit, "table_rows": table_rows})
+            if limit <= 0:
+                return [], None, meta
+            q = (
+                self.db.open_table(self.table)
+                .search(query, query_type="fts")
+                .select(list(columns))
+                .limit(limit)
+            )
+            if where:
+                q = q.where(where)
+            rows = q.to_list()
+            meta["capped"] = table_rows > cap and len(rows) >= cap
+            return rows, None, meta
+        except Exception as exc:
+            return [], f"full-text search unavailable; exact FTS counts unavailable ({exc})", meta
 
     def by_symbol(self, name: str, k: int = 20) -> list[dict]:
         """Metadata lookup: rows whose symbol is exactly `name` or `Parent.name`."""

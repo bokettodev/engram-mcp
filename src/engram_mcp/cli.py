@@ -1,7 +1,4 @@
-"""Phase 1 CLI: walk a project, chunk it, and print stats (and sample chunks).
-
-    uv run engram chunk <path> [--show N]
-"""
+"""Command-line interface for chunking, indexing, search, eval, and index administration."""
 
 from __future__ import annotations
 
@@ -248,20 +245,43 @@ def cmd_find_def(args: argparse.Namespace) -> int:
 def cmd_evaluate(args: argparse.Namespace) -> int:
     from engram_mcp import evaluate
     from engram_mcp.embeddings import factory
-    from engram_mcp.pipeline import load_query_index
+    from engram_mcp.pipeline import load_query_index, rerank_enabled
 
     root = Path(args.path).resolve()
     cases = evaluate.load_cases(args.evalfile)
     qi = load_query_index(root)
     provider = factory.provider_for_model_id(qi.manifest.embedder_id)
+    if args.rerank and not rerank_enabled():
+        print(
+            "warning: --rerank requested but ENGRAM_RERANK_ENABLED is off; "
+            "measuring baseline (rerank_applied=false)",
+            file=sys.stderr,
+        )
     report = evaluate.run_evaluation(root, provider, cases, k=args.k, mode=args.mode, rerank=args.rerank)
     o = report.overall
     print(f"eval: {o.n} queries  mode={args.mode}  (mean {report.mean_latency_ms:.0f} ms)")
-    print(f"  overall        hit@1 {o.hit1:6.1%}  hit@5 {o.hit5:6.1%}  hit@10 {o.hit10:6.1%}  MRR {o.mrr:.3f}")
+    if args.rerank:
+        print(f"  rerank_applied {report.rerank_applied_count}/{o.n}")
+        for reason, count in sorted(report.rerank_skipped_reasons.items()):
+            print(f"  rerank_skipped_reason ({count}): {reason}")
+    delta = "n/a" if o.delta_rank is None else f"{o.delta_rank:.2f}"
+    print(
+        f"  overall        hit@1 {o.hit1:6.1%}  hit@5 {o.hit5:6.1%}  "
+        f"hit@10 {o.hit10:6.1%}  MRR {o.mrr:.3f}  "
+        f"HNSR@5 {o.hnsr5:6.1%}  HNSR@10 {o.hnsr10:6.1%}  delta {delta}"
+    )
     print("  by category:")
     for cat in sorted(report.by_category):
         s = report.by_category[cat]
-        print(f"    {cat:<14} ({s.n:>2})  hit@1 {s.hit1:6.1%}  hit@5 {s.hit5:6.1%}  MRR {s.mrr:.3f}")
+        delta = "n/a" if s.delta_rank is None else f"{s.delta_rank:.2f}"
+        print(
+            f"    {cat:<14} ({s.n:>2})  hit@1 {s.hit1:6.1%}  "
+            f"hit@5 {s.hit5:6.1%}  MRR {s.mrr:.3f}  HNSR@10 {s.hnsr10:6.1%}  delta {delta}"
+        )
+    print("  by lexical-overlap bucket:")
+    for bucket in sorted(report.by_overlap_bucket):
+        s = report.by_overlap_bucket[bucket]
+        print(f"    {bucket:<8} ({s.n:>2})  hit@5 {s.hit5:6.1%}  MRR {s.mrr:.3f}  HNSR@10 {s.hnsr10:6.1%}")
     if args.verbose:
         for r in report.rows:
             tag = "ok  " if r["rank"] else "MISS"
@@ -272,19 +292,40 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 def cmd_search(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     from engram_mcp.embeddings import factory
-    from engram_mcp.pipeline import ProjectNotIndexedError, load_query_index, search_project
+    from engram_mcp.pipeline import ProjectNotIndexedError, load_query_index, rerank_enabled, search_project
 
     try:
         qi = load_query_index(root)
         provider = factory.provider_for_model_id(qi.manifest.embedder_id)
-        hits = search_project(root, provider, args.query, k=args.k, language=args.lang,
-                              mode=args.mode, rerank=args.rerank)
+        if args.rerank and not rerank_enabled():
+            print(
+                "warning: --rerank requested but ENGRAM_RERANK_ENABLED is off; "
+                "returning baseline ranking (rerank_applied=false)",
+                file=sys.stderr,
+            )
+        outcome = search_project(
+            root,
+            provider,
+            args.query,
+            k=args.k,
+            language=args.lang,
+            mode=args.mode,
+            rerank=args.rerank,
+            return_meta=True,
+        )
+        hits = outcome["hits"]
     except ProjectNotIndexedError:
         print(f'project not indexed: {root}\nrun: engram index "{root}"', file=sys.stderr)
         return 2
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if args.rerank:
+        if outcome.get("rerank_applied"):
+            print(f"rerank_applied=true model={outcome.get('rerank_model') or 'unknown'}", file=sys.stderr)
+        else:
+            reason = outcome.get("rerank_skipped_reason") or "rerank unavailable"
+            print(f"rerank_applied=false reason={reason}", file=sys.stderr)
     if not hits:
         print("no results.")
         return 0
@@ -346,7 +387,14 @@ def main(argv: list[str] | None = None) -> int:
     pv.add_argument("evalfile", help="JSON list of {query, expected_path, expected_symbol?}")
     pv.add_argument("-k", type=int, default=10, help="results considered per query")
     pv.add_argument("--mode", default="auto", choices=["auto", "hybrid", "vector"])
-    pv.add_argument("--rerank", action="store_true", help="cross-encoder rerank (needs --extra gpu)")
+    pv.add_argument(
+        "--rerank",
+        action="store_true",
+        help=(
+            "request rerank; runs only when ENGRAM_RERANK_ENABLED=1 and "
+            "mode_used=vector"
+        ),
+    )
     pv.add_argument("-v", "--verbose", action="store_true", help="print per-query ranks")
     pv.set_defaults(func=cmd_evaluate)
 
@@ -357,8 +405,14 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--lang", default=None, help="filter by language")
     ps.add_argument("--mode", default="auto", choices=["auto", "hybrid", "vector"],
                     help="retrieval mode (auto routes identifier queries to hybrid, NL to vector)")
-    ps.add_argument("--rerank", action="store_true",
-                    help="cross-encoder rerank the candidates (needs `uv sync --extra gpu`)")
+    ps.add_argument(
+        "--rerank",
+        action="store_true",
+        help=(
+            "request rerank; runs only when ENGRAM_RERANK_ENABLED=1 and "
+            "mode_used=vector"
+        ),
+    )
     ps.set_defaults(func=cmd_search)
 
     args = p.parse_args(argv)

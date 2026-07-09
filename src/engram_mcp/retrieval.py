@@ -103,6 +103,9 @@ def hybrid_search(
     meta = {
         "warnings": [fts_warning] if fts_warning else [],
         "mode_used": "vector" if fts_warning else "hybrid",
+        "vector_candidates": vec_hits,
+        "fts_candidates": fts_hits,
+        "fused_candidate_count": len(fused),
     }
     return (out, meta) if return_meta else out
 

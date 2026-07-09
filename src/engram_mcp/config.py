@@ -66,9 +66,7 @@ PROSE_CHUNK_MAX_TOKENS = 480
 # Bumped whenever chunking OR embedded-text format changes, so the cache
 # invalidates and incompatible indexes rebuild. v2: contextual chunk headers.
 # v3: brace-style header preservation + C/C++ declarator symbol names.
-# (An earlier v4 added file-level imports to the header but measured slightly
-# worse on the eval set, so it was reverted; the lean path/symbol/language
-# header stands.)
+# v3 retained lean path/symbol/language headers.
 # v4: structure-aware prose chunking — markdown split by heading sections (the
 # heading breadcrumb becomes the chunk symbol) + plain text packed by paragraph.
 # chunk_role is stored for new rows and derived for old rows. It does not alter

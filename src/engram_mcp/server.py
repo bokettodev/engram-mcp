@@ -1,23 +1,15 @@
-"""MCP server (stdio) exposing async indexing + semantic search.
+"""MCP server (stdio) exposing async indexing and static indexed-source search.
 
-Tools:
-  index_project(project_path)            -> {job_id, ...}   (async; poll status)
-  index_status(job_id)                   -> progress snapshot
-  search_code(project_path, query, ...)  -> ranked chunks
-  get_chunk(project_path, chunk_id)      -> fetch one chunk's full content
-  find_definition(project_path, symbol)  -> exact symbol lookup
-  model_status(project_path?)            -> query-model load status
-  reindex_file(project_path, rel_path)   -> incremental single-file re-index
-  remove_project(project_path)           -> delete a project's index
-  list_indexed_projects(limit, cursor)   -> compact on-disk index inventory
-  server_info()                          -> data-home/server diagnostics
+The tool surface is registered at module bottom in ``register_tools`` so
+mutating tools can be withheld in read-only mode.
 
 Indexing runs on a single-worker background thread pool so a tool call returns
 immediately and concurrent index requests serialize on the one embedder.
 
 Read-only mode: set ENGRAM_READONLY=1 (env) to expose ONLY the read tools
-(search_code / get_chunk / find_definition / model_status / index_status /
-list_indexed_projects / server_info). The
+(search_code / get_chunk / find_definition / project_map / doctor_project /
+grep_index / model_status / index_status / list_indexed_projects /
+server_info). The
 mutating tools (index_project / reindex_file / remove_project) are not
 registered, so a client physically cannot alter an index. Indexing is then
 driven out-of-band (e.g. the `engram` CLI/operator). Intended for hosts that
@@ -28,8 +20,10 @@ indexing.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,14 +34,23 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from engram_mcp import errors, inventory, paths
+from engram_mcp import config, errors, inventory, paths, pipeline
 from engram_mcp.embeddings import factory
 from engram_mcp.jobs import JobRegistry, snapshot
-from engram_mcp.pipeline import MAX_SEARCH_K, ProjectNotIndexedError
+from engram_mcp.pipeline import (
+    DEFAULT_RERANK_CANDIDATE_K,
+    MAX_RERANK_CANDIDATES,
+    MAX_SEARCH_K,
+    ProjectNotIndexedError,
+)
+from engram_mcp.pipeline import doctor_project as _run_doctor_project
 from engram_mcp.pipeline import find_definition as _run_find_def
 from engram_mcp.pipeline import get_chunk as _run_get_chunk
+from engram_mcp.pipeline import grep_index as _run_grep_index
 from engram_mcp.pipeline import index_project as _run_index
 from engram_mcp.pipeline import load_query_index
+from engram_mcp.pipeline import plan_index as _plan_index
+from engram_mcp.pipeline import project_map as _run_project_map
 from engram_mcp.pipeline import reindex_file as _run_reindex_file
 from engram_mcp.pipeline import remove_project as _run_remove
 from engram_mcp.pipeline import search_project as _run_search
@@ -55,19 +58,22 @@ from engram_mcp.pipeline import search_project as _run_search
 mcp = FastMCP("engram")
 _registry = JobRegistry()
 _index_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cidx-index")
+_warmup_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cidx-warmup")
 _model_loads = {}
 _model_loads_lock = Lock()
 
 _RESULT_FIELDS = (
     "chunk_id", "rel_path", "start_line", "end_line", "language", "symbol", "symbol_kind",
     "chunk_role", "score", "raw_score", "score_normalized", "relevance", "matched",
-    "match_reason", "stale", "freshness_reason",
+    "match_reason", "stale", "index_stale", "git_stale", "freshness_reason",
 )
 _CONTENT_MODES = {"none", "preview", "full"}
 _DEFAULT_PREVIEW_CHARS = 800
 _MAX_RESULT_CHARS = 20_000
 _MODEL_RETRY_AFTER_SEC = 2
 _DEFAULT_SEARCH_WAIT_SEC = 8.0
+_DEFAULT_DELTA_CPU_MAX = 1024
+_MAX_TOTAL_CHARS = 200_000
 
 
 def _get_provider(index_device: str | None = None):
@@ -223,6 +229,7 @@ def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, settin
         total_units=chunks,
         finished_at=time.time(),
     )
+    _schedule_query_model_warmup(data.get("embedder_id") or factory.CANONICAL_EMBEDDER_ID)
 
 
 def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_device: str) -> None:
@@ -268,6 +275,7 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
             total_units=stats.chunks,
             finished_at=time.time(),
         )
+        _schedule_query_model_warmup(provider.model_id)
     except Exception as exc:  # surface failure via status, never crash the server
         payload = _error_payload(exc)
         _registry.update(
@@ -289,6 +297,28 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
 
 # --- plain, testable logic (the MCP tools are thin wrappers over these) ---
 
+def _delta_cpu_max() -> int:
+    raw = os.environ.get("ENGRAM_DELTA_CPU_MAX", "").strip()
+    if not raw:
+        return _DEFAULT_DELTA_CPU_MAX
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_DELTA_CPU_MAX
+
+
+def _rerank_candidate_k_default() -> int:
+    raw = os.environ.get("ENGRAM_RERANK_CANDIDATE_K", "").strip()
+    if not raw:
+        value = DEFAULT_RERANK_CANDIDATE_K
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = DEFAULT_RERANK_CANDIDATE_K
+    return max(1, min(value, MAX_RERANK_CANDIDATES))
+
+
 def start_index_job(
     project_path: str,
     full_rebuild: bool = False,
@@ -300,14 +330,41 @@ def start_index_job(
         raise ValueError(f"not a directory: {root}")
     device = factory.resolve_index_device(index_device, gpu=gpu)
     resolved = str(root.resolve())
+    routed_device = device
+    plan = None
+    if device == "auto":
+        plan = _plan_index(
+            resolved,
+            full_rebuild=full_rebuild,
+            model_id=factory.CANONICAL_EMBEDDER_ID,
+            dim=config.DEFAULT_EMBED_DIM,
+        )
+        if plan.missing_unique_chunks <= _delta_cpu_max():
+            routed_device = "cpu"
     job = _registry.create(resolved)
-    _registry.update(job.job_id, index_device=device, embedder_id=factory.CANONICAL_EMBEDDER_ID)
-    _index_pool.submit(_index_worker, job.job_id, resolved, full_rebuild, device)
+    _registry.update(job.job_id, index_device=routed_device, embedder_id=factory.CANONICAL_EMBEDDER_ID)
+    _index_pool.submit(_index_worker, job.job_id, resolved, full_rebuild, routed_device)
+    plan_payload = None
+    if plan is not None:
+        plan_payload = {
+            "mode": plan.mode,
+            "files": plan.files,
+            "chunks": plan.chunks,
+            "added": plan.added,
+            "changed": plan.changed,
+            "deleted": plan.deleted,
+            "unchanged": plan.unchanged,
+            "missing_unique_chunks": plan.missing_unique_chunks,
+            "delta_cpu_max": _delta_cpu_max(),
+        }
     return {
         "job_id": job.job_id,
         "project_path": resolved,
         "status": job.status,
-        "index_device": device,
+        "index_device": routed_device,
+        "index_device_requested": device,
+        "routing": "delta_cpu" if device == "auto" and routed_device == "cpu" else "requested",
+        "plan": plan_payload,
         "embedder_id": factory.CANONICAL_EMBEDDER_ID,
     }
 
@@ -348,6 +405,21 @@ def _provider_load_worker(model_id: str):
     return factory.provider_for_model_id(model_id)
 
 
+def _schedule_query_model_warmup(model_id: str) -> None:
+    if not model_id:
+        return
+    try:
+        backend_id = factory.query_backend_id_for_model_id(model_id)
+    except Exception:
+        return
+    if factory.is_model_loaded(backend_id):
+        return
+    with _model_loads_lock:
+        fut = _model_loads.get(model_id)
+        if fut is None or (fut.done() and fut.exception() is not None):
+            _model_loads[model_id] = _warmup_pool.submit(_provider_load_worker, model_id)
+
+
 def _search_wait_budget_sec() -> float:
     raw = os.environ.get("ENGRAM_SEARCH_WAIT_SEC", "").strip()
     if not raw:
@@ -376,7 +448,7 @@ def _provider_for_query_model(model_id: str):
     with _model_loads_lock:
         fut = _model_loads.get(model_id)
         if fut is None:
-            fut = _index_pool.submit(_provider_load_worker, model_id)
+            fut = _warmup_pool.submit(_provider_load_worker, model_id)
             _model_loads[model_id] = fut
     if fut.done():
         return fut.result()
@@ -429,22 +501,149 @@ def _clip_text(text: str, limit: int) -> tuple[str, bool]:
     return text[:limit], True
 
 
-def _format_search_hit(hit: dict, content: str, max_chars: int) -> dict:
+_SEARCH_TOKEN = re.compile(r"[A-Za-z0-9_]{2,}")
+
+
+def _query_tokens(query: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in _SEARCH_TOKEN.findall(query.lower()):
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def _matched_in(hit: dict, query: str) -> list[str]:
+    toks = _query_tokens(query)
+    fields = []
+    checks = {
+        "content": hit.get("content") or "",
+        "symbol": hit.get("symbol") or "",
+        "path": hit.get("rel_path") or "",
+    }
+    for name, value in checks.items():
+        low = value.lower()
+        if any(tok in low for tok in toks):
+            fields.append(name)
+    return fields
+
+
+def _center_excerpt(text: str, query: str, limit: int, *, prefer_literal: bool) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    tokens = _query_tokens(query)
+    low = text.lower()
+    pos = None
+    if prefer_literal:
+        found = [
+            low.find(tok) for tok in tokens
+            if tok and low.find(tok) >= 0
+        ]
+        if found:
+            pos = min(found)
+    if pos is None:
+        sentences = re.split(r"(?<=[.!?])\s+|\n{2,}", text)
+        if sentences:
+            scored = []
+            for sentence in sentences:
+                stoks = set(_query_tokens(sentence))
+                scored.append((len(stoks & set(tokens)), len(sentence), sentence))
+            scored.sort(key=lambda item: (-item[0], item[1]))
+            best = scored[0][2]
+            if scored[0][0] > 0 and len(best) <= limit:
+                return best, True
+        pos = 0
+    half = max(0, limit // 2)
+    start = max(0, pos - half)
+    end = min(len(text), start + limit)
+    start = max(0, end - limit)
+    excerpt = text[start:end]
+    if start > 0:
+        excerpt = "..." + excerpt.lstrip()
+    if end < len(text):
+        excerpt = excerpt.rstrip() + "..."
+    if len(excerpt) > limit:
+        excerpt = excerpt[:limit]
+    return excerpt, True
+
+
+def _format_search_hit(
+    hit: dict,
+    content: str,
+    max_chars: int,
+    *,
+    query: str,
+    mode_used: str,
+    remaining_budget: int | None = None,
+) -> tuple[dict, int, bool]:
     out = {field: hit.get(field) for field in _RESULT_FIELDS}
     out["span"] = {"start_line": hit.get("start_line"), "end_line": hit.get("end_line")}
     out["path"] = hit.get("rel_path")
     raw_content = hit.get("content") or ""
+    budget = max_chars if remaining_budget is None else max(0, min(max_chars, remaining_budget))
+    if budget <= 0 and content != "none":
+        out["truncated"] = bool(raw_content)
+        out["matched_in"] = _matched_in(hit, query)
+        return out, 0, bool(raw_content)
     if content == "none":
         out["truncated"] = False
+        out["matched_in"] = _matched_in(hit, query)
+        return out, 0, False
     elif content == "preview":
-        preview, truncated = _clip_text(raw_content, max_chars)
+        preview, truncated = _center_excerpt(
+            raw_content,
+            query,
+            budget,
+            prefer_literal=mode_used == "hybrid",
+        )
         out["preview"] = preview
+        out["excerpt"] = preview
+        out["matched_in"] = _matched_in(hit, query)
         out["truncated"] = truncated
+        return out, len(preview), truncated
     else:
-        body, truncated = _clip_text(raw_content, max_chars)
+        body, truncated = _clip_text(raw_content, budget)
         out["content"] = body
+        out["matched_in"] = _matched_in(hit, query)
         out["truncated"] = truncated
-    return out
+        return out, len(body), truncated
+
+
+def _result_map(results: list[dict]) -> list[dict]:
+    return [
+        {
+            "rank": i,
+            "chunk_id": r.get("chunk_id"),
+            "path": r.get("path") or r.get("rel_path"),
+            "span": r.get("span"),
+            "score": r.get("score"),
+            "relevance": r.get("relevance"),
+            "symbol": r.get("symbol"),
+        }
+        for i, r in enumerate(results, 1)
+    ]
+
+
+def _validate_max_total_chars(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or value < 1 or value > _MAX_TOTAL_CHARS:
+        raise ValueError(f"max_total_chars must be between 1 and {_MAX_TOTAL_CHARS}")
+    return value
+
+
+def _search_hints(outcome: dict, results: list[dict], content: str, max_total_chars: int | None) -> list[str]:
+    hints: list[str] = []
+    if not results:
+        hints.append("No hits: try mode='hybrid' for exact tokens or find_definition for known symbols.")
+    if (outcome.get("dirty") or {}).get("stale"):
+        hints.append("Some results are stale: rebuild the index or reindex changed files.")
+    if outcome.get("git", {}).get("git_stale"):
+        hints.append("Git state differs from the indexed commit/ref; rebuild for current checkout state.")
+    if content != "none" and max_total_chars is None and len(results) >= 20:
+        hints.append("Large result set: use content='none' or max_total_chars to keep output bounded.")
+    return hints
 
 
 def do_reindex_file(project_path: str, rel_path: str) -> dict:
@@ -496,11 +695,19 @@ def do_search(
     project_path: str, query: str, k: int = 8, language: str | None = None,
     mode: str = "auto", rerank: bool = False, content: str = "preview",
     max_chars_per_result: int = _DEFAULT_PREVIEW_CHARS,
+    max_total_chars: int | None = None,
+    candidate_k: int | None = None,
+    facets: list[str] | None = None,
     min_relevance: str | None = None,
 ) -> dict:
     try:
         _check_k(k)
         _check_content(content, max_chars_per_result)
+        max_total_chars = _validate_max_total_chars(max_total_chars)
+        if candidate_k is None:
+            candidate_k = _rerank_candidate_k_default()
+        if not isinstance(candidate_k, int) or candidate_k < 1 or candidate_k > MAX_RERANK_CANDIDATES:
+            raise ValueError(f"candidate_k must be between 1 and {MAX_RERANK_CANDIDATES}")
         root = Path(project_path).expanduser().resolve()
         qi = load_query_index(root)
         provider = _provider_for_query_model(qi.manifest.embedder_id)
@@ -511,24 +718,44 @@ def do_search(
             k=k,
             language=language,
             mode=mode,
+            candidate_k=candidate_k,
             rerank=rerank,
+            facets=facets,
             min_relevance=min_relevance,
             return_meta=True,
         )
-        results = [
-            _format_search_hit(h, content, max_chars_per_result)
-            for h in outcome.pop("hits")
-        ]
+        results = []
+        used_chars = 0
+        truncated = False
+        for h in outcome.pop("hits"):
+            remaining = None if max_total_chars is None else max_total_chars - used_chars
+            formatted, consumed, item_truncated = _format_search_hit(
+                h,
+                content,
+                max_chars_per_result,
+                query=query,
+                mode_used=outcome.get("mode_used") or mode,
+                remaining_budget=remaining,
+            )
+            used_chars += consumed
+            truncated = truncated or item_truncated
+            results.append(formatted)
         return outcome | {
             "content": content,
             "max_chars_per_result": max_chars_per_result,
+            "max_total_chars": max_total_chars,
+            "body_chars": used_chars,
+            "truncated": truncated,
             "count": len(results),
+            "map": _result_map(results),
+            "hints": _search_hints(outcome, results, content, max_total_chars),
             "results": results,
         }
     except errors.EngramError as exc:
         extra = {}
         if exc.code == errors.E_MODEL_LOADING:
             extra["retry_after_sec"] = _MODEL_RETRY_AFTER_SEC
+            extra["hints"] = ["Model is still warming; retry after the reported delay."]
         return _error_payload(exc, results=[]) | extra
     except Exception as exc:
         return _error_payload(exc, results=[])
@@ -548,15 +775,78 @@ def list_projects(
     )
 
 
-def do_get_chunk(project_path: str, chunk_id: str, max_chars: int | None = None) -> dict:
+def do_project_map(project_path: str, depth: int = 2, sort: str = "path", limit: int = 200) -> dict:
     try:
-        row = _run_get_chunk(Path(project_path).expanduser().resolve(), chunk_id)
+        return _run_project_map(Path(project_path).expanduser().resolve(), depth=depth, sort=sort, limit=limit)
+    except Exception as exc:
+        return _error_payload(exc)
+
+
+def do_doctor_project(project_path: str, check_git: bool = True) -> dict:
+    try:
+        return _run_doctor_project(Path(project_path).expanduser().resolve(), check_git=check_git)
+    except Exception as exc:
+        return _error_payload(exc)
+
+
+def do_grep_index(
+    project_path: str,
+    pattern: str,
+    ignore_case: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    max_matches: int = 500,
+    max_scan_chunks: int = 10000,
+    include_lines: bool = False,
+) -> dict:
+    try:
+        return _run_grep_index(
+            Path(project_path).expanduser().resolve(),
+            pattern,
+            ignore_case=ignore_case,
+            limit=limit,
+            offset=offset,
+            max_matches=max_matches,
+            max_scan_chunks=max_scan_chunks,
+            include_lines=include_lines,
+        )
+    except Exception as exc:
+        return _error_payload(exc, results=[])
+
+
+def _clip_nested_chunk_content(row: dict, max_chars: int | None) -> None:
+    if max_chars is None:
+        return
+    if "content" in row:
+        row["content"], row["truncated"] = _clip_text(row.get("content") or "", max_chars)
+
+
+def do_get_chunk(
+    project_path: str,
+    chunk_id: str,
+    max_chars: int | None = None,
+    include_neighbors: bool = False,
+    neighbor_window: int = 1,
+    include_parent: bool = False,
+) -> dict:
+    try:
+        row = _run_get_chunk(
+            Path(project_path).expanduser().resolve(),
+            chunk_id,
+            include_neighbors=include_neighbors,
+            neighbor_window=neighbor_window,
+            include_parent=include_parent,
+        )
         content = row.get("content") or ""
         row["truncated"] = False
         if max_chars is not None:
             if not isinstance(max_chars, int) or max_chars < 1 or max_chars > _MAX_RESULT_CHARS:
                 raise ValueError(f"max_chars must be between 1 and {_MAX_RESULT_CHARS}")
             row["content"], row["truncated"] = _clip_text(content, max_chars)
+            for neighbor in row.get("neighbors") or []:
+                _clip_nested_chunk_content(neighbor, max_chars)
+            if isinstance(row.get("parent"), dict):
+                _clip_nested_chunk_content(row["parent"], max_chars)
         row["span"] = {"start_line": row.get("start_line"), "end_line": row.get("end_line")}
         return row
     except Exception as exc:
@@ -590,6 +880,23 @@ def do_server_info() -> dict:
     except Exception as exc:
         default_device = factory.DEFAULT_INDEX_DEVICE
         default_error = _error_payload(exc)
+    from engram_mcp.rerankers import DEFAULT_BACKEND, DEFAULT_ONNX_RERANKER
+
+    onnx_available = False
+    onnx_import_error = None
+    try:
+        if importlib.util.find_spec("fastembed.rerank.cross_encoder") is None:
+            onnx_import_error = "fastembed.rerank.cross_encoder module not found"
+        else:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+            onnx_available = TextCrossEncoder is not None
+            if not onnx_available:
+                onnx_import_error = "TextCrossEncoder is unavailable"
+    except Exception as exc:
+        onnx_import_error = str(exc) or repr(exc)
+
+    onnx_model = os.environ.get("ENGRAM_RERANKER_MODEL") or DEFAULT_ONNX_RERANKER
     return {
         "data_home": str(paths.data_home(create=False)),
         "data_home_source": paths.data_home_source(),
@@ -600,6 +907,23 @@ def do_server_info() -> dict:
         "default_index_device_error": default_error,
         "supported_index_devices": list(factory.SUPPORTED_INDEX_DEVICES),
         "search_backend": "fastembed-cpu",
+        "delta_cpu_max": _delta_cpu_max(),
+        "search_warmup_executor": "single_worker",
+        "reranker": {
+            "enabled": pipeline.rerank_enabled(),
+            "enable_env": "ENGRAM_RERANK_ENABLED",
+            "gated_to_mode": "vector",
+            "default_backend": DEFAULT_BACKEND,
+            "onnx_model": onnx_model,
+            "onnx_available": onnx_available,
+            "onnx_import_error": onnx_import_error,
+            "candidate_k_default": _rerank_candidate_k_default(),
+            "license_note": (
+                "jina-v2-multilingual is CC-BY-NC-4.0; fine for local/private use, "
+                "revisit before commercial distribution"
+            ),
+            "torch_fallback_backend": "sentence_transformers (needs 'gpu' extra)",
+        },
         "source_type": "static_indexed_source",
     }
 
@@ -613,18 +937,7 @@ def do_server_info() -> dict:
 async def index_project(
     project_path: str, full_rebuild: bool = False, index_device: str | None = None
 ) -> dict:
-    """Start a background index/re-index of a project directory.
-
-    Returns a job_id immediately. Poll index_status until status == 'done'
-    (or 'error'). Incremental by default (only changed files are touched);
-    pass full_rebuild=true to rebuild the whole index atomically.
-
-    index_device is "auto" (default): prefer a CUDA GPU (much faster), falling
-    back to CPU only when no GPU is available. Pass "cuda" to require the GPU
-    (errors if absent) or "cpu" to force the slow CPU fallback. Either way
-    search always uses FastEmbed/ONNX on CPU. GPU indexing runs in a short-lived
-    subprocess, so the server itself stays torch-free and ~0 VRAM.
-    """
+    """Start a background index job and return job/routing details."""
     return start_index_job(project_path, full_rebuild, index_device=index_device)
 
 
@@ -641,29 +954,26 @@ async def search_code(
     project_path: str, query: str, k: int = 8, language: str | None = None,
     mode: str = "auto", rerank: bool = False, content: str = "preview",
     max_chars_per_result: int = _DEFAULT_PREVIEW_CHARS,
+    max_total_chars: int | None = None,
+    candidate_k: int | None = None,
+    facets: list[str] | None = None,
     min_relevance: str | None = None,
 ) -> dict:
-    """Semantic search over static indexed source for choosing chunks to read.
-
-    Use find_definition when you know a symbol. Use hybrid for identifiers,
-    literals, action names, and paths; use vector for natural-language behavior
-    questions. Returns compact hits by default: chunk_id, path/span, symbol,
-    preview, relevance, freshness, mode metadata, and static-source warnings.
-    content is "none", "preview" (default), or "full" bounded by
-    max_chars_per_result; fetch exact full text with get_chunk(chunk_id). k is
-    bounded to 1..50. rerank=true is best-effort and reports rerank_applied.
-    """
+    """Search indexed source with compact bodies, facets, min relevance, and opt-in rerank."""
     return await asyncio.to_thread(
         do_search,
-        project_path,
-        query,
-        k,
-        language,
-        mode,
-        rerank,
-        content,
-        max_chars_per_result,
-        min_relevance,
+        project_path=project_path,
+        query=query,
+        k=k,
+        language=language,
+        mode=mode,
+        rerank=rerank,
+        content=content,
+        max_chars_per_result=max_chars_per_result,
+        max_total_chars=max_total_chars,
+        candidate_k=candidate_k,
+        facets=facets,
+        min_relevance=min_relevance,
     )
 
 
@@ -687,9 +997,60 @@ async def find_definition(project_path: str, symbol: str) -> dict:
     return await asyncio.to_thread(do_find_definition, project_path, symbol)
 
 
-async def get_chunk(project_path: str, chunk_id: str, max_chars: int | None = None) -> dict:
-    """Fetch full static indexed source content for one search_code chunk_id."""
-    return await asyncio.to_thread(do_get_chunk, project_path, chunk_id, max_chars)
+async def get_chunk(
+    project_path: str,
+    chunk_id: str,
+    max_chars: int | None = None,
+    include_neighbors: bool = False,
+    neighbor_window: int = 1,
+    include_parent: bool = False,
+) -> dict:
+    """Fetch one chunk, optionally with adjacent/parent context."""
+    return await asyncio.to_thread(
+        do_get_chunk,
+        project_path,
+        chunk_id,
+        max_chars,
+        include_neighbors,
+        neighbor_window,
+        include_parent,
+    )
+
+
+async def project_map(
+    project_path: str, depth: int = 2, sort: str = "path", limit: int = 200
+) -> dict:
+    """Body-free file/dir/symbol map served from the catalog sidecar."""
+    return await asyncio.to_thread(do_project_map, project_path, depth, sort, limit)
+
+
+async def doctor_project(project_path: str, check_git: bool = True) -> dict:
+    """Read-only index health check; does not load an embedding model."""
+    return await asyncio.to_thread(do_doctor_project, project_path, check_git)
+
+
+async def grep_index(
+    project_path: str,
+    pattern: str,
+    ignore_case: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    max_matches: int = 500,
+    max_scan_chunks: int = 10000,
+    include_lines: bool = False,
+) -> dict:
+    """Bounded regex/count probe over indexed text; bodies omitted by default."""
+    return await asyncio.to_thread(
+        do_grep_index,
+        project_path,
+        pattern,
+        ignore_case,
+        limit,
+        offset,
+        max_matches,
+        max_scan_chunks,
+        include_lines,
+    )
 
 
 async def model_status(project_path: str | None = None) -> dict:
@@ -737,6 +1098,9 @@ def register_tools(read_only: bool) -> None:
     mcp.tool()(search_code)
     mcp.tool()(find_definition)
     mcp.tool()(get_chunk)
+    mcp.tool()(project_map)
+    mcp.tool()(doctor_project)
+    mcp.tool()(grep_index)
     mcp.tool()(model_status)
     mcp.tool()(index_status)
     mcp.tool()(list_indexed_projects)
@@ -751,12 +1115,18 @@ def register_tools(read_only: bool) -> None:
 register_tools(read_only_enabled())
 
 
+def _maybe_warmup_on_start() -> None:
+    if os.environ.get("ENGRAM_WARMUP_ON_START", "").strip().lower() in ("1", "true", "yes", "on"):
+        _schedule_query_model_warmup(factory.CANONICAL_EMBEDDER_ID)
+
+
 def main() -> None:
     # Set up TLS trust (OS store / CA bundle / insecure) before the background
     # index worker loads a model over HTTPS.
     from engram_mcp.net import configure_tls
 
     configure_tls()
+    _maybe_warmup_on_start()
     mcp.run()
 
 
