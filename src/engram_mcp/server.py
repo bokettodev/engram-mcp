@@ -668,10 +668,10 @@ def do_remove_project(project_path: str) -> dict:
     return {"removed": _run_remove(root), "project_path": str(root)}
 
 
-def do_find_definition(project_path: str, symbol: str) -> dict:
+def do_find_definition(project_path: str, symbol: str, ref: str | None = None) -> dict:
     try:
         root = Path(project_path).expanduser().resolve()
-        return _run_find_def(root, symbol, include_suggestions=True)
+        return _run_find_def(root, symbol, include_suggestions=True, ref=ref)
     except Exception as exc:
         return _error_payload(exc, results=[])
 
@@ -699,6 +699,7 @@ def do_search(
     candidate_k: int | None = None,
     facets: list[str] | None = None,
     min_relevance: str | None = None,
+    ref: str | None = None,
 ) -> dict:
     try:
         _check_k(k)
@@ -709,10 +710,10 @@ def do_search(
         if not isinstance(candidate_k, int) or candidate_k < 1 or candidate_k > MAX_RERANK_CANDIDATES:
             raise ValueError(f"candidate_k must be between 1 and {MAX_RERANK_CANDIDATES}")
         root = Path(project_path).expanduser().resolve()
-        qi = load_query_index(root)
+        qi = load_query_index(root, ref=ref)
         provider = _provider_for_query_model(qi.manifest.embedder_id)
         outcome = _run_search(
-            qi.root,
+            root,
             provider,
             query,
             k=k,
@@ -723,6 +724,8 @@ def do_search(
             facets=facets,
             min_relevance=min_relevance,
             return_meta=True,
+            ref=ref,
+            _query_index=qi,
         )
         results = []
         used_chars = 0
@@ -1016,6 +1019,7 @@ async def search_code(
     candidate_k: int | None = None,
     facets: list[str] | None = None,
     min_relevance: str | None = None,
+    ref: str | None = None,
 ) -> dict:
     """Search indexed source with compact bodies, facets, min relevance, and opt-in rerank."""
     return await asyncio.to_thread(
@@ -1032,6 +1036,7 @@ async def search_code(
         candidate_k=candidate_k,
         facets=facets,
         min_relevance=min_relevance,
+        ref=ref,
     )
 
 
@@ -1045,14 +1050,14 @@ async def remove_project(project_path: str) -> dict:
     return await asyncio.to_thread(do_remove_project, project_path)
 
 
-async def find_definition(project_path: str, symbol: str) -> dict:
+async def find_definition(project_path: str, symbol: str, ref: str | None = None) -> dict:
     """Exact symbol lookup over static indexed source, with miss suggestions.
 
     Use this when you already know the symbol name (`symbol` or `Parent.symbol`).
     It does not load an embedding model. On an exact miss, suggestions contains
     nearby symbols from the indexed inventory.
     """
-    return await asyncio.to_thread(do_find_definition, project_path, symbol)
+    return await asyncio.to_thread(do_find_definition, project_path, symbol, ref)
 
 
 async def get_chunk(

@@ -93,6 +93,8 @@ def _write_manifest_only(root: Path, dim: int = 4, **overrides) -> Path:
     m = manifest.ProjectManifest(
         project_id=paths.project_id_for(root),
         root_path=str(root.resolve()),
+        logical_project_id=paths.project_id_for(root),
+        checkout_kind="non_git",
         active_table="chunks",
         embedder_id="test:fake",
         dim=dim,
@@ -151,6 +153,8 @@ def test_load_query_index_rejects_missing_corrupt_and_incompatible_manifest(tmp_
         manifest.ProjectManifest(
             project_id=paths.project_id_for(proj),
             root_path=str(proj.resolve()),
+            logical_project_id=paths.project_id_for(proj),
+            checkout_kind="non_git",
             active_table="chunks",
             embedder_id="",
             dim=0,
@@ -929,6 +933,8 @@ def test_list_projects_compact_pagination_and_orphan_prune(tmp_path):
             manifest.ProjectManifest(
                 project_id=paths.project_id_for(root),
                 root_path=str(root.resolve()),
+                logical_project_id=paths.project_id_for(root),
+                checkout_kind="non_git",
                 active_table="chunks",
                 generation=3,
                 embedder_id=factory.CANONICAL_EMBEDDER_ID,
@@ -945,8 +951,11 @@ def test_list_projects_compact_pagination_and_orphan_prune(tmp_path):
     assert first["cursor"] is not None
     assert set(first["projects"][0]) == {
         "project_id",
+        "logical_project_id",
         "root_path",
         "root_exists",
+        "checkout_kind",
+        "indexed_ref",
         "files",
         "chunks",
         "indexed_at",
@@ -1068,6 +1077,8 @@ def test_manifest_compat_uses_canonical_model_id():
     m = manifest.ProjectManifest(
         project_id="p",
         root_path="/tmp/p",
+        logical_project_id="p",
+        checkout_kind="non_git",
         active_table="chunks",
         embedder_id=factory.CANONICAL_EMBEDDER_ID,
         dim=config.DEFAULT_EMBED_DIM,

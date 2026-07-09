@@ -16,13 +16,15 @@ from pathlib import Path
 
 from engram_mcp import errors
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass
 class ProjectManifest:
     project_id: str
     root_path: str
+    logical_project_id: str = ""
+    checkout_kind: str = ""
     active_table: str | None = None
     generation: int = 0
     embedder_id: str = ""

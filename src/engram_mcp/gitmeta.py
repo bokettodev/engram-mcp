@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from engram_mcp import paths
+
 # Env that makes git non-interactive and non-blocking: never prompt for
 # credentials, never wait on/ take .git/index.lock (git status), never talk to
 # a long-running fsmonitor daemon. These are the real reasons `git status` /
@@ -140,6 +142,40 @@ def _normalize_git_path(value: str | None) -> str:
     while text.startswith("./"):
         text = text[2:]
     return text.strip("/")
+
+
+def _canonical_git_path(value: str | None, *, base: Path) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    try:
+        return candidate.resolve().as_posix()
+    except OSError:
+        return ""
+
+
+def _path_key(value: str) -> str:
+    return os.path.normcase(value.replace("\\", "/"))
+
+
+def _non_git_snapshot(root: Path | None) -> dict:
+    logical_project_id = ""
+    if root is not None:
+        try:
+            logical_project_id = paths.project_id_for(root)
+        except OSError:
+            logical_project_id = ""
+    return {
+        "logical_project_id": logical_project_id,
+        "checkout_kind": "non_git",
+        "git_worktree_root": "",
+        "indexed_ref": "",
+        "indexed_commit": "",
+        "indexed_dirty": False,
+    }
 
 
 def _parse_int_stat(value: str) -> int:
@@ -891,30 +927,38 @@ def snapshot(root: str | Path) -> dict:
     try:
         path = Path(root).resolve()
     except OSError:
-        return {
-            "git_worktree_root": "",
-            "indexed_ref": "",
-            "indexed_commit": "",
-            "indexed_dirty": False,
-        }
+        return _non_git_snapshot(None)
     worktree = _git(path, "rev-parse", "--show-toplevel")
     if not worktree:
-        return {
-            "git_worktree_root": "",
-            "indexed_ref": "",
-            "indexed_commit": "",
-            "indexed_dirty": False,
-        }
+        return _non_git_snapshot(path)
+    worktree_root = _canonical_git_path(worktree, base=path)
+    common_dir = _canonical_git_path(
+        _git(path, "rev-parse", "--git-common-dir"),
+        base=path,
+    )
+    git_dir = _canonical_git_path(_git(path, "rev-parse", "--git-dir"), base=path)
+    checkout_kind = "main"
+    if common_dir and git_dir and _path_key(common_dir) != _path_key(git_dir):
+        checkout_kind = "worktree"
+    logical_project_id = ""
+    if common_dir:
+        try:
+            logical_project_id = paths.logical_project_id_for_common_dir(common_dir)
+        except OSError:
+            logical_project_id = ""
+    if not logical_project_id and worktree_root:
+        try:
+            logical_project_id = paths.project_id_for(Path(worktree_root))
+        except OSError:
+            logical_project_id = ""
     commit = _git(path, "rev-parse", "HEAD") or ""
     ref = _git(path, "symbolic-ref", "--short", "-q", "HEAD")
     if not ref:
         ref = _git(path, "rev-parse", "--short", "HEAD") or ""
     status = _git(path, "status", "--porcelain")
-    try:
-        worktree_root = str(Path(worktree).resolve())
-    except OSError:
-        worktree_root = ""
     return {
+        "logical_project_id": logical_project_id,
+        "checkout_kind": checkout_kind,
         "git_worktree_root": worktree_root,
         "indexed_ref": ref,
         "indexed_commit": commit,

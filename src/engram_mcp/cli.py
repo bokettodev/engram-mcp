@@ -231,11 +231,17 @@ def cmd_find_def(args: argparse.Namespace) -> int:
     from engram_mcp.pipeline import ProjectNotIndexedError, find_definition
 
     root = Path(args.path).resolve()
+    ref = getattr(args, "ref", None)
     try:
-        out = find_definition(root, args.symbol, include_suggestions=True)
+        if ref is None:
+            out = find_definition(root, args.symbol, include_suggestions=True)
+        else:
+            out = find_definition(root, args.symbol, include_suggestions=True, ref=ref)
     except ProjectNotIndexedError:
         print(f'project not indexed: {root}\nrun: engram index "{root}"', file=sys.stderr)
         return 2
+    for warning in out.get("warnings") or []:
+        print(f"warning: {warning}", file=sys.stderr)
     rows = out["results"]
     if not rows:
         print(f"no definition found for {args.symbol!r}")
@@ -302,8 +308,9 @@ def cmd_search(args: argparse.Namespace) -> int:
     from engram_mcp.embeddings import factory
     from engram_mcp.pipeline import ProjectNotIndexedError, load_query_index, rerank_enabled, search_project
 
+    ref = getattr(args, "ref", None)
     try:
-        qi = load_query_index(root)
+        qi = load_query_index(root) if ref is None else load_query_index(root, ref=ref)
         provider = factory.provider_for_model_id(qi.manifest.embedder_id)
         if args.rerank and not rerank_enabled():
             print(
@@ -320,6 +327,8 @@ def cmd_search(args: argparse.Namespace) -> int:
             mode=args.mode,
             rerank=args.rerank,
             return_meta=True,
+            ref=ref,
+            _query_index=qi,
         )
         hits = outcome["hits"]
         from engram_mcp import gitmeta
@@ -331,6 +340,9 @@ def cmd_search(args: argparse.Namespace) -> int:
         )
         if revision_warning:
             print(f"warning: {revision_warning}", file=sys.stderr)
+        for warning in outcome.get("warnings") or []:
+            if warning.startswith("no index for ref "):
+                print(f"warning: {warning}", file=sys.stderr)
     except ProjectNotIndexedError:
         print(f'project not indexed: {root}\nrun: engram index "{root}"', file=sys.stderr)
         return 2
@@ -417,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
     pf = sub.add_parser("find-def", help="exact symbol definition lookup (no embedding)")
     pf.add_argument("path", help="project root directory")
     pf.add_argument("symbol", help="symbol name (e.g. EmbeddingCache or LanceStore.refresh_fts)")
+    pf.add_argument("--ref", default=None, help="search an indexed checkout recorded for this git ref")
     pf.set_defaults(func=cmd_find_def)
 
     pv = sub.add_parser("eval", help="measure retrieval quality on a query set")
@@ -440,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("query", help="natural-language query")
     ps.add_argument("-k", type=int, default=8, help="number of results")
     ps.add_argument("--lang", default=None, help="filter by language")
+    ps.add_argument("--ref", default=None, help="search an indexed checkout recorded for this git ref")
     ps.add_argument("--mode", default="auto", choices=["auto", "hybrid", "vector"],
                     help="retrieval mode (auto routes identifier queries to hybrid, NL to vector)")
     ps.add_argument(

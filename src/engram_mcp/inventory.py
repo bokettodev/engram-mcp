@@ -13,7 +13,6 @@ DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 500
 _GIT_KEYS = (
     "git_worktree_root",
-    "indexed_ref",
     "indexed_commit",
     "indexed_dirty",
 )
@@ -95,8 +94,11 @@ def _compact_project(d: Path, raw: dict) -> dict:
     root = raw.get("root_path") or ""
     item = {
         "project_id": raw.get("project_id") or d.name,
+        "logical_project_id": raw.get("logical_project_id") or "",
         "root_path": root,
         "root_exists": Path(root).exists() if root else False,
+        "checkout_kind": raw.get("checkout_kind") or "",
+        "indexed_ref": raw.get("indexed_ref") or "",
         "files": raw.get("files", 0),
         "chunks": raw.get("chunks", 0),
         "indexed_at": raw.get("indexed_at", 0.0),

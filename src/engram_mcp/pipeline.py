@@ -58,6 +58,9 @@ class QueryIndex:
     manifest: manifest.ProjectManifest
     store: LanceStore
     count: int
+    requested_root: Path | None = None
+    requested_ref: str | None = None
+    resolution_warnings: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -93,6 +96,8 @@ _EXECUTABLE_KINDS = (
     "enum", "struct", "trait", "impl", "macro", "namespace", "module_declaration",
 )
 
+_CHECKOUT_KINDS = {"main", "worktree", "non_git"}
+
 
 def _read_text(path: Path) -> str | None:
     try:
@@ -108,6 +113,123 @@ def _norm_path_key(path: Path) -> str:
     import os
 
     return os.path.normcase(str(path.resolve()))
+
+
+def _normalize_ref(ref: str | None) -> str | None:
+    if ref is None:
+        return None
+    text = str(ref).strip()
+    return text or None
+
+
+def _indexed_project_dirs() -> list[Path]:
+    base = paths.data_home(create=False) / "projects"
+    if not base.exists():
+        return []
+    try:
+        return sorted(d for d in base.iterdir() if d.is_dir())
+    except OSError:
+        return []
+
+
+def _load_manifest_lenient(pdir: Path) -> manifest.ProjectManifest | None:
+    try:
+        return manifest.load_project(pdir)
+    except TypeError:
+        return None
+
+
+def _query_logical_project_id(root: Path, own_manifest: manifest.ProjectManifest | None) -> str:
+    if own_manifest is not None and own_manifest.logical_project_id:
+        return own_manifest.logical_project_id
+    try:
+        snap = gitmeta.snapshot(root)
+    except Exception:
+        snap = {}
+    logical_project_id = str(snap.get("logical_project_id") or "")
+    if logical_project_id:
+        return logical_project_id
+    try:
+        return paths.project_id_for(root)
+    except OSError:
+        return ""
+
+
+def _manifest_root_path(m: manifest.ProjectManifest) -> Path | None:
+    if not m.root_path:
+        return None
+    try:
+        return Path(m.root_path).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _find_index_for_ref(
+    *,
+    requested_root: Path,
+    requested_pdir: Path,
+    requested_manifest: manifest.ProjectManifest | None,
+    logical_project_id: str,
+    ref: str,
+) -> tuple[Path, Path, manifest.ProjectManifest] | None:
+    if (
+        requested_manifest is not None
+        and requested_manifest.logical_project_id == logical_project_id
+        and requested_manifest.indexed_ref == ref
+    ):
+        root = _manifest_root_path(requested_manifest) or requested_root
+        return root, requested_pdir, requested_manifest
+
+    candidates: list[tuple[float, str, Path, Path, manifest.ProjectManifest]] = []
+    for pdir in _indexed_project_dirs():
+        m = _load_manifest_lenient(pdir)
+        if m is None:
+            continue
+        if m.logical_project_id != logical_project_id or m.indexed_ref != ref:
+            continue
+        root = _manifest_root_path(m)
+        if root is None:
+            continue
+        candidates.append((float(m.indexed_at or 0.0), m.project_id, root, pdir, m))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    _, _, root, pdir, m = candidates[0]
+    return root, pdir, m
+
+
+def _resolve_query_index(
+    root: Path,
+    ref: str | None,
+) -> tuple[Path, Path, tuple[str, ...]]:
+    requested_root = root
+    requested_pdir = paths.project_dir(requested_root, create=False)
+    requested_ref = _normalize_ref(ref)
+    if requested_ref is None:
+        return requested_root, requested_pdir, ()
+
+    requested_manifest = _load_manifest_lenient(requested_pdir)
+    logical_project_id = _query_logical_project_id(requested_root, requested_manifest)
+    match = _find_index_for_ref(
+        requested_root=requested_root,
+        requested_pdir=requested_pdir,
+        requested_manifest=requested_manifest,
+        logical_project_id=logical_project_id,
+        ref=requested_ref,
+    )
+    if match is not None:
+        resolved_root, resolved_pdir, _resolved_manifest = match
+        return resolved_root, resolved_pdir, ()
+
+    searched_ref = ""
+    if requested_manifest is not None:
+        searched_ref = requested_manifest.indexed_ref or ""
+    label = searched_ref or "unknown"
+    warning = (
+        f"no index for ref '{requested_ref}'; searched '{label}'; "
+        "index that worktree/branch to search it"
+    )
+    return requested_root, requested_pdir, (warning,)
 
 
 def derive_chunk_role(
@@ -185,17 +307,27 @@ def rerank_candidate_k_default() -> int:
     return max(1, min(value, MAX_RERANK_CANDIDATES))
 
 
-def load_query_index(root: str | Path) -> QueryIndex:
+def load_query_index(root: str | Path, ref: str | None = None) -> QueryIndex:
     """Validate a project's readable index before any model/provider load."""
 
-    root = Path(root).expanduser().resolve()
-    pdir = paths.project_dir(root, create=False)
+    requested_root = Path(root).expanduser().resolve()
+    requested_ref = _normalize_ref(ref)
+    root, pdir, resolution_warnings = _resolve_query_index(requested_root, requested_ref)
     if not pdir.exists():
-        raise ProjectNotIndexedError(f"project not indexed: {root}")
+        raise ProjectNotIndexedError(f"project not indexed: {requested_root}")
     m = manifest.load_project_strict(pdir)
     if m is None:
-        raise ProjectNotIndexedError(f"project not indexed: {root}")
+        raise ProjectNotIndexedError(f"project not indexed: {requested_root}")
     problems: list[str] = []
+    if m.schema_version != manifest.SCHEMA_VERSION:
+        problems.append(
+            f"schema_version {m.schema_version!r} is incompatible with "
+            f"{manifest.SCHEMA_VERSION!r}"
+        )
+    if not m.logical_project_id:
+        problems.append("logical_project_id is missing")
+    if m.checkout_kind not in _CHECKOUT_KINDS:
+        problems.append("checkout_kind is missing or invalid")
     if not m.active_table:
         problems.append("active_table is missing")
     if not m.embedder_id:
@@ -250,7 +382,16 @@ def load_query_index(root: str | Path) -> QueryIndex:
             errors.E_INDEX_INVALID,
             hint="Rebuild the index after adding indexable source files.",
         )
-    return QueryIndex(root=root, pdir=pdir, manifest=m, store=store, count=count)
+    return QueryIndex(
+        root=root,
+        pdir=pdir,
+        manifest=m,
+        store=store,
+        count=count,
+        requested_root=requested_root,
+        requested_ref=requested_ref,
+        resolution_warnings=resolution_warnings,
+    )
 
 
 def _catalog_chunk_ids(data: dict) -> set[str]:
@@ -1139,6 +1280,9 @@ def _search_text(c) -> str:
 def _is_compatible(m: manifest.ProjectManifest | None, provider: EmbeddingProvider) -> bool:
     return bool(
         m is not None
+        and m.schema_version == manifest.SCHEMA_VERSION
+        and m.logical_project_id
+        and m.checkout_kind in _CHECKOUT_KINDS
         and m.active_table
         and m.embedder_id == provider.model_id
         and m.dim == provider.dim
@@ -1367,6 +1511,9 @@ def plan_index(
     m = manifest.load_project(pdir)
     compatible = bool(
         m is not None
+        and m.schema_version == manifest.SCHEMA_VERSION
+        and m.logical_project_id
+        and m.checkout_kind in _CHECKOUT_KINDS
         and m.active_table
         and m.embedder_id == model_id
         and m.dim == dim
@@ -2281,8 +2428,10 @@ def search_project(
     facets: list[str] | tuple[str, ...] | None = None,
     min_relevance: str | None = None,
     return_meta: bool = False,
+    ref: str | None = None,
+    _query_index: QueryIndex | None = None,
 ) -> list[dict] | dict:
-    root = Path(root).resolve()
+    requested_root = Path(root).resolve()
     k = _validate_search_k(k)
     if not query or not query.strip():
         raise ValueError("query must not be empty")
@@ -2294,7 +2443,8 @@ def search_project(
     if min_relevance is not None and min_relevance not in retrieval.RELEVANCE_ORDER:
         retrieval.relevance_at_least("low", min_relevance)  # raises the canonical message
     resolved_mode = retrieval.classify_query(query) if mode == "auto" else mode
-    qi = load_query_index(root)
+    qi = _query_index or load_query_index(requested_root, ref=ref)
+    root = qi.root
     m = qi.manifest
     if m.embedder_id and m.embedder_id != provider.model_id:
         raise ValueError(
@@ -2315,7 +2465,7 @@ def search_project(
         raise ValueError("candidate_k must be an integer")
     candidate_k = max(k, min(candidate_k, MAX_RERANK_CANDIDATES))
     n = candidate_k
-    warnings: list[str] = []
+    warnings: list[str] = list(qi.resolution_warnings)
     mode_used = resolved_mode
     vector_candidates: list[dict] = []
     if resolved_mode == "hybrid":
@@ -2418,7 +2568,12 @@ def search_project(
     return {
         "query": query,
         "project_path": str(root),
+        "requested_project_path": str(qi.requested_root or requested_root),
         "project_id": m.project_id,
+        "logical_project_id": m.logical_project_id,
+        "checkout_kind": m.checkout_kind,
+        "indexed_ref": m.indexed_ref,
+        "requested_ref": qi.requested_ref,
         "index_generation": m.generation,
         "embedder_id": m.embedder_id,
         "source_type": "static_indexed_source",
@@ -2470,7 +2625,11 @@ def _symbol_suggestions(store: LanceStore, name: str, limit: int = 8) -> list[di
 
 
 def find_definition(
-    root: str | Path, name: str, k: int = 20, include_suggestions: bool = False
+    root: str | Path,
+    name: str,
+    k: int = 20,
+    include_suggestions: bool = False,
+    ref: str | None = None,
 ) -> list[dict] | dict:
     """Exact symbol lookup (no embedding): definitions named `name` or `Parent.name`.
 
@@ -2479,7 +2638,7 @@ def find_definition(
     """
     if not name or not name.strip():
         raise ValueError("symbol must not be empty")
-    qi = load_query_index(root)
+    qi = load_query_index(root, ref=ref)
     rows = qi.store.by_symbol(name, k=k)
     for row in rows:
         _ensure_chunk_role(row)
@@ -2490,8 +2649,14 @@ def find_definition(
     return {
         "symbol": name,
         "project_path": str(qi.root),
+        "requested_project_path": str(qi.requested_root or qi.root),
         "project_id": qi.manifest.project_id,
+        "logical_project_id": qi.manifest.logical_project_id,
+        "checkout_kind": qi.manifest.checkout_kind,
+        "indexed_ref": qi.manifest.indexed_ref,
+        "requested_ref": qi.requested_ref,
         "source_type": "static_indexed_source",
+        "warnings": list(qi.resolution_warnings),
         "count": len(results),
         "results": results,
         "suggestions": [] if results else _symbol_suggestions(qi.store, name),
@@ -2678,6 +2843,9 @@ def doctor_project(root: str | Path, *, check_git: bool = True) -> dict:
     return {
         "project_path": str(root),
         "project_id": m.project_id,
+        "logical_project_id": m.logical_project_id,
+        "checkout_kind": m.checkout_kind,
+        "indexed_ref": m.indexed_ref,
         "index_generation": m.generation,
         "source_type": "static_indexed_source",
         "ok": errors_count == 0,

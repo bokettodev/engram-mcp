@@ -72,6 +72,26 @@ def project_id_for(root: Path) -> str:
     return f"{slug}-{digest}"
 
 
+def canonical_path(root: str | Path) -> str:
+    """Return an absolute, resolved path string with forward slashes."""
+
+    return Path(root).expanduser().resolve().as_posix()
+
+
+def logical_project_id_for_common_dir(common_dir: str | Path) -> str:
+    """Stable repo identity shared by linked worktrees of one git repository."""
+
+    common = Path(common_dir).expanduser().resolve()
+    # A normal non-bare repository's common dir is `<main-worktree>/.git`.
+    # Use the parent name for a human-readable slug while hashing the common dir
+    # itself so every linked worktree shares the same logical id.
+    slug_source = common.parent if common.name.lower() == ".git" else common
+    key = os.path.normcase(common.as_posix())
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", slug_source.name).strip("-").lower() or "project"
+    return f"{slug}-{digest}"
+
+
 def project_dir(root: Path, create: bool = True) -> Path:
     d = data_home(create=create) / "projects" / project_id_for(root)
     if create:
