@@ -1,10 +1,37 @@
 [project]
 name = "engram-mcp"
 version = "0.1.0"
-description = "Engram — local, private semantic code-index MCP server (local embeddings + LanceDB)"
+description = "Local, private semantic code and prose search MCP stdio server for AI coding agents."
 readme = "README.md"
+authors = [{ name = "Rafael Dzhancherov", email = "bokettodev@gmail.com" }]
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+keywords = [
+    "ai-agents",
+    "code-search",
+    "fastembed",
+    "lancedb",
+    "local-first",
+    "mcp",
+    "model-context-protocol",
+    "privacy",
+    "semantic-search",
+    "tree-sitter",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Indexing",
+]
 dependencies = [
     "fastembed>=0.8.0",
     "filelock>=3.29.4",
@@ -25,8 +52,14 @@ dependencies = [
     "tree-sitter-typescript>=0.23.2",
 ]
 
+[project.urls]
+Homepage = "https://github.com/bokettodev/engram-mcp"
+Repository = "https://github.com/bokettodev/engram-mcp"
+Issues = "https://github.com/bokettodev/engram-mcp/issues"
+
 [project.optional-dependencies]
-# CUDA indexing via sentence-transformers + optional cross-encoder reranker.
+# CUDA indexing via sentence-transformers; also enables explicit/offline
+# sentence-transformers reranker.
 # Heavy (~2GB) + GPU-recommended, so opt-in: `uv sync --extra gpu`.
 gpu = [
     "sentence-transformers>=3.0.0",
@@ -44,7 +77,12 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.15.20",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
 
 # GPU torch for the optional `gpu` extra. This only affects resolution when
 # torch is pulled in (i.e. `uv sync --extra gpu`) — the default `uv sync`

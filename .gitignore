@@ -12,8 +12,18 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# coverage / logs
+.coverage
+coverage.xml
+htmlcov/
+*.log
 
 .artifacts/
 
-# Note: uv.lock IS committed (the lockfile). The semantic index + embedding
-# cache live under %LOCALAPPDATA%\code-index-mcp, outside the repo.
+# Note: uv.lock IS committed. The semantic index + embedding cache live under
+# %LOCALAPPDATA%\engram on Windows, $XDG_DATA_HOME/engram on Linux, or
+# ~/.engram otherwise, outside the repo.

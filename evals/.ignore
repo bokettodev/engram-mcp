@@ -1,0 +1,3 @@
+# Keep self-evaluation fixtures out of Engram's own project index.
+# They are benchmark data, not source/prose corpus content.
+*.json

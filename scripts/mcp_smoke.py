@@ -1,6 +1,6 @@
 """End-to-end MCP smoke: launch the server over stdio with a real client.
 
-    uv run python mcp_smoke.py
+    uv run python scripts/mcp_smoke.py
 
 Proves the JSON-RPC handshake + tools/list + a no-model tool call work.
 """
