@@ -481,6 +481,162 @@ def test_rerank_candidate_k_env_default_and_validation(tmp_path, monkeypatch):
     assert explicit["candidate_k"] == 9
 
 
+def test_search_response_source_revision_branch_mismatch_top_level(tmp_path, monkeypatch):
+    from engram_mcp import gitmeta, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+
+    indexed = {
+        "git_worktree_root": "C:/repo",
+        "indexed_ref": "main",
+        "indexed_commit": "1111111111111111111111111111111111111111",
+        "indexed_dirty": False,
+    }
+    current = {
+        "git_worktree_root": "C:/repo",
+        "indexed_ref": "feature/x",
+        "indexed_commit": "2222222222222222222222222222222222222222",
+        "indexed_dirty": True,
+    }
+
+    monkeypatch.setattr(
+        gitmeta,
+        "current_staleness",
+        lambda _root, _indexed: {
+            "available": True,
+            "git_stale": True,
+            "reasons": ["indexed_ref", "indexed_commit", "indexed_dirty"],
+            "indexed": indexed,
+            "current": current,
+        },
+    )
+
+    out = server.do_search(str(proj), "add numbers", k=1, content="none")
+    revision = out["source_revision"]
+    assert revision == {
+        "available": True,
+        "indexed": {
+            "worktree_root": "C:/repo",
+            "ref": "main",
+            "commit": "1111111111111111111111111111111111111111",
+            "dirty": False,
+        },
+        "current": {
+            "worktree_root": "C:/repo",
+            "ref": "feature/x",
+            "commit": "2222222222222222222222222222222222222222",
+            "dirty": True,
+        },
+        "stale": True,
+        "branch_mismatch": True,
+        "commit_mismatch": True,
+        "dirty_mismatch": True,
+        "reasons": ["indexed_ref", "indexed_commit", "indexed_dirty"],
+    }
+    assert any("indexed ref 'main'" in w and "feature/x" in w for w in out["warnings"])
+    assert out["results"][0]["git_stale"] is True
+    assert "source_revision" not in out["results"][0]
+
+
+def test_search_response_source_revision_unavailable_has_no_mismatch(tmp_path, monkeypatch):
+    from engram_mcp import gitmeta
+
+    proj, provider = _indexed_project(tmp_path)
+    monkeypatch.setattr(
+        gitmeta,
+        "current_staleness",
+        lambda _root, _indexed: {
+            "available": False,
+            "git_stale": False,
+            "reasons": ["indexed_ref"],
+            "indexed": {"indexed_ref": "main", "indexed_commit": "a", "indexed_dirty": False},
+            "current": {"indexed_ref": "feature/x", "indexed_commit": "b", "indexed_dirty": True},
+        },
+    )
+
+    out = search_project(proj, provider, "add numbers", k=1, return_meta=True)
+    revision = out["source_revision"]
+    assert revision["available"] is False
+    assert revision["stale"] is False
+    assert revision["branch_mismatch"] is False
+    assert revision["commit_mismatch"] is False
+    assert revision["dirty_mismatch"] is False
+    assert revision["reasons"] == []
+    assert not any("indexed ref" in w for w in out["warnings"])
+
+
+def test_cli_search_prints_revision_warning_to_stderr(tmp_path, monkeypatch, capsys):
+    from engram_mcp import cli, pipeline
+    from engram_mcp.embeddings import factory
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.setattr(
+        pipeline,
+        "load_query_index",
+        lambda _root: types.SimpleNamespace(
+            manifest=types.SimpleNamespace(embedder_id="test:fake")
+        ),
+    )
+    monkeypatch.setattr(factory, "provider_for_model_id", lambda _model_id: object())
+    monkeypatch.setattr(pipeline, "rerank_enabled", lambda: True)
+
+    def fake_search_project(*_args, **_kwargs):
+        return {
+            "hits": [
+                {
+                    "rel_path": "math_utils.py",
+                    "start_line": 1,
+                    "end_line": 3,
+                    "symbol_kind": "function_definition",
+                    "symbol": "add_numbers",
+                    "score": 1.0,
+                    "content": "def add_numbers(a, b):\n    return a + b\n",
+                }
+            ],
+            "source_revision": {
+                "available": True,
+                "indexed": {
+                    "worktree_root": "C:/repo",
+                    "ref": "feature/x",
+                    "commit": "1111111111111111111111111111111111111111",
+                    "dirty": False,
+                },
+                "current": {
+                    "worktree_root": "C:/repo",
+                    "ref": "feature/x",
+                    "commit": "2222222222222222222222222222222222222222",
+                    "dirty": False,
+                },
+                "stale": True,
+                "branch_mismatch": False,
+                "commit_mismatch": True,
+                "dirty_mismatch": False,
+                "reasons": ["indexed_commit"],
+            },
+        }
+
+    monkeypatch.setattr(pipeline, "search_project", fake_search_project)
+    code = cli.cmd_search(
+        types.SimpleNamespace(
+            path=str(proj),
+            query="add numbers",
+            k=1,
+            lang=None,
+            mode="vector",
+            rerank=False,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "warning: results are from indexed commit '111111111111'" in captured.err
+    assert "not current commit '222222222222'" in captured.err
+    assert "warning:" not in captured.out
+    assert "def add_numbers" in captured.out
+
+
 def test_rerank_failure_degrades_to_base_ranking(tmp_path, monkeypatch):
     # Rerank is best-effort: a non-ImportError failure (e.g. model download
     # race, onnxruntime error) must NOT nuke the search — return base ranking.

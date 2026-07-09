@@ -1499,6 +1499,10 @@ def search_project(
             "warning": f"git metadata unavailable: {exc}",
         }
         warnings.append(f"git metadata unavailable: {exc}")
+    source_revision = gitmeta.source_revision_from_staleness(git_status)
+    revision_warning = gitmeta.source_revision_warning(source_revision)
+    if revision_warning:
+        warnings.append(revision_warning)
     annotated, dirty, tail = _annotate_hits(
         root, qi.pdir, hits[:k], query, mode_used, min_relevance,
         git_stale=bool(git_status.get("git_stale")),
@@ -1545,6 +1549,7 @@ def search_project(
         "dirty": dirty,
         "index_stale": dirty["stale"],
         "git": git_status,
+        "source_revision": source_revision,
         **tail,
         "hits": annotated,
     }

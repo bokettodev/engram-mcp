@@ -256,7 +256,9 @@ totals are reported as `null`, not `0`.
 `match_reason`, `stale`, and `truncated`. It also returns `mode_requested`,
 `mode_used`, `warnings[]`, `hints[]`, `map[]`, `total_matches`, optional
 `facets`, `rerank_applied`, `source_type: "static_indexed_source"`, and a
-`dirty` freshness summary. Use `content="none"` to get metadata only,
+`dirty` freshness summary. It also includes a top-level `source_revision`
+object with indexed/current `worktree_root`, `ref`, `commit`, and `dirty`
+fields plus `stale`, mismatch flags, and `reasons[]`. Use `content="none"` to get metadata only,
 `content="full"` for bounded inline text, or `get_chunk` for exact full content
 by `chunk_id`. `k` and `candidate_k` are bounded to `1..50`. If omitted,
 `candidate_k` resolves from `ENGRAM_RERANK_CANDIDATE_K` (default `20`, clamped

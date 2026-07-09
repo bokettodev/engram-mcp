@@ -314,6 +314,17 @@ def cmd_search(args: argparse.Namespace) -> int:
             return_meta=True,
         )
         hits = outcome["hits"]
+        from engram_mcp import gitmeta
+
+        source_revision = outcome.get("source_revision")
+        if source_revision is None and outcome.get("git") is not None:
+            source_revision = gitmeta.source_revision_from_staleness(outcome.get("git"))
+        revision_warning = gitmeta.source_revision_warning(
+            source_revision,
+            include_commit_mismatch=True,
+        )
+        if revision_warning:
+            print(f"warning: {revision_warning}", file=sys.stderr)
     except ProjectNotIndexedError:
         print(f'project not indexed: {root}\nrun: engram index "{root}"', file=sys.stderr)
         return 2
