@@ -7,10 +7,14 @@ can report staleness, but it never uses churn or recency as a relevance prior.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 
 # Env that makes git non-interactive and non-blocking: never prompt for
 # credentials, never wait on/ take .git/index.lock (git status), never talk to
@@ -29,6 +33,32 @@ _GIT_ENV = {
 _GIT_TIMEOUT_SEC = 3.0
 _LOG_RECORD_SEP = "\x1e"
 _LOG_FIELD_SEP = "\x1f"
+DEFAULT_FIX_REGEX = r"(?i)\b(fix(e[sd])?|bug|hotfix|patch|close[sd]?\s+#\d+)\b"
+_HUNK_RE = re.compile(r"@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+\d+(?:,\d+)? @@")
+
+
+def _ms_since(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000.0, 3)
+
+
+def _szz_worker_config() -> tuple[int, str | None]:
+    default = min(8, max(2, (os.cpu_count() or 2) - 1))
+    raw = os.environ.get("ENGRAM_SZZ_WORKERS", "").strip()
+    if not raw:
+        return default, None
+    try:
+        value = int(raw)
+    except ValueError:
+        return default, f"invalid ENGRAM_SZZ_WORKERS={raw!r}; using {default}"
+    if value < 1:
+        return default, f"invalid ENGRAM_SZZ_WORKERS={raw!r}; using {default}"
+    return value, None
+
+
+def szz_worker_count() -> int:
+    """Return the adaptive SZZ blame worker count for this process."""
+
+    return _szz_worker_config()[0]
 
 
 def _staleness_disabled() -> bool:
@@ -218,9 +248,508 @@ def _parse_log_output(text: str) -> list[dict]:
     return commits
 
 
+def _coerce_max_commits(max_commits: int | None) -> int | None:
+    if max_commits is None:
+        return None
+    try:
+        value = int(max_commits)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return min(value, 1_000_000)
+
+
+def _limit_commits(commits: list[dict], max_commits: int | None) -> list[dict]:
+    limit = _coerce_max_commits(max_commits)
+    if limit is None:
+        return list(commits)
+    return list(commits)[:limit]
+
+
+def _strip_diff_path(value: str) -> str:
+    text = value.strip()
+    if not text or text == "/dev/null":
+        return ""
+    if "\t" in text:
+        text = text.split("\t", 1)[0]
+    if " " in text and (text.startswith("a/") or text.startswith("b/")):
+        text = text.split(" ", 1)[0]
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    if text.startswith("a/") or text.startswith("b/"):
+        text = text[2:]
+    return _normalize_git_path(text)
+
+
+def _old_line_ranges_from_diff(text: str) -> dict[str, list[tuple[int, int]]]:
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    old_path = ""
+    for line in text.splitlines():
+        if line.startswith("--- "):
+            old_path = _strip_diff_path(line[4:])
+            continue
+        match = _HUNK_RE.search(line)
+        if not match or not old_path:
+            continue
+        old_start = _parse_int_stat(match.group("old_start"))
+        old_count = _parse_int_stat(match.group("old_count") or "1")
+        if old_start <= 0 or old_count <= 0:
+            continue
+        ranges.setdefault(old_path, []).append((old_start, old_count))
+    return ranges
+
+
+def _blame_commits_for_range(
+    root: Path,
+    *,
+    revision: str,
+    path: str,
+    start_line: int,
+    line_count: int,
+    excluded_commit: str,
+) -> Counter[str]:
+    end_line = start_line + line_count - 1
+    out = _git(
+        root,
+        "blame",
+        "-w",
+        "--root",
+        "--line-porcelain",
+        "-L",
+        f"{start_line},{end_line}",
+        revision,
+        "--",
+        path,
+    )
+    commits: Counter[str] = Counter()
+    if out is None:
+        return commits
+    for line in out.splitlines():
+        token = line.split(" ", 1)[0]
+        if not re.fullmatch(r"[0-9a-f]{40}", token):
+            continue
+        if token == excluded_commit or set(token) == {"0"}:
+            continue
+        commits[token] += 1
+    return commits
+
+
+def _szz_empty_payload(
+    *,
+    status: str,
+    warning: str,
+    fix_regex: str | None,
+    workers: int,
+    warnings: list[str] | None = None,
+) -> dict:
+    warning_list = list(warnings or ([warning] if warning else []))
+    return {
+        "status": status,
+        "warning": warning,
+        "fix_regex": fix_regex or DEFAULT_FIX_REGEX,
+        "fix_commits": 0,
+        "blamed_lines": 0,
+        "attributions": [],
+        "commit_attributions": {},
+        "workers": workers,
+        "cached_commits": 0,
+        "blamed_commits": 0,
+        "timings_ms": {"total": 0.0, "blame": 0.0},
+        "warnings": warning_list[:50],
+    }
+
+
+def _fix_commits_for_szz(commits: Iterable[dict], fix_rx: re.Pattern[str]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        commit_id = str(commit.get("commit") or "")
+        if not commit_id or commit_id in seen:
+            continue
+        parents = [str(parent) for parent in (commit.get("parents") or []) if str(parent)]
+        if len(parents) != 1:
+            continue
+        if not fix_rx.search(str(commit.get("message") or "")):
+            continue
+        seen.add(commit_id)
+        out.append(commit)
+    return out
+
+
+def _normalize_szz_attribution(item: dict, *, fix_commit: str) -> dict | None:
+    introducing_commit = str(item.get("introducing_commit") or "")
+    rel_path = _normalize_git_path(item.get("path"))
+    if not fix_commit or not introducing_commit or not rel_path:
+        return None
+    try:
+        lines = max(1, int(item.get("lines", 1) or 1))
+    except (TypeError, ValueError):
+        lines = 1
+    return {
+        "fix_commit": fix_commit,
+        "introducing_commit": introducing_commit,
+        "path": rel_path,
+        "lines": lines,
+    }
+
+
+def _normalize_szz_commit_payload(fix_commit: str, payload: dict) -> dict | None:
+    if not fix_commit or not isinstance(payload, dict):
+        return None
+    counts: Counter[tuple[str, str, str]] = Counter()
+    for item in payload.get("attributions") or []:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_szz_attribution(item, fix_commit=fix_commit)
+        if normalized is None:
+            continue
+        key = (
+            normalized["fix_commit"],
+            normalized["introducing_commit"],
+            normalized["path"],
+        )
+        counts[key] += int(normalized["lines"])
+    attributions = [
+        {
+            "fix_commit": fix,
+            "introducing_commit": introducing,
+            "path": rel_path,
+            "lines": lines,
+        }
+        for (fix, introducing, rel_path), lines in sorted(counts.items())
+    ]
+    warnings = [str(w) for w in (payload.get("warnings") or []) if str(w)]
+    status = str(payload.get("status") or ("partial" if warnings else "ready"))
+    if status not in {"ready", "partial"}:
+        status = "partial" if warnings else "ready"
+    return {
+        "fix_commit": fix_commit,
+        "status": status,
+        "attributions": attributions,
+        "blamed_lines": sum(int(item.get("lines", 0) or 0) for item in attributions),
+        "warnings": warnings[:50],
+    }
+
+
+def _szz_cache_from_previous(previous: dict | None) -> dict[str, dict]:
+    if not isinstance(previous, dict):
+        return {}
+    cache: dict[str, dict] = {}
+    commit_payloads = previous.get("commit_attributions")
+    if isinstance(commit_payloads, dict):
+        for raw_commit, payload in commit_payloads.items():
+            fix_commit = str(raw_commit or "")
+            normalized = _normalize_szz_commit_payload(fix_commit, payload)
+            if normalized is not None:
+                cache[fix_commit] = normalized
+    for item in previous.get("attributions") or []:
+        if not isinstance(item, dict):
+            continue
+        fix_commit = str(item.get("fix_commit") or "")
+        normalized = _normalize_szz_attribution(item, fix_commit=fix_commit)
+        if normalized is None or fix_commit in cache:
+            continue
+        cache[fix_commit] = {
+            "fix_commit": fix_commit,
+            "status": "partial" if previous.get("status") == "partial" else "ready",
+            "attributions": [],
+            "blamed_lines": 0,
+            "warnings": [],
+        }
+    if previous.get("attributions"):
+        grouped: dict[str, list[dict]] = {}
+        for item in previous.get("attributions") or []:
+            if not isinstance(item, dict):
+                continue
+            fix_commit = str(item.get("fix_commit") or "")
+            normalized = _normalize_szz_attribution(item, fix_commit=fix_commit)
+            if normalized is not None:
+                grouped.setdefault(fix_commit, []).append(normalized)
+        for fix_commit, attributions in grouped.items():
+            if fix_commit in cache and cache[fix_commit].get("attributions"):
+                continue
+            payload = _normalize_szz_commit_payload(
+                fix_commit,
+                {
+                    "status": "partial" if previous.get("status") == "partial" else "ready",
+                    "attributions": attributions,
+                    "warnings": [],
+                },
+            )
+            if payload is not None:
+                cache[fix_commit] = payload
+    return cache
+
+
+def _failed_szz_commit_payload(fix_commit: str, warning: str) -> dict:
+    return {
+        "fix_commit": fix_commit,
+        "status": "partial",
+        "attributions": [],
+        "blamed_lines": 0,
+        "warnings": [warning],
+    }
+
+
+def _szz_attributions_for_fix_commit(root: Path, commit: dict) -> dict:
+    commit_id = str(commit.get("commit") or "")
+    parents = [str(parent) for parent in (commit.get("parents") or []) if str(parent)]
+    if not commit_id or len(parents) != 1:
+        return _failed_szz_commit_payload(commit_id, "invalid fix commit metadata")
+    parent = parents[0]
+    warnings: list[str] = []
+    attribution_counts: Counter[tuple[str, str, str]] = Counter()
+    diff = _git(
+        root,
+        "diff",
+        "--unified=0",
+        "-w",
+        "--no-ext-diff",
+        "--no-color",
+        "-M",
+        parent,
+        commit_id,
+        "--",
+    )
+    if diff is None:
+        return _failed_szz_commit_payload(commit_id, f"diff unavailable for {commit_id[:12]}")
+    ranges_by_path = _old_line_ranges_from_diff(diff)
+    for rel_path, ranges in sorted(ranges_by_path.items()):
+        for start_line, line_count in ranges:
+            blamed = _blame_commits_for_range(
+                root,
+                revision=parent,
+                path=rel_path,
+                start_line=start_line,
+                line_count=line_count,
+                excluded_commit=commit_id,
+            )
+            if not blamed:
+                warnings.append(f"blame unavailable for {commit_id[:12]}:{rel_path}:{start_line}")
+                continue
+            for introducing_commit, lines in blamed.items():
+                attribution_counts[(commit_id, introducing_commit, rel_path)] += int(lines)
+    attributions = [
+        {
+            "fix_commit": fix_commit,
+            "introducing_commit": introducing_commit,
+            "path": rel_path,
+            "lines": lines,
+        }
+        for (fix_commit, introducing_commit, rel_path), lines in sorted(attribution_counts.items())
+    ]
+    return {
+        "fix_commit": commit_id,
+        "status": "partial" if warnings else "ready",
+        "attributions": attributions,
+        "blamed_lines": sum(int(item.get("lines", 0) or 0) for item in attributions),
+        "warnings": warnings[:50],
+    }
+
+
+def _combine_szz_commit_cache(
+    *,
+    fix_commits: list[dict],
+    cache: dict[str, dict],
+    fix_regex: str,
+    workers: int,
+    cached_commits: int,
+    blamed_commits: int,
+    worker_warning: str | None,
+    total_start: float,
+    blame_start: float,
+    complete: bool,
+) -> dict:
+    fix_ids = [str(commit.get("commit") or "") for commit in fix_commits if str(commit.get("commit") or "")]
+    selected: dict[str, dict] = {}
+    for fix_id in fix_ids:
+        payload = _normalize_szz_commit_payload(fix_id, cache.get(fix_id) or {})
+        if payload is not None:
+            selected[fix_id] = payload
+
+    counts: Counter[tuple[str, str, str]] = Counter()
+    warnings: list[str] = []
+    for fix_id in sorted(selected):
+        payload = selected[fix_id]
+        warnings.extend(str(w) for w in (payload.get("warnings") or []) if str(w))
+        for item in payload.get("attributions") or []:
+            normalized = _normalize_szz_attribution(item, fix_commit=fix_id)
+            if normalized is None:
+                continue
+            key = (
+                normalized["fix_commit"],
+                normalized["introducing_commit"],
+                normalized["path"],
+            )
+            counts[key] += int(normalized["lines"])
+    if worker_warning:
+        warnings.insert(0, worker_warning)
+    attributions = [
+        {
+            "fix_commit": fix_commit,
+            "introducing_commit": introducing_commit,
+            "path": rel_path,
+            "lines": lines,
+        }
+        for (fix_commit, introducing_commit, rel_path), lines in sorted(counts.items())
+    ]
+    missing = [fix_id for fix_id in fix_ids if fix_id not in selected]
+    partial_commits = [
+        fix_id for fix_id, payload in selected.items() if payload.get("status") == "partial"
+    ]
+    status = "ready"
+    if missing or partial_commits or warnings or not complete:
+        status = "partial"
+    return {
+        "status": status,
+        "warning": "; ".join(warnings[:5]),
+        "fix_regex": fix_regex,
+        "fix_commits": len(fix_ids),
+        "blamed_lines": sum(int(item.get("lines", 0) or 0) for item in attributions),
+        "attributions": attributions,
+        "commit_attributions": {fix_id: selected[fix_id] for fix_id in sorted(selected)},
+        "workers": workers,
+        "cached_commits": cached_commits,
+        "blamed_commits": blamed_commits,
+        "timings_ms": {
+            "total": _ms_since(total_start),
+            "blame": _ms_since(blame_start) if blamed_commits else 0.0,
+        },
+        "warnings": warnings[:50],
+    }
+
+
+def szz_attributions_with_status(
+    root: str | Path,
+    commits: Iterable[dict],
+    *,
+    fix_regex: str | None = None,
+    previous: dict | None = None,
+    progress: Callable[[dict], None] | None = None,
+) -> dict:
+    """Return SZZ-style fix-to-introducer blame attributions.
+
+    Failures are reported as ``partial``/``unavailable`` instead of raised so
+    index jobs do not fail solely because optional VCS analytics degraded.
+    """
+
+    total_start = time.perf_counter()
+    workers, worker_warning = _szz_worker_config()
+    fix_regex_value = fix_regex or DEFAULT_FIX_REGEX
+    if _staleness_disabled():
+        return {
+            **_szz_empty_payload(
+                status="unavailable",
+                warning="git disabled by ENGRAM_GIT_STALENESS=0",
+                fix_regex=fix_regex_value,
+                workers=workers,
+            ),
+            "timings_ms": {"total": _ms_since(total_start), "blame": 0.0},
+        }
+    try:
+        path = Path(root).resolve()
+    except OSError as exc:
+        return {
+            **_szz_empty_payload(
+                status="unavailable",
+                warning=str(exc),
+                fix_regex=fix_regex_value,
+                workers=workers,
+            ),
+            "timings_ms": {"total": _ms_since(total_start), "blame": 0.0},
+        }
+    try:
+        fix_rx = re.compile(fix_regex_value)
+    except re.error as exc:
+        return {
+            **_szz_empty_payload(
+                status="unavailable",
+                warning=f"invalid fix regex: {exc}",
+                fix_regex=fix_regex_value,
+                workers=workers,
+            ),
+            "timings_ms": {"total": _ms_since(total_start), "blame": 0.0},
+        }
+
+    fix_commits = _fix_commits_for_szz(commits, fix_rx)
+    cache = _szz_cache_from_previous(previous)
+    fix_ids = {str(commit.get("commit") or "") for commit in fix_commits}
+    cached = {fix_id: payload for fix_id, payload in cache.items() if fix_id in fix_ids}
+    to_blame = [commit for commit in fix_commits if str(commit.get("commit") or "") not in cached]
+    cached_commits = len(cached)
+    blamed_commits = 0
+    blame_start = time.perf_counter()
+
+    def emit_progress() -> None:
+        if progress is None:
+            return
+        progress(
+            _combine_szz_commit_cache(
+                fix_commits=fix_commits,
+                cache=cached,
+                fix_regex=fix_regex_value,
+                workers=workers,
+                cached_commits=cached_commits,
+                blamed_commits=blamed_commits,
+                worker_warning=worker_warning,
+                total_start=total_start,
+                blame_start=blame_start,
+                complete=False,
+            )
+        )
+
+    if workers <= 1:
+        for commit in to_blame:
+            fix_id = str(commit.get("commit") or "")
+            try:
+                cached[fix_id] = _szz_attributions_for_fix_commit(path, commit)
+            except Exception as exc:
+                cached[fix_id] = _failed_szz_commit_payload(
+                    fix_id,
+                    f"szz unavailable for {fix_id[:12]}: {exc}",
+                )
+            blamed_commits += 1
+            emit_progress()
+    elif to_blame:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="engram-szz") as pool:
+            futures = {
+                pool.submit(_szz_attributions_for_fix_commit, path, commit): str(
+                    commit.get("commit") or ""
+                )
+                for commit in to_blame
+            }
+            for future in as_completed(futures):
+                fix_id = futures[future]
+                try:
+                    cached[fix_id] = future.result()
+                except Exception as exc:
+                    cached[fix_id] = _failed_szz_commit_payload(
+                        fix_id,
+                        f"szz unavailable for {fix_id[:12]}: {exc}",
+                    )
+                blamed_commits += 1
+                emit_progress()
+
+    return _combine_szz_commit_cache(
+        fix_commits=fix_commits,
+        cache=cached,
+        fix_regex=fix_regex_value,
+        workers=workers,
+        cached_commits=cached_commits,
+        blamed_commits=blamed_commits,
+        worker_warning=worker_warning,
+        total_start=total_start,
+        blame_start=blame_start,
+        complete=True,
+    )
+
+
 def commit_log_with_status(
     root: str | Path,
-    max_commits: int = 1000,
+    max_commits: int | None = None,
     rev_range: str | None = None,
 ) -> dict:
     """Return a compact parsed git history or an unavailable status.
@@ -239,7 +768,7 @@ def commit_log_with_status(
         path = Path(root).resolve()
     except OSError as exc:
         return {"status": "unavailable", "warning": str(exc), "commits": []}
-    max_commits = max(1, min(int(max_commits), 100_000))
+    max_commits = _coerce_max_commits(max_commits)
     if not (_git(path, "rev-parse", "--is-inside-work-tree") or "").strip():
         return {"status": "unavailable", "warning": "not a git worktree", "commits": []}
     fmt = f"{_LOG_RECORD_SEP}%H{_LOG_FIELD_SEP}%P{_LOG_FIELD_SEP}%ct{_LOG_FIELD_SEP}%an{_LOG_FIELD_SEP}%s"
@@ -251,9 +780,9 @@ def commit_log_with_status(
         "--raw",
         "--numstat",
         f"--format={fmt}",
-        "-n",
-        str(max_commits),
     ]
+    if max_commits is not None:
+        args.extend(["-n", str(max_commits)])
     if rev_range:
         args.append(rev_range)
     args.append("--")
@@ -263,7 +792,7 @@ def commit_log_with_status(
     return {"status": "ready", "warning": "", "commits": _parse_log_output(out)}
 
 
-def commit_log(root: str | Path, max_commits: int = 1000) -> list[dict]:
+def commit_log(root: str | Path, max_commits: int | None = None) -> list[dict]:
     """Walk ``git log`` and return compact commit/file statistics.
 
     Failures return an empty list; callers that need to distinguish empty
@@ -295,19 +824,21 @@ def is_ancestor(root: str | Path, ancestor: str, descendant: str) -> bool:
 def history_for_catalog(
     root: str | Path,
     *,
-    max_commits: int = 1000,
+    max_commits: int | None = None,
     previous: dict | None = None,
     head: str | None = None,
+    fix_regex: str | None = None,
 ) -> dict:
-    """Build/update the raw git-history block stored inside a catalog sidecar."""
+    """Build/update the cheap raw git-history block stored in the catalog."""
 
-    max_commits = max(1, min(int(max_commits), 100_000))
+    max_commits = _coerce_max_commits(max_commits)
     current_head = head or head_commit(root)
     base = {
         "schema_version": 1,
         "status": "unavailable",
         "max_commits": max_commits,
         "head_commit": current_head or "",
+        "fix_regex": fix_regex or DEFAULT_FIX_REGEX,
         "commits": [],
     }
     if not current_head:
@@ -318,14 +849,15 @@ def history_for_catalog(
     if isinstance(previous, dict) and previous.get("status") == "ready":
         old_head = str(previous.get("head_commit") or "")
         old_commits = [c for c in (previous.get("commits") or []) if isinstance(c, dict)]
+    previous_max = _coerce_max_commits(previous.get("max_commits")) if isinstance(previous, dict) else None
 
-    if old_head and old_head == current_head:
+    if old_head and old_head == current_head and previous_max == max_commits:
         return base | {
             "status": "ready",
-            "commits": old_commits[:max_commits],
+            "commits": _limit_commits(old_commits, max_commits),
         }
 
-    if old_head and is_ancestor(root, old_head, current_head):
+    if old_head and previous_max == max_commits and is_ancestor(root, old_head, current_head):
         delta = commit_log_with_status(root, max_commits=max_commits, rev_range=f"{old_head}..{current_head}")
         if delta.get("status") != "ready":
             return base | {"warning": delta.get("warning") or "git log unavailable"}
@@ -337,7 +869,7 @@ def history_for_catalog(
                 continue
             seen.add(commit)
             commits.append(item)
-            if len(commits) >= max_commits:
+            if max_commits is not None and len(commits) >= max_commits:
                 break
         return base | {
             "status": "ready",
@@ -349,7 +881,7 @@ def history_for_catalog(
         return base | {"warning": full.get("warning") or "git log unavailable"}
     return base | {
         "status": "ready",
-        "commits": list(full.get("commits") or [])[:max_commits],
+        "commits": _limit_commits(list(full.get("commits") or []), max_commits),
     }
 
 

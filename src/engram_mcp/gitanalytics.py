@@ -13,7 +13,8 @@ from statistics import median
 from typing import Iterable
 
 DEFAULT_TICKET_REGEX = r"(?P<ticket>[A-Z][A-Z0-9]+-\d+|#[0-9]+)"
-DEFAULT_FIX_REGEX = r"(?i)\b(fix|bug|hotfix|patch)\b"
+DEFAULT_FIX_REGEX = r"(?i)\b(fix(e[sd])?|bug|hotfix|patch|close[sd]?\s+#\d+)\b"
+_COMMENTISH_PREFIXES = ("#", "//", "/*", "*", "*/", "--", "<!--")
 
 
 def _norm_path(value: str | None) -> str:
@@ -21,6 +22,43 @@ def _norm_path(value: str | None) -> str:
     while text.startswith("./"):
         text = text[2:]
     return text.strip("/")
+
+
+def indentation_complexity(
+    text: str | None,
+    *,
+    tab_width: int = 4,
+    max_chars: int = 1_000_000,
+) -> float:
+    """Return Hindle-style indentation complexity for one text file.
+
+    The metric is the sum of leading indentation depth over non-blank,
+    non-comment-ish logical lines. One depth unit is ``tab_width`` columns;
+    tabs advance to the next tab stop.
+    """
+
+    if not text or "\x00" in text or len(text) > max_chars:
+        return 0.0
+    tab_width = max(1, int(tab_width or 4))
+    total = 0.0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if line.lstrip().startswith(_COMMENTISH_PREFIXES):
+            continue
+        columns = 0
+        for ch in line:
+            if ch == " ":
+                columns += 1
+            elif ch == "\t":
+                columns += tab_width - (columns % tab_width)
+            elif ch in "\r\f\v":
+                columns += 1
+            else:
+                break
+        total += columns / tab_width
+    return round(total, 3)
 
 
 def _is_merge(commit: dict) -> bool:
@@ -320,7 +358,7 @@ def churn(
     recent_days: int = 90,
     fix_regex: str | None = DEFAULT_FIX_REGEX,
 ) -> dict[str, dict]:
-    """Compute per-file churn/recency/author counts."""
+    """Compute per-file churn/recency/fix-density counts."""
 
     changes = [c for c in change_sets if isinstance(c, dict)]
     if now_ts is None:
@@ -329,7 +367,6 @@ def churn(
     fix_rx = re.compile(fix_regex or DEFAULT_FIX_REGEX)
 
     stats: dict[str, dict] = {}
-    authors: dict[str, set[str]] = defaultdict(set)
     fix_hits: Counter[str] = Counter()
     for change in changes:
         files = sorted({_norm_path(path) for path in (change.get("files") or []) if _norm_path(path)})
@@ -344,7 +381,6 @@ def churn(
             messages = [str(change.get("message") or "")]
         is_fix = any(fix_rx.search(message) for message in messages)
         churn_by_path: Counter[str] = Counter()
-        authors_by_path: dict[str, set[str]] = defaultdict(set)
         for entry in change.get("paths") or []:
             if not isinstance(entry, dict):
                 continue
@@ -352,9 +388,6 @@ def churn(
             if not path:
                 continue
             churn_by_path[path] += int(entry.get("added", 0) or 0) + int(entry.get("deleted", 0) or 0)
-            author = str(entry.get("author") or "")
-            if author:
-                authors_by_path[path].add(author)
         for path in files:
             row = stats.setdefault(
                 path,
@@ -363,7 +396,6 @@ def churn(
                     "churn_lines": 0,
                     "last_touched_ts": 0,
                     "recent_changes": 0,
-                    "authors_count": 0,
                     "fix_density": 0.0,
                 },
             )
@@ -372,14 +404,9 @@ def churn(
             row["last_touched_ts"] = max(int(row["last_touched_ts"]), ts)
             if ts >= recent_cutoff:
                 row["recent_changes"] += 1
-            if authors_by_path.get(path):
-                authors[path].update(authors_by_path[path])
-            else:
-                authors[path].update(str(a) for a in (change.get("authors") or []) if str(a))
             if is_fix:
                 fix_hits[path] += 1
     for path, row in stats.items():
-        row["authors_count"] = len(authors.get(path, set()))
         changes = max(1, int(row["changes"]))
         row["fix_density"] = round(fix_hits[path] / changes, 6)
     return dict(sorted(stats.items()))
@@ -398,31 +425,82 @@ def _complexity_for(file_row: dict) -> dict:
             symbols_count = 0
     else:
         symbols_count = len(file_row.get("symbols") or [])
+    raw_indent = file_row.get("indent_complexity")
+    try:
+        indent_complexity = max(0.0, float(raw_indent))
+    except (TypeError, ValueError):
+        indent_complexity = 0.0
+    fallback_complexity = float(chunks + symbols_count)
+    complexity = indent_complexity if raw_indent is not None else fallback_complexity
     return {
         "path": path,
         "chunks": chunks,
         "symbols_count": symbols_count,
-        "complexity": chunks + symbols_count,
+        "indent_complexity": indent_complexity,
+        "complexity": complexity,
     }
 
 
-def _median_positive(values: Iterable[int]) -> float:
-    positives = [int(value) for value in values if int(value) > 0]
+def _median_positive(values: Iterable[float]) -> float:
+    positives = [float(value) for value in values if float(value) > 0]
     return float(median(positives)) if positives else 0.0
+
+
+def defect_introductions(attributions: Iterable[dict]) -> dict[str, dict]:
+    """Summarize SZZ blame attributions by file.
+
+    Each attribution is expected to name the later fix commit, the blamed
+    introducing commit, the file path in the parent, and an optional line count.
+    """
+
+    by_file: dict[str, dict] = {}
+    introducing: dict[str, set[str]] = defaultdict(set)
+    fixes: dict[str, set[str]] = defaultdict(set)
+    for item in attributions:
+        if not isinstance(item, dict):
+            continue
+        path = _norm_path(item.get("path"))
+        fix_commit = str(item.get("fix_commit") or "")
+        introducing_commit = str(item.get("introducing_commit") or "")
+        if not path or not fix_commit or not introducing_commit:
+            continue
+        try:
+            lines = max(1, int(item.get("lines", 1) or 1))
+        except (TypeError, ValueError):
+            lines = 1
+        row = by_file.setdefault(
+            path,
+            {
+                "defect_introducing_lines": 0,
+                "defect_introducing_commits": 0,
+                "fix_commits_with_szz": 0,
+                "introducing_commits": [],
+            },
+        )
+        row["defect_introducing_lines"] += lines
+        introducing[path].add(introducing_commit)
+        fixes[path].add(fix_commit)
+    for path, row in by_file.items():
+        row["introducing_commits"] = sorted(introducing[path])
+        row["defect_introducing_commits"] = len(introducing[path])
+        row["fix_commits_with_szz"] = len(fixes[path])
+    return dict(sorted(by_file.items()))
 
 
 def hotspots(
     churn_by_file: dict[str, dict],
     catalog_files: Iterable[dict],
     limit: int = 25,
+    defect_by_file: dict[str, dict] | None = None,
 ) -> dict:
-    """Combine churn and catalog complexity proxy into hotspot quadrants."""
+    """Combine churn, indentation complexity, and SZZ defect signals."""
 
     complexity = {
         item["path"]: item
         for item in (_complexity_for(file_row) for file_row in catalog_files)
         if item["path"]
     }
+    defect_by_file = defect_by_file or {}
     change_threshold = _median_positive(
         int((churn_by_file.get(path) or {}).get("changes", 0) or 0)
         for path in set(complexity) | set(churn_by_file)
@@ -430,11 +508,12 @@ def hotspots(
     complexity_threshold = _median_positive(item["complexity"] for item in complexity.values())
     per_file: dict[str, dict] = {}
     ranked: list[dict] = []
-    for path in sorted(set(complexity) | set(churn_by_file)):
+    for path in sorted(set(complexity) | set(churn_by_file) | set(defect_by_file)):
         churn_row = churn_by_file.get(path) or {}
         comp = complexity.get(path) or {"chunks": 0, "symbols_count": 0, "complexity": 0}
+        defect = defect_by_file.get(path) or {}
         changes = int(churn_row.get("changes", 0) or 0)
-        complexity_score = int(comp.get("complexity", 0) or 0)
+        complexity_score = float(comp.get("complexity", 0.0) or 0.0)
         high_churn = bool(change_threshold and changes >= change_threshold)
         high_complexity = bool(complexity_threshold and complexity_score >= complexity_threshold)
         quadrant = (
@@ -442,16 +521,22 @@ def hotspots(
             + "_"
             + ("high_complexity" if high_complexity else "low_complexity")
         )
+        defect_commits = int(defect.get("defect_introducing_commits", 0) or 0)
+        defect_lines = int(defect.get("defect_introducing_lines", 0) or 0)
+        defect_hotspot_score = defect_commits * max(1, changes) + defect_lines
         item = {
             "path": path,
             "changes": changes,
             "churn_lines": int(churn_row.get("churn_lines", 0) or 0),
             "recent_changes": int(churn_row.get("recent_changes", 0) or 0),
             "last_touched_ts": int(churn_row.get("last_touched_ts", 0) or 0),
-            "authors_count": int(churn_row.get("authors_count", 0) or 0),
             "fix_density": float(churn_row.get("fix_density", 0.0) or 0.0),
+            "defect_introducing_commits": defect_commits,
+            "defect_introducing_lines": defect_lines,
+            "defect_hotspot_score": defect_hotspot_score,
             "chunks": int(comp.get("chunks", 0) or 0),
             "symbols_count": int(comp.get("symbols_count", 0) or 0),
+            "indent_complexity": float(comp.get("indent_complexity", 0.0) or 0.0),
             "complexity": complexity_score,
             "hotspot_quadrant": quadrant,
             "hotspot_score": changes * max(1, complexity_score),
@@ -459,15 +544,20 @@ def hotspots(
         per_file[path] = {
             "hotspot_quadrant": quadrant,
             "complexity": complexity_score,
+            "indent_complexity": item["indent_complexity"],
             "symbols_count": item["symbols_count"],
             "chunks": item["chunks"],
+            "defect_introducing_commits": defect_commits,
+            "defect_introducing_lines": defect_lines,
+            "defect_hotspot_score": defect_hotspot_score,
         }
-        if changes > 0:
+        if changes > 0 or defect_hotspot_score > 0:
             ranked.append(item)
     ranked.sort(
         key=lambda item: (
             item["hotspot_quadrant"] != "high_churn_high_complexity",
             -item["hotspot_score"],
+            -item["defect_hotspot_score"],
             -item["changes"],
             -item["churn_lines"],
             item["path"],

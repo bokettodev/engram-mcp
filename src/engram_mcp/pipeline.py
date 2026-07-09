@@ -15,6 +15,8 @@ import re
 import shutil
 import time
 import multiprocessing as mp
+import threading
+from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -348,10 +350,13 @@ def _ms_since(start: float) -> float:
 def _unavailable_git_analytics(
     *,
     group_by: str,
-    source_key: str,
+    source_counts: dict | None = None,
     log_ms: float,
     total_start: float,
     warning: str | None = None,
+    cache_head: str = "",
+    current_head: str = "",
+    freshened_commits: int = 0,
 ) -> dict:
     warnings = [warning] if warning else []
     return {
@@ -360,7 +365,10 @@ def _unavailable_git_analytics(
         "group_by": group_by,
         "analyzed_changes": 0,
         "skipped_changes": 0,
-        source_key: 0,
+        "cache_head": cache_head,
+        "current_head": current_head,
+        "freshened_commits": freshened_commits,
+        **(source_counts or {}),
         "timings_ms": {
             "log": log_ms,
             "group": 0.0,
@@ -369,7 +377,397 @@ def _unavailable_git_analytics(
             "total": _ms_since(total_start),
         },
         "warnings": warnings,
+        "szz": _szz_summary(_unavailable_szz_payload(None, warning or "git unavailable")),
         "hotspots": [],
+    }
+
+
+def _coerce_git_max_commits(value: int | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return min(parsed, 1_000_000)
+
+
+def _limit_commits(commits: list[dict], max_commits: int | None) -> list[dict]:
+    limit = _coerce_git_max_commits(max_commits)
+    if limit is None:
+        return list(commits)
+    return list(commits)[:limit]
+
+
+_SZZ_TASKS: set[threading.Thread] = set()
+_SZZ_TASKS_LOCK = threading.Lock()
+_SZZ_DEFECT_KEYS = {
+    "defect_introducing_commits",
+    "defect_introducing_lines",
+    "defect_hotspot_score",
+}
+
+
+def _fix_commit_count(commits: list[dict], fix_regex: str) -> int:
+    try:
+        fix_rx = re.compile(fix_regex or gitmeta.DEFAULT_FIX_REGEX)
+    except re.error:
+        fix_rx = re.compile(gitmeta.DEFAULT_FIX_REGEX)
+    total = 0
+    seen: set[str] = set()
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        commit_id = str(commit.get("commit") or "")
+        if not commit_id or commit_id in seen:
+            continue
+        parents = [str(parent) for parent in (commit.get("parents") or []) if str(parent)]
+        if len(parents) != 1:
+            continue
+        if not fix_rx.search(str(commit.get("message") or "")):
+            continue
+        seen.add(commit_id)
+        total += 1
+    return total
+
+
+def _legacy_szz_from_history(history: dict | None) -> dict | None:
+    if not isinstance(history, dict):
+        return None
+    szz = history.get("szz")
+    return szz if isinstance(szz, dict) else None
+
+
+def _szz_sidecar_matches(sidecar: dict, *, history: dict, fix_regex: str) -> bool:
+    if str(sidecar.get("head_commit") or "") != str(history.get("head_commit") or ""):
+        return False
+    if _coerce_git_max_commits(sidecar.get("max_commits")) != _coerce_git_max_commits(
+        history.get("max_commits")
+    ):
+        return False
+    return str(sidecar.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX) == fix_regex
+
+
+def _wrap_szz_sidecar(
+    *,
+    root: Path,
+    generation: int,
+    history: dict,
+    szz: dict,
+) -> dict:
+    payload = dict(szz)
+    payload.update(
+        {
+            "schema_version": catalog.SCHEMA_VERSION,
+            "generation": int(generation),
+            "root_path": str(root),
+            "head_commit": str(history.get("head_commit") or ""),
+            "max_commits": _coerce_git_max_commits(history.get("max_commits")),
+            "fix_regex": str(payload.get("fix_regex") or history.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX),
+        }
+    )
+    return payload
+
+
+def _write_szz_sidecar_if_current(
+    *,
+    pdir: Path,
+    generation: int,
+    expected_history: dict,
+    payload: dict,
+) -> bool:
+    current = catalog.load_catalog(pdir, generation)
+    history = current.get("git_history") if isinstance(current, dict) else None
+    if not isinstance(history, dict) or history.get("status") != "ready":
+        return False
+    fix_regex = str(expected_history.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX)
+    expected = _wrap_szz_sidecar(
+        root=Path(str(current.get("root_path") or "")),
+        generation=generation,
+        history=expected_history,
+        szz=payload,
+    )
+    if not _szz_sidecar_matches(expected, history=history, fix_regex=fix_regex):
+        return False
+    catalog.save_szz(pdir, expected)
+    return True
+
+
+def _computing_szz_payload(history: dict, previous_szz: dict | None) -> dict:
+    base = dict(previous_szz) if isinstance(previous_szz, dict) else {}
+    warnings = [str(w) for w in (base.get("warnings") or []) if str(w)]
+    return {
+        **base,
+        "status": "computing",
+        "warning": "",
+        "fix_regex": str(history.get("fix_regex") or base.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX),
+        "fix_commits": int(base.get("fix_commits", 0) or 0),
+        "blamed_lines": int(base.get("blamed_lines", 0) or 0),
+        "attributions": list(base.get("attributions") or []),
+        "commit_attributions": dict(base.get("commit_attributions") or {}),
+        "workers": gitmeta.szz_worker_count(),
+        "cached_commits": int(base.get("cached_commits", 0) or 0),
+        "blamed_commits": 0,
+        "timings_ms": {"total": 0.0, "blame": 0.0},
+        "warnings": warnings[:50],
+    }
+
+
+def _unavailable_szz_payload(history: dict | None, warning: str) -> dict:
+    return {
+        "status": "unavailable",
+        "warning": warning,
+        "fix_regex": str((history or {}).get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX),
+        "fix_commits": 0,
+        "blamed_lines": 0,
+        "attributions": [],
+        "commit_attributions": {},
+        "workers": gitmeta.szz_worker_count(),
+        "cached_commits": 0,
+        "blamed_commits": 0,
+        "timings_ms": {"total": 0.0, "blame": 0.0},
+        "warnings": [warning] if warning else [],
+    }
+
+
+def _szz_summary(szz: dict, *, commits: list[dict] | None = None) -> dict:
+    fix_regex = str(szz.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX)
+    fix_commits = int(szz.get("fix_commits", 0) or 0)
+    if not fix_commits and commits:
+        fix_commits = _fix_commit_count(commits, fix_regex)
+    attributions = szz.get("attributions") or []
+    return {
+        "status": str(szz.get("status") or "unavailable"),
+        "workers": int(szz.get("workers", gitmeta.szz_worker_count()) or gitmeta.szz_worker_count()),
+        "cached_commits": int(szz.get("cached_commits", 0) or 0),
+        "blamed_commits": int(szz.get("blamed_commits", 0) or 0),
+        "fix_commits": fix_commits,
+        "blamed_lines": int(szz.get("blamed_lines", 0) or 0),
+        "attributions": len(attributions),
+        "timings_ms": dict(szz.get("timings_ms") or {}),
+        "warnings": list(szz.get("warnings") or []),
+    }
+
+
+def _szz_for_source(
+    *,
+    pdir: Path,
+    generation: int,
+    source: dict,
+    history: dict | None,
+    commits: list[dict],
+) -> dict:
+    fix_regex = str(
+        source.get("fix_regex")
+        or (history or {}).get("fix_regex")
+        or gitmeta.DEFAULT_FIX_REGEX
+    )
+    expected_history = {
+        "status": "ready",
+        "head_commit": str(source.get("current_head") or source.get("cache_head") or ""),
+        "max_commits": source.get("max_commits"),
+        "fix_regex": fix_regex,
+    }
+    sidecar = catalog.load_szz(pdir, generation)
+    if isinstance(sidecar, dict) and _szz_sidecar_matches(
+        sidecar,
+        history=expected_history,
+        fix_regex=fix_regex,
+    ):
+        return sidecar
+    legacy = _legacy_szz_from_history(history)
+    if isinstance(legacy, dict) and str(source.get("status") or "") == "ready":
+        return legacy
+    if str(source.get("status") or "") == "unavailable":
+        return _unavailable_szz_payload(history, str(source.get("warning") or "git unavailable"))
+    return {
+        "status": "computing",
+        "warning": "",
+        "fix_regex": fix_regex,
+        "fix_commits": _fix_commit_count(commits, fix_regex),
+        "blamed_lines": 0,
+        "attributions": [],
+        "commit_attributions": {},
+        "workers": gitmeta.szz_worker_count(),
+        "cached_commits": 0,
+        "blamed_commits": 0,
+        "timings_ms": {"total": 0.0, "blame": 0.0},
+        "warnings": [],
+    }
+
+
+def _strip_defect_signal(hotspot_result: dict) -> dict:
+    files = hotspot_result.get("files")
+    if isinstance(files, dict):
+        for row in files.values():
+            if isinstance(row, dict):
+                for key in _SZZ_DEFECT_KEYS:
+                    row.pop(key, None)
+    for item in hotspot_result.get("hotspots") or []:
+        if isinstance(item, dict):
+            for key in _SZZ_DEFECT_KEYS:
+                item.pop(key, None)
+    return hotspot_result
+
+
+def _run_szz_sidecar_task(
+    *,
+    root: Path,
+    pdir: Path,
+    generation: int,
+    history: dict,
+    previous_szz: dict | None,
+) -> None:
+    commits = [c for c in (history.get("commits") or []) if isinstance(c, dict)]
+    fix_regex = str(history.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX)
+
+    def write_progress(payload: dict) -> None:
+        _write_szz_sidecar_if_current(
+            pdir=pdir,
+            generation=generation,
+            expected_history=history,
+            payload=payload,
+        )
+
+    try:
+        szz = gitmeta.szz_attributions_with_status(
+            root,
+            commits,
+            fix_regex=fix_regex,
+            previous=previous_szz,
+            progress=write_progress,
+        )
+    except Exception as exc:
+        szz = _unavailable_szz_payload(history, f"szz unavailable: {exc}")
+    _write_szz_sidecar_if_current(
+        pdir=pdir,
+        generation=generation,
+        expected_history=history,
+        payload=szz,
+    )
+
+
+def _schedule_szz_sidecar(
+    *,
+    root: Path,
+    pdir: Path,
+    generation: int,
+    git_history: dict | None,
+    previous_szz: dict | None,
+) -> None:
+    if not isinstance(git_history, dict) or git_history.get("status") != "ready":
+        return
+    if not git_history.get("head_commit"):
+        return
+    computing = _computing_szz_payload(git_history, previous_szz)
+    computing["fix_commits"] = _fix_commit_count(
+        [c for c in (git_history.get("commits") or []) if isinstance(c, dict)],
+        str(computing.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX),
+    )
+    _write_szz_sidecar_if_current(
+        pdir=pdir,
+        generation=generation,
+        expected_history=git_history,
+        payload=computing,
+    )
+
+    def runner() -> None:
+        thread = threading.current_thread()
+        try:
+            _run_szz_sidecar_task(
+                root=root,
+                pdir=pdir,
+                generation=generation,
+                history=git_history,
+                previous_szz=previous_szz,
+            )
+        finally:
+            with _SZZ_TASKS_LOCK:
+                _SZZ_TASKS.discard(thread)
+
+    thread = threading.Thread(target=runner, name=f"engram-szz-g{generation}", daemon=True)
+    with _SZZ_TASKS_LOCK:
+        _SZZ_TASKS.add(thread)
+    thread.start()
+
+
+def wait_for_szz_tasks(timeout: float | None = None) -> None:
+    """Wait for currently scheduled background SZZ tasks.
+
+    Used by tests and measurement scripts; normal indexing does not call this.
+    """
+
+    deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+    while True:
+        with _SZZ_TASKS_LOCK:
+            tasks = [task for task in _SZZ_TASKS if task.is_alive()]
+        if not tasks:
+            return
+        for task in tasks:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if remaining is not None and remaining <= 0:
+                return
+            task.join(remaining)
+
+
+def _merge_commit_lists(newer: list[dict], older: list[dict], max_commits: int | None) -> list[dict]:
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for item in list(newer) + list(older):
+        if not isinstance(item, dict):
+            continue
+        commit = str(item.get("commit") or "")
+        if not commit or commit in seen:
+            continue
+        seen.add(commit)
+        merged.append(item)
+        if max_commits is not None and len(merged) >= max_commits:
+            break
+    return merged
+
+
+def _merge_szz_payloads(old_szz: dict | None, new_szz: dict | None) -> dict:
+    old_szz = old_szz if isinstance(old_szz, dict) else {}
+    new_szz = new_szz if isinstance(new_szz, dict) else {}
+    counts: Counter[tuple[str, str, str]] = Counter()
+    for payload in (new_szz, old_szz):
+        for item in payload.get("attributions") or []:
+            if not isinstance(item, dict):
+                continue
+            fix_commit = str(item.get("fix_commit") or "")
+            introducing_commit = str(item.get("introducing_commit") or "")
+            path = str(item.get("path") or "").replace("\\", "/")
+            if not fix_commit or not introducing_commit or not path:
+                continue
+            try:
+                lines = max(1, int(item.get("lines", 1) or 1))
+            except (TypeError, ValueError):
+                lines = 1
+            counts[(fix_commit, introducing_commit, path)] += lines
+    attributions = [
+        {
+            "fix_commit": fix_commit,
+            "introducing_commit": introducing_commit,
+            "path": path,
+            "lines": lines,
+        }
+        for (fix_commit, introducing_commit, path), lines in sorted(counts.items())
+    ]
+    warnings = list(new_szz.get("warnings") or []) + list(old_szz.get("warnings") or [])
+    statuses = {str(old_szz.get("status") or ""), str(new_szz.get("status") or "")}
+    status = "partial" if "partial" in statuses else "ready"
+    if not old_szz and not new_szz:
+        status = "unavailable"
+    return {
+        "status": status,
+        "warning": "; ".join(str(w) for w in warnings[:5]),
+        "fix_regex": new_szz.get("fix_regex") or old_szz.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX,
+        "fix_commits": len({item["fix_commit"] for item in attributions}),
+        "blamed_lines": sum(int(item.get("lines", 0) or 0) for item in attributions),
+        "attributions": attributions,
+        "warnings": [str(w) for w in warnings[:50]],
     }
 
 
@@ -377,20 +775,127 @@ def _analytics_source(
     root: Path,
     data: dict,
     *,
-    git_max_commits: int,
-) -> tuple[list[dict], str, str | None, float]:
+    git_max_commits: int | None,
+) -> dict:
     t0 = time.perf_counter()
+    max_commits = _coerce_git_max_commits(git_max_commits)
     history = data.get("git_history")
-    if isinstance(history, dict):
-        if history.get("status") == "ready":
-            commits = [c for c in (history.get("commits") or []) if isinstance(c, dict)]
-            return commits, "cached_commits", None, _ms_since(t0)
-        warning = str(history.get("warning") or "cached git history unavailable")
-        return [], "cached_commits", warning, _ms_since(t0)
-    status = gitmeta.commit_log_with_status(root, max_commits=git_max_commits)
+    cached_window = (
+        _coerce_git_max_commits(history.get("max_commits")) if isinstance(history, dict) else None
+    )
+    cached_ready_raw = isinstance(history, dict) and history.get("status") == "ready"
+    cached_ready = cached_ready_raw and cached_window == max_commits
+    cached_commits = [c for c in ((history or {}).get("commits") or []) if isinstance(c, dict)]
+    cache_head = str((history or {}).get("head_commit") or "") if isinstance(history, dict) else ""
+    current_head = gitmeta.head_commit(root)
+    base = {
+        "commits": [],
+        "status": "unavailable",
+        "warning": "",
+        "cache_head": cache_head,
+        "current_head": current_head,
+        "max_commits": max_commits,
+        "fix_regex": str((history or {}).get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX),
+        "freshened_commits": 0,
+        "source_counts": {
+            "cached_commits": len(cached_commits) if isinstance(history, dict) else 0,
+            "scanned_commits": 0,
+        },
+        "log_ms": 0.0,
+    }
+    if not current_head:
+        base["warning"] = (
+            str(history.get("warning") or "git head unavailable")
+            if isinstance(history, dict)
+            else "git head unavailable"
+        )
+        base["log_ms"] = _ms_since(t0)
+        return base
+
+    if cached_ready:
+        if cache_head == current_head:
+            base.update(
+                {
+                    "commits": _limit_commits(cached_commits, max_commits),
+                    "status": "ready",
+                    "warning": "",
+                    "source_counts": {"cached_commits": len(cached_commits)},
+                    "log_ms": _ms_since(t0),
+                }
+            )
+            return base
+        if cache_head and gitmeta.is_ancestor(root, cache_head, current_head):
+            delta = gitmeta.commit_log_with_status(
+                root,
+                max_commits=max_commits,
+                rev_range=f"{cache_head}..{current_head}",
+            )
+            if delta.get("status") != "ready":
+                base["warning"] = str(delta.get("warning") or "git log unavailable")
+                base["log_ms"] = _ms_since(t0)
+                return base
+            delta_commits = [c for c in (delta.get("commits") or []) if isinstance(c, dict)]
+            base.update(
+                {
+                    "commits": _merge_commit_lists(delta_commits, cached_commits, max_commits),
+                    "status": "freshened",
+                    "warning": "",
+                    "freshened_commits": len(delta_commits),
+                    "source_counts": {
+                        "cached_commits": len(cached_commits),
+                        "scanned_commits": len(delta_commits),
+                    },
+                    "log_ms": _ms_since(t0),
+                }
+            )
+            return base
+
+        full = gitmeta.commit_log_with_status(root, max_commits=max_commits)
+        if full.get("status") != "ready":
+            base["warning"] = str(full.get("warning") or "git log unavailable")
+            base["log_ms"] = _ms_since(t0)
+            return base
+        commits = [c for c in (full.get("commits") or []) if isinstance(c, dict)]
+        base.update(
+            {
+                "commits": commits,
+                "status": "freshened",
+                "warning": "cached git head is not an ancestor of current HEAD",
+                "freshened_commits": len(commits),
+                "source_counts": {
+                    "cached_commits": len(cached_commits),
+                    "scanned_commits": len(commits),
+                },
+                "log_ms": _ms_since(t0),
+            }
+        )
+        return base
+
+    if isinstance(history, dict) and not cached_ready_raw:
+        base["warning"] = str(history.get("warning") or "cached git history unavailable")
+        base["log_ms"] = _ms_since(t0)
+        return base
+
+    status = gitmeta.commit_log_with_status(root, max_commits=max_commits)
     commits = [c for c in (status.get("commits") or []) if isinstance(c, dict)]
-    warning = None if status.get("status") == "ready" else str(status.get("warning") or "git log unavailable")
-    return commits, "scanned_commits", warning, _ms_since(t0)
+    if status.get("status") != "ready":
+        base["warning"] = str(status.get("warning") or "git log unavailable")
+        base["log_ms"] = _ms_since(t0)
+        return base
+    base.update(
+        {
+            "commits": commits,
+            "status": "uncached",
+            "warning": (
+                "cached git history window differs from requested window"
+                if cached_ready_raw
+                else ""
+            ),
+            "source_counts": {"scanned_commits": len(commits)},
+            "log_ms": _ms_since(t0),
+        }
+    )
+    return base
 
 
 def _file_git_payload(
@@ -399,29 +904,43 @@ def _file_git_payload(
     churn_by_file: dict[str, dict],
     cochanges_by_file: dict[str, list[dict]],
     hotspot_by_file: dict[str, dict],
+    include_defects: bool,
 ) -> dict:
     churn_row = churn_by_file.get(path) or {}
     hotspot = hotspot_by_file.get(path) or {}
-    return {
+    payload = {
         "changes": int(churn_row.get("changes", 0) or 0),
         "churn_lines": int(churn_row.get("churn_lines", 0) or 0),
         "last_touched_ts": int(churn_row.get("last_touched_ts", 0) or 0),
-        "authors_count": int(churn_row.get("authors_count", 0) or 0),
         "fix_density": float(churn_row.get("fix_density", 0.0) or 0.0),
+        "complexity": float(hotspot.get("complexity", 0.0) or 0.0),
+        "indent_complexity": float(hotspot.get("indent_complexity", 0.0) or 0.0),
         "hotspot_quadrant": hotspot.get("hotspot_quadrant") or "low_churn_low_complexity",
         "cochanges": list(cochanges_by_file.get(path) or []),
     }
+    if include_defects:
+        payload.update(
+            {
+                "defect_introducing_commits": int(
+                    hotspot.get("defect_introducing_commits", 0) or 0
+                ),
+                "defect_introducing_lines": int(hotspot.get("defect_introducing_lines", 0) or 0),
+                "defect_hotspot_score": int(hotspot.get("defect_hotspot_score", 0) or 0),
+            }
+        )
+    return payload
 
 
 def _attach_git_analytics(
     out: dict,
     *,
     root: Path,
+    pdir: Path,
     data: dict,
     group_by: str,
     ticket_regex: str | None,
     window_hours: float,
-    git_max_commits: int,
+    git_max_commits: int | None,
     recent_days: int,
     max_files_per_change: int,
     cochange_limit: int,
@@ -429,20 +948,38 @@ def _attach_git_analytics(
 ) -> dict:
     total_start = time.perf_counter()
     warnings: list[str] = []
-    commits, source_key, source_warning, log_ms = _analytics_source(
+    source = _analytics_source(
         root,
         data,
         git_max_commits=git_max_commits,
     )
-    if source_warning:
+    source_warning = str(source.get("warning") or "")
+    if source.get("status") == "unavailable":
         out["git_analytics"] = _unavailable_git_analytics(
             group_by=group_by,
-            source_key=source_key,
-            log_ms=log_ms,
+            source_counts=source.get("source_counts") or {},
+            log_ms=float(source.get("log_ms", 0.0) or 0.0),
             total_start=total_start,
             warning=source_warning,
+            cache_head=str(source.get("cache_head") or ""),
+            current_head=str(source.get("current_head") or ""),
+            freshened_commits=int(source.get("freshened_commits", 0) or 0),
         )
         return out
+    if source_warning:
+        warnings.append(source_warning)
+    commits = [c for c in (source.get("commits") or []) if isinstance(c, dict)]
+    history = data.get("git_history") if isinstance(data.get("git_history"), dict) else None
+    szz = _szz_for_source(
+        pdir=pdir,
+        generation=int(data.get("generation", 0) or 0),
+        source=source,
+        history=history,
+        commits=commits,
+    )
+    szz_status = str(szz.get("status") or "unavailable")
+    szz_ready = szz_status == "ready"
+    fix_regex = str(szz.get("fix_regex") or source.get("fix_regex") or gitmeta.DEFAULT_FIX_REGEX)
 
     t_group = time.perf_counter()
     grouped = gitanalytics.group_changes_result(
@@ -464,12 +1001,19 @@ def _attach_git_analytics(
         change_sets,
         now_ts=int(time.time()),
         recent_days=recent_days,
+        fix_regex=fix_regex,
+    )
+    defect_by_file = (
+        gitanalytics.defect_introductions(szz.get("attributions") or []) if szz_ready else {}
     )
     hotspot_result = gitanalytics.hotspots(
         churn_by_file,
         data.get("files") or [],
         limit=hotspots_limit,
+        defect_by_file=defect_by_file,
     )
+    if not szz_ready:
+        hotspot_result = _strip_defect_signal(hotspot_result)
     churn_ms = _ms_since(t_churn)
     hotspot_by_file = hotspot_result.get("files") or {}
 
@@ -480,17 +1024,22 @@ def _attach_git_analytics(
             churn_by_file=churn_by_file,
             cochanges_by_file=cochanges_by_file,
             hotspot_by_file=hotspot_by_file,
+            include_defects=szz_ready,
         )
 
     out["git_analytics"] = {
         "available": True,
-        "status": "ready",
+        "status": source.get("status") or "ready",
         "group_by": grouped.get("group_by") or group_by,
         "analyzed_changes": len(change_sets),
         "skipped_changes": int(grouped.get("skipped_changes", 0) or 0),
-        source_key: len(commits),
+        "cache_head": str(source.get("cache_head") or ""),
+        "current_head": str(source.get("current_head") or ""),
+        "freshened_commits": int(source.get("freshened_commits", 0) or 0),
+        **(source.get("source_counts") or {}),
+        "szz": _szz_summary(szz, commits=commits),
         "timings_ms": {
-            "log": log_ms,
+            "log": float(source.get("log_ms", 0.0) or 0.0),
             "group": group_ms,
             "cochange": cochange_ms,
             "churn": churn_ms,
@@ -506,8 +1055,7 @@ def project_map(
     root: str | Path,
     depth: int = 2,
     sort: str = "path",
-    limit: int | None = 200,
-    dirs_limit: int | None = None,
+    dirs_limit: int | None = 200,
     dirs_offset: int = 0,
     include_files: bool = False,
     files_limit: int | None = 50,
@@ -523,11 +1071,11 @@ def project_map(
     symbol_kinds: list[str] | None = None,
     min_symbols: int = 0,
     non_empty: bool = True,
-    include_git: bool = False,
+    include_git: bool = True,
     group_by: str = "commit",
     ticket_regex: str | None = None,
     window_hours: float = 2.0,
-    git_max_commits: int = 1000,
+    git_max_commits: int | None = None,
     recent_days: int = 90,
     max_files_per_change: int = 50,
     cochange_limit: int = 5,
@@ -540,7 +1088,6 @@ def project_map(
         data,
         depth=depth,
         sort=sort,
-        limit=limit,
         dirs_limit=dirs_limit,
         dirs_offset=dirs_offset,
         include_files=include_files,
@@ -563,6 +1110,7 @@ def project_map(
     return _attach_git_analytics(
         out,
         root=qi.root,
+        pdir=qi.pdir,
         data=data,
         group_by=group_by,
         ticket_regex=ticket_regex,
@@ -647,9 +1195,10 @@ def _maybe_git_history_for_catalog(
     root: Path,
     *,
     enabled: bool,
-    max_commits: int,
+    max_commits: int | None,
     previous: dict | None = None,
     head: str | None = None,
+    fix_regex: str | None = None,
 ) -> dict | None:
     if not enabled:
         return None
@@ -659,13 +1208,15 @@ def _maybe_git_history_for_catalog(
             max_commits=max_commits,
             previous=previous,
             head=head,
+            fix_regex=fix_regex,
         )
     except Exception as exc:
         return {
             "schema_version": 1,
             "status": "unavailable",
-            "max_commits": max(1, int(max_commits or 1000)),
+            "max_commits": _coerce_git_max_commits(max_commits),
             "head_commit": head or "",
+            "fix_regex": fix_regex or gitmeta.DEFAULT_FIX_REGEX,
             "commits": [],
             "warning": f"git history unavailable: {exc}",
         }
@@ -916,8 +1467,9 @@ def index_project(
     full_rebuild: bool = False,
     batch_size: int = config.EMBED_BATCH_SIZE,
     progress: ProgressSink | None = None,
-    git_analytics: bool = False,
-    git_max_commits: int = 1000,
+    git_analytics: bool = True,
+    git_max_commits: int | None = None,
+    git_fix_regex: str | None = None,
 ) -> IndexStats:
     root = Path(root).resolve()
     pdir = paths.project_dir(root)
@@ -935,6 +1487,7 @@ def index_project(
                 progress,
                 git_analytics=git_analytics,
                 git_max_commits=git_max_commits,
+                git_fix_regex=git_fix_regex,
             )
         return _incremental(
             root,
@@ -945,6 +1498,7 @@ def index_project(
             progress,
             git_analytics=git_analytics,
             git_max_commits=git_max_commits,
+            git_fix_regex=git_fix_regex,
         )
 
 
@@ -957,7 +1511,8 @@ def _full_rebuild(
     progress,
     *,
     git_analytics: bool,
-    git_max_commits: int,
+    git_max_commits: int | None,
+    git_fix_regex: str | None,
 ) -> IndexStats:
     t0 = time.time()
     files_meta: dict[str, dict] = {}
@@ -980,6 +1535,7 @@ def _full_rebuild(
         files_meta[rec.rel_path] = {
             "file_hash": sha256_text(text), "mtime_ns": rec.mtime_ns, "size": rec.size,
             "language": rec.language or "", "chunks": len(cs),
+            "indent_complexity": gitanalytics.indentation_complexity(text),
         }
         _maybe_emit_scanning(
             progress,
@@ -1002,6 +1558,13 @@ def _full_rebuild(
     rows = _rows(chunks, search_texts, hashes, vec_by_hash, file_hash_by_path)
 
     gen = (m.generation + 1) if m else 1
+    previous_szz = None
+    if git_analytics and m is not None:
+        previous_szz = catalog.load_szz(pdir, m.generation)
+        if previous_szz is None:
+            old_catalog = catalog.load_catalog(pdir, m.generation)
+            old_history = old_catalog.get("git_history") if isinstance(old_catalog, dict) else None
+            previous_szz = _legacy_szz_from_history(old_history)
     new_table = f"chunks_g{gen}"
     db_dir = pdir / "lancedb"
     # GC tables left over from prior interrupted runs, but keep the current
@@ -1064,6 +1627,7 @@ def _full_rebuild(
         max_commits=git_max_commits,
         previous=None,
         head=git.get("indexed_commit") or None,
+        fix_regex=git_fix_regex,
     )
     _save_catalog_from_rows(
         pdir=pdir,
@@ -1092,6 +1656,13 @@ def _full_rebuild(
         ),
     )
     manifest.save_files(pdir, files_meta)
+    _schedule_szz_sidecar(
+        root=root,
+        pdir=pdir,
+        generation=gen,
+        git_history=git_history if git_analytics else None,
+        previous_szz=previous_szz,
+    )
     # The previous active table is intentionally retained for in-flight readers;
     # it is GC'd at the start of the next rebuild.
 
@@ -1125,11 +1696,15 @@ def _incremental(
     progress,
     *,
     git_analytics: bool,
-    git_max_commits: int,
+    git_max_commits: int | None,
+    git_fix_regex: str | None,
 ) -> IndexStats:
     t0 = time.time()
     old_catalog = catalog.load_catalog(pdir, m.generation) if git_analytics else None
     old_git_history = old_catalog.get("git_history") if isinstance(old_catalog, dict) else None
+    previous_szz = catalog.load_szz(pdir, m.generation) if git_analytics else None
+    if previous_szz is None:
+        previous_szz = _legacy_szz_from_history(old_git_history)
     old_files = manifest.load_files(pdir)
     new_files: dict[str, dict] = {}
     touched = []
@@ -1141,7 +1716,12 @@ def _incremental(
         scanned += 1
         old = old_files.get(rec.rel_path)
         if old and old.get("size") == rec.size and old.get("mtime_ns") == rec.mtime_ns:
-            new_files[rec.rel_path] = old
+            entry = dict(old)
+            if "indent_complexity" not in entry:
+                text = _read_text(rec.abs_path)
+                if text is not None:
+                    entry["indent_complexity"] = gitanalytics.indentation_complexity(text)
+            new_files[rec.rel_path] = entry
             unchanged += 1
             _maybe_emit_scanning(
                 progress,
@@ -1165,6 +1745,7 @@ def _incremental(
         if old and old.get("file_hash") == fh:
             entry = dict(old)
             entry["mtime_ns"] = rec.mtime_ns
+            entry["indent_complexity"] = gitanalytics.indentation_complexity(text)
             new_files[rec.rel_path] = entry
             unchanged += 1
             _maybe_emit_scanning(
@@ -1193,6 +1774,7 @@ def _incremental(
         new_files[rec.rel_path] = {
             "file_hash": fh, "mtime_ns": rec.mtime_ns, "size": rec.size,
             "language": rec.language or "", "chunks": len(cs),
+            "indent_complexity": gitanalytics.indentation_complexity(text),
         }
     _maybe_emit_scanning(
         progress,
@@ -1313,6 +1895,7 @@ def _incremental(
         max_commits=git_max_commits,
         previous=old_git_history if isinstance(old_git_history, dict) else None,
         head=git.get("indexed_commit") or None,
+        fix_regex=git_fix_regex,
     )
     catalog_rows = _strict_catalog_rows(store)
     _save_catalog_from_rows(
@@ -1334,6 +1917,13 @@ def _incremental(
     for key, value in git.items():
         setattr(m, key, value)
     manifest.save_project(pdir, m)
+    _schedule_szz_sidecar(
+        root=root,
+        pdir=pdir,
+        generation=m.generation,
+        git_history=git_history if git_analytics else None,
+        previous_szz=previous_szz,
+    )
 
     elapsed = time.time() - t0
     _emit_progress(
@@ -1372,6 +1962,11 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
             raise ValueError(f"path escapes project root: {rel_path}")
 
         old_files = manifest.load_files(pdir)
+        old_catalog = catalog.load_catalog(pdir, m.generation)
+        old_git_history = old_catalog.get("git_history") if isinstance(old_catalog, dict) else None
+        previous_szz = catalog.load_szz(pdir, m.generation)
+        if previous_szz is None:
+            previous_szz = _legacy_szz_from_history(old_git_history)
         store = LanceStore(pdir / "lancedb", provider.dim, table=m.active_table)
         _mark_catalog_stale_for_update(
             pdir=pdir,
@@ -1407,6 +2002,7 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
             old_files[rel] = {
                 "file_hash": fh, "mtime_ns": st.st_mtime_ns, "size": st.st_size,
                 "language": lang or "", "chunks": len(chunks),
+                "indent_complexity": gitanalytics.indentation_complexity(text),
             }
             action = "reindexed"
         else:
@@ -1416,6 +2012,19 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
         store.refresh_fts()
         indexed_at = time.time()
         catalog_rows = _strict_catalog_rows(store)
+        git = gitmeta.snapshot(root)
+        git_history = _maybe_git_history_for_catalog(
+            root,
+            enabled=True,
+            max_commits=(old_git_history or {}).get("max_commits") if isinstance(old_git_history, dict) else None,
+            previous=old_git_history if isinstance(old_git_history, dict) else None,
+            head=git.get("indexed_commit") or None,
+            fix_regex=(
+                str(old_git_history.get("fix_regex") or "")
+                if isinstance(old_git_history, dict)
+                else None
+            ),
+        )
         _save_catalog_from_rows(
             pdir=pdir,
             project_id=m.project_id,
@@ -1426,14 +2035,22 @@ def reindex_file(root: str | Path, provider: EmbeddingProvider, rel_path: str) -
             rows=catalog_rows,
             indexed_at=indexed_at,
             store=store,
+            git_history=git_history,
         )
         manifest.save_files(pdir, old_files)
         m.files = len(old_files)
         m.chunks = store.count()
         m.indexed_at = indexed_at
-        for key, value in gitmeta.snapshot(root).items():
+        for key, value in git.items():
             setattr(m, key, value)
         manifest.save_project(pdir, m)
+        _schedule_szz_sidecar(
+            root=root,
+            pdir=pdir,
+            generation=m.generation,
+            git_history=git_history,
+            previous_szz=previous_szz,
+        )
         return {"rel_path": rel, "action": action, "chunks": len(chunks)}
 
 
@@ -1463,7 +2080,6 @@ def _annotate_hits(
     query: str,
     mode_used: str,
     min_relevance: str | None,
-    git_stale: bool = False,
 ) -> tuple[list[dict], dict, dict]:
     files_meta = manifest.load_files(pdir)
     annotated: list[dict] = []
@@ -1484,7 +2100,6 @@ def _annotate_hits(
         stale, reason = _freshness_for_hit(root, files_meta, h)
         h["stale"] = stale
         h["index_stale"] = stale
-        h["git_stale"] = git_stale
         h["freshness_reason"] = reason
         if stale:
             stale_paths.add(h.get("rel_path") or "")
@@ -1779,7 +2394,6 @@ def search_project(
         warnings.append(revision_warning)
     annotated, dirty, tail = _annotate_hits(
         root, qi.pdir, hits[:k], query, mode_used, min_relevance,
-        git_stale=bool(git_status.get("git_stale")),
     )
     catalog_data, catalog_reason = _load_valid_catalog(qi)
     if catalog_data is None:
@@ -1822,7 +2436,6 @@ def search_project(
         "total_matches": total_matches,
         "dirty": dirty,
         "index_stale": dirty["stale"],
-        "git": git_status,
         "source_revision": source_revision,
         **tail,
         "hits": annotated,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from engram_mcp import catalog
 
 
@@ -33,6 +35,7 @@ def _file(
         "dir": catalog._dir_for(path),
         "language": language,
         "chunks": chunks,
+        "indent_complexity": 0.0,
         "chunk_roles": chunk_roles,
         "symbols": symbols,
         "chunk_refs": [],
@@ -127,6 +130,7 @@ def test_project_map_default_dirs_only_and_compact_files() -> None:
         "dir",
         "language",
         "chunks",
+        "indent_complexity",
         "symbols_count",
         "chunk_roles",
         "kinds",
@@ -178,9 +182,8 @@ def test_project_map_independent_dir_and_file_pagination() -> None:
     }
     assert out["has_more"] is True
 
-    legacy = catalog.project_map(data, depth=1, limit=1)
-    assert legacy["dirs_page"]["limit"] == 1
-    assert legacy["dirs_page"]["has_more"] is True
+    with pytest.raises(TypeError):
+        catalog.project_map(data, depth=1, limit=1)
 
 
 def test_project_map_filters_apply_to_files_and_dir_aggregates() -> None:

@@ -18,6 +18,7 @@ from typing import Iterable
 
 SCHEMA_VERSION = 1
 SUPPORTED_FACETS = {"dir", "language", "chunk_role", "kind"}
+SZZ_STATUSES = {"computing", "partial", "ready", "unavailable"}
 
 _CONFIG_NAMES = {
     ".env",
@@ -39,6 +40,10 @@ def catalog_path(pdir: Path, generation: int) -> Path:
     return pdir / f"catalog_g{generation}.json"
 
 
+def szz_path(pdir: Path, generation: int) -> Path:
+    return pdir / f"szz_g{generation}.json"
+
+
 def _atomic_write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -56,6 +61,32 @@ def _atomic_write_json(path: Path, data) -> None:
 
 def save_catalog(pdir: Path, data: dict) -> None:
     _atomic_write_json(catalog_path(pdir, int(data.get("generation", 0))), data)
+
+
+def save_szz(pdir: Path, data: dict) -> None:
+    _atomic_write_json(szz_path(pdir, int(data.get("generation", 0))), data)
+
+
+def load_szz(pdir: Path, generation: int) -> dict | None:
+    f = szz_path(pdir, generation)
+    if not f.is_file():
+        return None
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("schema_version") != SCHEMA_VERSION:
+        return None
+    try:
+        if int(data.get("generation", -1)) != int(generation):
+            return None
+    except (TypeError, ValueError):
+        return None
+    if str(data.get("status") or "") not in SZZ_STATUSES:
+        return None
+    return data
 
 
 def mark_catalog_stale(
@@ -201,6 +232,7 @@ def build_catalog(
             "dir": _dir_for(rel_path),
             "language": lang,
             "chunks": int(meta.get("chunks", 0) or 0),
+            "indent_complexity": float(meta.get("indent_complexity", 0.0) or 0.0),
             "chunk_roles": {},
             "symbols": [],
             "chunk_refs": [],
@@ -218,6 +250,7 @@ def build_catalog(
                 "dir": _dir_for(rel),
                 "language": lang,
                 "chunks": 0,
+                "indent_complexity": 0.0,
                 "chunk_roles": {},
                 "symbols": [],
                 "chunk_refs": [],
@@ -364,6 +397,7 @@ def _compact_file_row(file_row: dict, *, include_symbols: bool, symbols_limit: i
         "dir": file_row.get("dir") or ".",
         "language": file_row.get("language") or "",
         "chunks": int(file_row.get("chunks", 0) or 0),
+        "indent_complexity": float(file_row.get("indent_complexity", 0.0) or 0.0),
         "symbols_count": len(symbols),
         "chunk_roles": dict(sorted((file_row.get("chunk_roles") or {}).items())),
         "kinds": list(file_row.get("kinds") or []),
@@ -432,8 +466,7 @@ def project_map(
     *,
     depth: int = 2,
     sort: str = "path",
-    limit: int | None = 200,
-    dirs_limit: int | None = None,
+    dirs_limit: int | None = 200,
     dirs_offset: int = 0,
     include_files: bool = False,
     files_limit: int | None = 50,
@@ -451,7 +484,7 @@ def project_map(
     non_empty: bool = True,
 ) -> dict:
     depth = max(0, min(int(depth), 20))
-    dirs_limit_value = _coerce_limit(dirs_limit if dirs_limit is not None else limit, default=200)
+    dirs_limit_value = _coerce_limit(dirs_limit, default=200)
     dirs_offset_value = _coerce_offset(dirs_offset)
     files_limit_value = _coerce_limit(files_limit, default=50)
     files_offset_value = _coerce_offset(files_offset)
@@ -558,7 +591,6 @@ def project_map(
         "catalog_schema_version": data.get("schema_version"),
         "depth": depth,
         "sort": sort,
-        "limit": dirs_limit_value,
         "dirs_limit": dirs_limit_value,
         "files_limit": files_limit_value,
         "count": dirs_page["count"],

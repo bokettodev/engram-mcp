@@ -112,6 +112,9 @@ uv run engram chunk    <path> [--show N]                  # walk + chunk only (n
 Incremental indexing reprocesses changed/added/deleted files and reuses cached
 embeddings for unchanged content. `--rebuild` forces a full atomic rebuild (a
 crash mid-rebuild leaves the previous index searchable).
+Git-history analytics are captured by default during indexing. Use
+`--no-git-analytics` for a zero-git catalog, or `--git-max-commits N` to cap
+history capture; omitted means all commits.
 
 For operators, `engram index --json` emits line-delimited JSON as work proceeds:
 progress events use `{"event":"progress","version":1,"seq":N,"stage":"...",
@@ -236,7 +239,7 @@ tool call never blocks for minutes):
 | `search_code(project_path, query, k=8, language=None, mode="auto", rerank=False, content="preview", max_chars_per_result=800, max_total_chars=None, candidate_k=None, facets=None, min_relevance=None)` | compact ranked hits over static indexed source |
 | `get_chunk(project_path, chunk_id, max_chars=None, include_neighbors=False, neighbor_window=1, include_parent=False)` | fetch full content for one search hit, optionally adjacent/parent context |
 | `find_definition(project_path, symbol)` | exact symbol definition lookup, with suggestions on miss (no embedding) |
-| `project_map(project_path, depth=2, sort="path", limit=200, dirs_limit=None, dirs_offset=0, include_files=False, files_limit=50, files_offset=0, include_symbols=False, symbols_limit=20, code_only=False, languages=None, chunk_roles=None, kinds=None, path_prefix=None, path_glob=None, symbol_kinds=None, min_symbols=0, non_empty=True)` | body-free dirs by default; compact file rows are opt-in and paginated; `limit` is the legacy alias for `dirs_limit`; filters compose and report `filtered_totals` |
+| `project_map(project_path, depth=2, sort="path", dirs_limit=200, dirs_offset=0, include_files=False, files_limit=50, files_offset=0, include_symbols=False, symbols_limit=20, code_only=False, languages=None, chunk_roles=None, kinds=None, path_prefix=None, path_glob=None, symbol_kinds=None, min_symbols=0, non_empty=True, include_git=True, group_by="commit", ticket_regex=None, window_hours=2.0, git_max_commits=None, recent_days=90, max_files_per_change=50, cochange_limit=5, hotspots_limit=25)` | body-free dirs by default; compact file rows are opt-in and paginated; filters compose and report `filtered_totals`; VCS analytics are included by default and can be disabled with `include_git=False` |
 | `doctor_project(project_path, check_git=True)` | use before debugging empty/odd results; returns `ok`, `summary`, `git`, and `issues[]` |
 | `grep_index(project_path, pattern, ...)` | bounded Python regex probe; counts/line numbers by default, snippets with `include_lines=true` |
 | `model_status(project_path=None)` | reports whether the project's recorded query model is loaded/loading/not_loaded in this process |
@@ -253,7 +256,7 @@ totals are reported as `null`, not `0`.
 `search_code` is a decision tool first: by default each hit contains `chunk_id`,
 `rel_path`/`span`, `symbol`, `symbol_kind`, `chunk_role`, `preview`, `raw_score`,
 `score_normalized`, `relevance` (`high|medium|low|uncertain`), `matched`,
-`match_reason`, `stale`, and `truncated`. It also returns `mode_requested`,
+`match_reason`, `stale`, `index_stale`, and `truncated`. It also returns `mode_requested`,
 `mode_used`, `warnings[]`, `hints[]`, `map[]`, `total_matches`, optional
 `facets`, `rerank_applied`, `source_type: "static_indexed_source"`, and a
 `dirty` freshness summary. It also includes a top-level `source_revision`
@@ -266,9 +269,10 @@ to `1..50`) and is raised to at least `k` internally. `max_total_chars` caps
 aggregate returned body/excerpt text across results.
 Valid `facets` are `dir`, `language`, `chunk_role`, `kind`; `facets.scope` says
 whether counts are exact FTS, capped lower bound, or vector candidate estimate.
-`min_relevance` filters to `uncertain|low|medium|high` and stricter. `dirty` is
-per-file index freshness; `git.git_stale` is manifest-vs-current repo state and
-does not affect ranking.
+`min_relevance` filters to `uncertain|low|medium|high` and stricter. `dirty`,
+`stale`, and `index_stale` are per-file mtime/size freshness. The top-level
+`source_revision` object is the single git revision signal; search no longer
+returns a top-level `git` object or per-hit `git_stale`.
 
 `total_matches.fts_exact` is an exact LanceDB FTS/BM25 metadata scan when hybrid
 FTS is available and the body-free metadata scan completes under
@@ -297,7 +301,32 @@ the active Lance generation. It powers `project_map`, structural `kind` facets
 (`test`, `config`, `migration`, `doc`, marked inferred), neighborhood lookup,
 and doctor checks without loading a model or copying source bodies.
 `project_map` returns `totals`, `dirs`, and `files`; `depth` is clamped to
-`0..20`, `limit` to `1..1000`, and `sort` to `path|files|chunks|symbols`.
+`0..20`, `dirs_limit`/`files_limit`/`symbols_limit` to `0..1000`, and `sort`
+to `path|files|chunks|symbols`.
+With `include_git=True`, `project_map` attaches `git_analytics` plus per-file
+`git` rows when files are included. `git_analytics.status` is `ready`,
+`freshened`, `uncached`, or `unavailable`; it reports `cache_head`,
+`current_head`, and `freshened_commits`. Cached `git_history` is written only at
+index time. Reads compare the cached head to current `HEAD`, merge any
+`cache_head..HEAD` commits in memory for the response, and do not write the
+sidecar.
+Per-file git rows include churn/change counts, `fix_density`, co-change rules
+ranked by lift, indentation complexity, and hotspot quadrant. Once the
+generation's SZZ sidecar is ready, rows also include SZZ defect signals
+(`defect_introducing_commits`, `defect_introducing_lines`,
+`defect_hotspot_score`); before that, `git_analytics.szz.status` reports
+`computing`, `partial`, or `unavailable` and defect fields are omitted.
+Indentation complexity is the sum of leading
+indentation depth over non-blank, non-comment-ish lines, with one depth unit per
+4 columns and tabs advancing to the next tab stop. SZZ attribution detects fix
+commits with the default regex
+`(?i)\b(fix(e[sd])?|bug|hotfix|patch|close[sd]?\s+#\d+)\b`, diffs each fix
+against its parent, blames removed/changed parent lines with `git blame -w`,
+and caches per-fix-commit attributions in a separate `szz_g<N>.json` sidecar
+written atomically by the indexer after the core generation is already active.
+Blames run through an adaptive bounded thread pool:
+`min(8, max(2, (os.cpu_count() or 2) - 1))`, overrideable with
+`ENGRAM_SZZ_WORKERS`.
 `grep_index` accepts `ignore_case`, `limit`, `offset`, `max_matches`,
 `max_scan_chunks`, and `include_lines`; it is capped by `max_matches`,
 `max_scan_chunks`, and `ENGRAM_GREP_REGEX_TIMEOUT_SEC`.

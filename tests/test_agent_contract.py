@@ -535,7 +535,9 @@ def test_search_response_source_revision_branch_mismatch_top_level(tmp_path, mon
         "reasons": ["indexed_ref", "indexed_commit", "indexed_dirty"],
     }
     assert any("indexed ref 'main'" in w and "feature/x" in w for w in out["warnings"])
-    assert out["results"][0]["git_stale"] is True
+    assert "git" not in out
+    assert "git_stale" not in out["results"][0]
+    assert "stale" in out["results"][0]
     assert "source_revision" not in out["results"][0]
 
 

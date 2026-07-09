@@ -65,7 +65,7 @@ _model_loads_lock = Lock()
 _RESULT_FIELDS = (
     "chunk_id", "rel_path", "start_line", "end_line", "language", "symbol", "symbol_kind",
     "chunk_role", "score", "raw_score", "score_normalized", "relevance", "matched",
-    "match_reason", "stale", "index_stale", "git_stale", "freshness_reason",
+    "match_reason", "stale", "index_stale", "freshness_reason",
 )
 _CONTENT_MODES = {"none", "preview", "full"}
 _DEFAULT_PREVIEW_CHARS = 800
@@ -639,7 +639,7 @@ def _search_hints(outcome: dict, results: list[dict], content: str, max_total_ch
         hints.append("No hits: try mode='hybrid' for exact tokens or find_definition for known symbols.")
     if (outcome.get("dirty") or {}).get("stale"):
         hints.append("Some results are stale: rebuild the index or reindex changed files.")
-    if outcome.get("git", {}).get("git_stale"):
+    if (outcome.get("source_revision") or {}).get("stale"):
         hints.append("Git state differs from the indexed commit/ref; rebuild for current checkout state.")
     if content != "none" and max_total_chars is None and len(results) >= 20:
         hints.append("Large result set: use content='none' or max_total_chars to keep output bounded.")
@@ -779,8 +779,7 @@ def do_project_map(
     project_path: str,
     depth: int = 2,
     sort: str = "path",
-    limit: int | None = 200,
-    dirs_limit: int | None = None,
+    dirs_limit: int | None = 200,
     dirs_offset: int = 0,
     include_files: bool = False,
     files_limit: int | None = 50,
@@ -796,11 +795,11 @@ def do_project_map(
     symbol_kinds: list[str] | None = None,
     min_symbols: int = 0,
     non_empty: bool = True,
-    include_git: bool = False,
+    include_git: bool = True,
     group_by: str = "commit",
     ticket_regex: str | None = None,
     window_hours: float = 2.0,
-    git_max_commits: int = 1000,
+    git_max_commits: int | None = None,
     recent_days: int = 90,
     max_files_per_change: int = 50,
     cochange_limit: int = 5,
@@ -811,7 +810,6 @@ def do_project_map(
             Path(project_path).expanduser().resolve(),
             depth=depth,
             sort=sort,
-            limit=limit,
             dirs_limit=dirs_limit,
             dirs_offset=dirs_offset,
             include_files=include_files,
@@ -1081,8 +1079,7 @@ async def project_map(
     project_path: str,
     depth: int = 2,
     sort: str = "path",
-    limit: int | None = 200,
-    dirs_limit: int | None = None,
+    dirs_limit: int | None = 200,
     dirs_offset: int = 0,
     include_files: bool = False,
     files_limit: int | None = 50,
@@ -1098,11 +1095,11 @@ async def project_map(
     symbol_kinds: list[str] | None = None,
     min_symbols: int = 0,
     non_empty: bool = True,
-    include_git: bool = False,
+    include_git: bool = True,
     group_by: str = "commit",
     ticket_regex: str | None = None,
     window_hours: float = 2.0,
-    git_max_commits: int = 1000,
+    git_max_commits: int | None = None,
     recent_days: int = 90,
     max_files_per_change: int = 50,
     cochange_limit: int = 5,
@@ -1114,7 +1111,6 @@ async def project_map(
         project_path=project_path,
         depth=depth,
         sort=sort,
-        limit=limit,
         dirs_limit=dirs_limit,
         dirs_offset=dirs_offset,
         include_files=include_files,
