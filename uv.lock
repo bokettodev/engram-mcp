@@ -382,10 +382,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastembed", specifier = ">=0.8.0" },
+    { name = "fastembed", specifier = ">=0.8.0,<0.9.0" },
     { name = "filelock", specifier = ">=3.29.4" },
-    { name = "lancedb", specifier = ">=0.33.0" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.28.0" },
+    { name = "lancedb", specifier = ">=0.33.0,<0.34.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.28.0,<2.0.0" },
     { name = "pathspec", specifier = ">=1.1.1" },
     { name = "sentence-transformers", marker = "extra == 'gpu'", specifier = ">=3.0.0" },
     { name = "torch", marker = "(sys_platform == 'linux' and extra == 'gpu') or (sys_platform == 'win32' and extra == 'gpu')", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cu128" },

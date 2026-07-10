@@ -133,6 +133,16 @@ def git_analytics_lock(logical_project_id: str) -> FileLock:
     return FileLock(str(lock_dir / f"git-analytics-{safe_id}.lock"))
 
 
+def read_only_enabled() -> bool:
+    """True when ``ENGRAM_READONLY`` selects the read-only tool/CLI surface.
+
+    Shared by every place that must refuse to delete or mutate an index:
+    the MCP read-only tool gate (`server.py`), orphan/generation GC
+    (`inventory.py`, `gcreclaim.py`), and the global embedding-cache prune.
+    """
+    return os.environ.get("ENGRAM_READONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def gpu_index_lock() -> FileLock:
     """Machine-wide CUDA index admission lock.
 

@@ -33,10 +33,10 @@ classifiers = [
     "Topic :: Text Processing :: Indexing",
 ]
 dependencies = [
-    "fastembed>=0.8.0",
+    "fastembed>=0.8.0,<0.9.0",
     "filelock>=3.29.4",
-    "lancedb>=0.33.0",
-    "mcp[cli]>=1.28.0",
+    "lancedb>=0.33.0,<0.34.0",
+    "mcp[cli]>=1.28.0,<2.0.0",
     "pathspec>=1.1.1",
     "truststore>=0.10",
     "tree-sitter>=0.25.2",
@@ -58,8 +58,8 @@ Repository = "https://github.com/bokettodev/engram-mcp"
 Issues = "https://github.com/bokettodev/engram-mcp/issues"
 
 [project.optional-dependencies]
-# CUDA indexing via sentence-transformers; also enables explicit/offline
-# sentence-transformers reranker.
+# CUDA indexing via sentence-transformers (index-only; the reranker's only
+# backend is the torch-free FastEmbed ONNX cross-encoder, no extra needed).
 # Heavy (~2GB) + GPU-recommended, so opt-in: `uv sync --extra gpu`.
 gpu = [
     "sentence-transformers>=3.0.0",

@@ -18,11 +18,27 @@ import threading
 from functools import lru_cache
 from typing import Any, Callable
 
-from engram_mcp import errors, paths
+from engram_mcp import config, errors, paths
+from engram_mcp.embeddings import hf_pin
 from engram_mcp.embeddings.fastembed_provider import FastEmbedProvider
 
-GRANITE_MODEL = "ibm-granite/granite-embedding-97m-multilingual-r2"
-CANONICAL_EMBEDDER_ID = f"fastembed:{GRANITE_MODEL}"
+GRANITE_MODEL = config.DEFAULT_EMBED_MODEL
+# The canonical manifest/cache identity: repo + pinned revision + dim +
+# pooling + normalization + backend ("fastembed", since the query path
+# always loads via FastEmbed/ONNX CPU regardless of which backend built the
+# index -- see the canonical/backend id split below). This is a pure string
+# computation (no I/O, no model load), so it stays safe to reference from
+# every status/info code path, not just ones that actually load a model.
+# Changing config.EMBED_MODEL_REVISION changes this value, which is exactly
+# the point: every existing manifest/cache row keyed under the old value
+# stops matching and forces a rebuild instead of silently mixing vectors.
+CANONICAL_EMBEDDER_ID = hf_pin.canonical_model_id(
+    backend="fastembed",
+    repo_id=GRANITE_MODEL,
+    revision=config.EMBED_MODEL_REVISION,
+    dim=config.DEFAULT_EMBED_DIM,
+    pooling="cls",
+)
 # Index device *setting*: "auto" prefers a CUDA GPU and only falls back to CPU
 # when none is usable. GPU is the priority path; CPU indexing is much slower and
 # meant as a fallback. "cpu"/"cuda" force the device explicitly.
@@ -174,6 +190,28 @@ def _fastembed_granite_cpu() -> FastEmbedProvider:
         return FastEmbedProvider(GRANITE_MODEL, device="cpu")
 
 
+def make_uncached_cpu_provider() -> FastEmbedProvider:
+    """Build a standalone CPU FastEmbed provider, bypassing the shared query cache.
+
+    ``_fastembed_granite_cpu()`` is a process-wide singleton shared with the
+    query path; embedding through it from an index job serializes against
+    search (see ``FastEmbedProvider._lock``). This factory returns a fresh
+    instance with its own lock instead, so a caller can embed passages
+    in-process without ever contending with the cached query provider. It is
+    intentionally not cached/registered anywhere -- the caller owns the
+    instance and lets it be garbage-collected after use (FastEmbed/ONNX holds
+    no CUDA allocator cache to release explicitly).
+
+    Used only by the server's optional, off-by-default, small-delta
+    in-process CPU fast path (``ENGRAM_INPROCESS_CPU_MAX``); the default index
+    path always runs in a short-lived subprocess instead.
+    """
+    from engram_mcp.net import guard_download
+
+    with guard_download(GRANITE_MODEL):
+        return FastEmbedProvider(GRANITE_MODEL, device="cpu")
+
+
 def _sentence_transformers_granite_cuda():
     if importlib.util.find_spec("sentence_transformers") is None:
         raise errors.EngramError(
@@ -196,6 +234,7 @@ def _sentence_transformers_granite_cuda():
             passage_prompt=None,
             canonical_id=CANONICAL_EMBEDDER_ID,
             strict_device=True,
+            revision=config.EMBED_MODEL_REVISION,
         )
 
 
@@ -237,12 +276,6 @@ def make_index_provider(index_device: str | None = None, *, progress: ProgressSi
     return provider
 
 
-def make_provider(index_device: str | None = None):
-    """Compatibility alias for older internal callers."""
-
-    return make_index_provider(index_device)
-
-
 def release_index_provider(provider) -> None:
     """Release index backend resources after a job.
 
@@ -269,18 +302,3 @@ def release_index_provider(provider) -> None:
                     setattr(provider, "_engram_gpu_index_lock", None)
                 except Exception:
                     pass
-
-
-def provider_for_project(root):
-    """Return the CPU query provider recorded in a project's manifest."""
-
-    from engram_mcp import manifest, paths
-
-    pdir = paths.project_dir(root, create=False)
-    m = manifest.load_project(pdir) if pdir.exists() else None
-    if m is None or not m.embedder_id:
-        raise errors.EngramError(
-            f"project not indexed: {root}",
-            errors.E_PROJECT_NOT_INDEXED,
-        )
-    return provider_for_model_id(m.embedder_id)

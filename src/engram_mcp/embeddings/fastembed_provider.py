@@ -57,6 +57,16 @@ _CUSTOM_ONNX: dict[str, dict] = {
     "ibm-granite/granite-embedding-97m-multilingual-r2": {"pooling": "CLS", "dim": 384},
 }
 
+# Exact upstream revision each custom-registered model is pinned to (see
+# config.py for why). FastEmbed's own download path doesn't accept a
+# revision, so this is enforced by resolving the snapshot ourselves (see
+# ``hf_pin``) and handing FastEmbed the local directory via
+# ``specific_model_path`` -- which bypasses its (revision-less) download
+# entirely, so this really does pin what gets loaded.
+_PINNED_REVISIONS: dict[str, str] = {
+    config.DEFAULT_EMBED_MODEL: config.EMBED_MODEL_REVISION,
+}
+
 _REGISTER_LOCK = threading.Lock()
 
 
@@ -99,17 +109,60 @@ def _resolve_device(device: str) -> str:
     return "cpu"
 
 
+def _resolve_pinned_model_path(model_name: str) -> tuple[str, str]:
+    """Resolve the pinned local snapshot dir + artifact digest for a model.
+
+    Returns ``("", "")`` for a model with no recorded pin (loaded unpinned,
+    at whatever FastEmbed's own download resolves to). A pinned model that
+    fails to resolve raises -- pinning exists specifically so a revision
+    mismatch is never silently ignored, so a resolution failure (e.g. no
+    network and nothing cached yet) must fail loud rather than quietly fall
+    back to an unpinned load.
+    """
+    revision = _PINNED_REVISIONS.get(model_name)
+    if revision is None:
+        return "", ""
+    from engram_mcp.embeddings import hf_pin
+
+    snapshot_dir = hf_pin.pinned_snapshot_dir(
+        model_name, revision, extra_patterns=("onnx/model.onnx",)
+    )
+    digest = hf_pin.blob_digest(snapshot_dir, "onnx/model.onnx")
+    return snapshot_dir, digest
+
+
 class FastEmbedProvider:
     def __init__(self, model_name: str = config.DEFAULT_EMBED_MODEL, device: str = "cpu"):
         from fastembed import TextEmbedding
 
         _ensure_custom_registered(model_name)
         self.model_name = model_name
-        self.model_id = f"fastembed:{model_name}"  # device-independent cache key
+        snapshot_dir, self.artifact_digest = _resolve_pinned_model_path(model_name)
+        pin_kwargs = {"specific_model_path": snapshot_dir} if snapshot_dir else {}
+        # model_id is the device-independent cache/manifest key: repo + pinned
+        # revision + dim + pooling (see hf_pin.canonical_model_id). Falls back
+        # to the plain repo-name id for a hypothetical model with no recorded
+        # pin/spec -- in practice only the pinned Granite model is ever loaded
+        # through this provider.
+        pinned_revision = _PINNED_REVISIONS.get(model_name, "")
+        spec = _CUSTOM_ONNX.get(model_name)
+        if pinned_revision and spec is not None:
+            from engram_mcp.embeddings import hf_pin
+
+            self.model_id = hf_pin.canonical_model_id(
+                backend="fastembed",
+                repo_id=model_name,
+                revision=pinned_revision,
+                dim=spec["dim"],
+                pooling=spec["pooling"],
+            )
+        else:
+            self.model_id = f"fastembed:{model_name}"  # device-independent cache key
         self.backend_id = self.model_id
         self.device = _resolve_device(device)
 
         kwargs = {"cuda": True} if self.device == "cuda" else {}
+        kwargs.update(pin_kwargs)
         try:
             with _utf8_text_open():
                 self._model = TextEmbedding(model_name, **kwargs)
@@ -118,7 +171,7 @@ class FastEmbedProvider:
                 logger.warning("CUDA embedder unavailable (%r); falling back to CPU", exc)
                 self.device = "cpu"
                 with _utf8_text_open():
-                    self._model = TextEmbedding(model_name)
+                    self._model = TextEmbedding(model_name, **pin_kwargs)
             else:
                 raise
 

@@ -11,9 +11,15 @@ from typing import Protocol, Sequence, runtime_checkable
 
 @runtime_checkable
 class EmbeddingProvider(Protocol):
-    model_id: str  # stable id baked into cache keys (e.g. "fastembed:ibm-granite/granite-embedding-97m-multilingual-r2")
+    model_id: str  # stable id baked into cache keys (e.g. "fastembed:ibm-granite/granite-embedding-97m-multilingual-r2@<rev>#dim=384;pool=cls;norm=1")
     backend_id: str  # actual loaded runtime id used for diagnostics/status
     dim: int
+    # Best-effort content digest of the model artifact actually loaded (e.g.
+    # the ONNX weight file's blob hash); "" when not cheaply obtainable for
+    # this backend. Extra defense in depth on top of model_id's revision pin
+    # -- see indexing/hash.py::embedding_input_hash and manifest.py's
+    # embedder_artifact_digest field.
+    artifact_digest: str
 
     def embed_passages(self, texts: Sequence[str]) -> list[list[float]]: ...
 

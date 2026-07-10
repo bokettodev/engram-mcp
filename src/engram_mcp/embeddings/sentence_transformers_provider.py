@@ -3,6 +3,20 @@
 The optional CUDA index path uses the same Granite 97m vector space as the
 FastEmbed CPU search path. When ``canonical_id`` is set, ``model_id`` is that
 canonical manifest/cache id and ``backend_id`` records the actual runtime.
+
+``revision`` pins the exact upstream commit sentence-transformers loads
+(unlike FastEmbed, ``SentenceTransformer`` accepts ``revision=`` natively --
+no snapshot-resolution workaround needed here, see ``embeddings/hf_pin.py``).
+
+``artifact_digest`` is intentionally left empty for this backend: the
+manifest's recorded digest must be comparable against whatever the *query*
+path (always FastEmbed/ONNX CPU) computes, and this backend loads a
+different artifact (safetensors, not the ONNX export) -- hashing it would
+only produce a digest that can never match the query-time one, which would
+make every GPU-built index fail its digest check the first time it's
+queried. The revision pin (part of ``model_id``/``canonical_id``) is what
+actually protects a GPU-built index; the artifact digest is CPU-backend-only
+defense in depth on top of that.
 """
 
 from __future__ import annotations
@@ -59,6 +73,7 @@ class SentenceTransformersProvider:
         passage_prompt: str | None = None,
         canonical_id: str | None = None,
         strict_device: bool = False,
+        revision: str | None = None,
     ):
         try:
             from sentence_transformers import SentenceTransformer
@@ -93,7 +108,7 @@ class SentenceTransformersProvider:
 
         try:
             self._model = SentenceTransformer(
-                model_name, device=self.device, trust_remote_code=True, truncate_dim=truncate_dim
+                model_name, device=self.device, truncate_dim=truncate_dim, revision=revision
             )
         except Exception as exc:
             if strict_device:
@@ -106,7 +121,7 @@ class SentenceTransformersProvider:
                 logger.warning("CUDA load failed (%r); falling back to CPU", exc)
                 self.device = "cpu"
                 self._model = SentenceTransformer(
-                    model_name, device="cpu", trust_remote_code=True, truncate_dim=truncate_dim
+                    model_name, device="cpu", truncate_dim=truncate_dim, revision=revision
                 )
             else:
                 raise
@@ -116,8 +131,12 @@ class SentenceTransformersProvider:
         # runtime, not per canonical vector space.
         dim_tag = truncate_dim if truncate_dim else "full"
         ptag = f"{query_prompt or 'none'}/{passage_prompt or 'none'}"
-        self.backend_id = f"st:{model_name}@{dim_tag}#{ptag}:{self.device}"
-        self.model_id = canonical_id or f"st:{model_name}@{dim_tag}#{ptag}"
+        rev_tag = f":rev={revision}" if revision else ""
+        self.backend_id = f"st:{model_name}@{dim_tag}#{ptag}:{self.device}{rev_tag}"
+        self.model_id = canonical_id or f"st:{model_name}@{dim_tag}#{ptag}{rev_tag}"
+        # See module docstring: never computed for this backend, only for the
+        # canonical FastEmbed/ONNX one that the query path actually uses.
+        self.artifact_digest = ""
         self._lock = threading.Lock()
         self._batch_size = _env_batch_size()
         try:
