@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import time
 
 import pytest
 
@@ -90,12 +92,32 @@ class _BoomCtx:
 def test_regexsafe_run_worker_terminate_failure_still_runs_kill_and_closes_both_ends(
     monkeypatch,
 ) -> None:
-    fake_proc = _FakeProc()
-    fake_ctx = _FakeCtx(fake_proc)
-    monkeypatch.setattr(regexsafe.mp, "get_context", lambda name: fake_ctx)
+    class TimeoutProc:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def communicate(self, input=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("regex-child", timeout)
+            return b"", b""
+
+    fake_proc = TimeoutProc()
+    killed = []
+    launched = {}
+
+    def fake_popen(args, **kwargs):
+        launched["args"] = args
+        launched["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(regexsafe.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gitmeta, "kill_process_tree", lambda proc: killed.append(proc))
 
     ok, payload, reason = regexsafe._run_worker(
-        regexsafe._search_many_worker,
+        "search",
         pattern="foo",
         flags=0,
         texts=["foo bar"],
@@ -105,19 +127,27 @@ def test_regexsafe_run_worker_terminate_failure_still_runs_kill_and_closes_both_
     assert ok is False
     assert payload is None
     assert "timed out" in reason
-    assert fake_proc.terminate_called
-    assert fake_proc.kill_called
-    assert fake_proc.join_calls >= 2
-    assert fake_proc.closed
-    assert fake_ctx.recv_conn is not None and fake_ctx.recv_conn.closed
-    assert fake_ctx.send_conn is not None and fake_ctx.send_conn.closed
+    assert killed == [fake_proc]
+    assert fake_proc.calls == 2
+    assert launched["args"][-1] == "engram_mcp._regex_child"
+    assert launched["kwargs"]["stdin"] is subprocess.PIPE
+    assert launched["kwargs"]["stdout"] is subprocess.PIPE
+    assert launched["kwargs"]["stderr"] is subprocess.DEVNULL
+    assert launched["kwargs"]["close_fds"] is True
+    if os.name == "nt":
+        assert launched["kwargs"]["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        assert launched["kwargs"]["start_new_session"] is True
 
 
 def test_regexsafe_run_worker_pipe_allocation_oserror_degrades(monkeypatch) -> None:
-    monkeypatch.setattr(regexsafe.mp, "get_context", lambda name: _BoomCtx())
+    def fail_launch(*args, **kwargs):
+        raise OSError("simulated process allocation failure")
+
+    monkeypatch.setattr(regexsafe.subprocess, "Popen", fail_launch)
 
     ok, payload, reason = regexsafe._run_worker(
-        regexsafe._search_many_worker,
+        "search",
         pattern="foo",
         flags=0,
         texts=["foo bar"],
@@ -126,7 +156,27 @@ def test_regexsafe_run_worker_pipe_allocation_oserror_degrades(monkeypatch) -> N
 
     assert ok is False
     assert payload is None
-    assert reason  # OSError message surfaced, not raised
+    assert "allocation failure" in reason
+
+
+def test_safe_custom_ticket_regex_survives_heavy_parent_imports() -> None:
+    import engram_mcp.server  # noqa: F401 -- simulate the long-lived MCP parent graph
+
+    custom = r"[A-Z]{2,}-\d+"
+    messages = [f"ABC-{i} update" for i in range(50)]
+    started = time.perf_counter()
+    resolved, tickets, warnings = regexsafe.extract_first_or_default(
+        custom,
+        gitanalytics.DEFAULT_TICKET_REGEX,
+        messages,
+        label="ticket_regex",
+        timeout_sec=1.0,
+    )
+
+    assert resolved == custom
+    assert tickets == [f"ABC-{i}" for i in range(50)]
+    assert warnings == []
+    assert time.perf_counter() - started < 1.0
 
 
 def _commit(commit: str, paths: list[str], *, ts: int = 1000, author: str = "A", message: str = "") -> dict:
@@ -201,16 +251,18 @@ def test_invalid_ticket_and_fix_regex_fall_back_to_defaults() -> None:
 
 def test_pathological_ticket_regex_degrades_without_hanging(monkeypatch) -> None:
     monkeypatch.setenv("ENGRAM_USER_REGEX_TIMEOUT_SEC", "0.05")
-    commits = [_commit("c1", ["a.py"], message="ABC-1 " + ("b" * 128) + "!")]
+    commits = [_commit("c1", ["a.py"], message="ABC-1 " + ("a" * 10_000) + "!")]
+    started = time.perf_counter()
 
     grouped = gitanalytics.group_changes_result(
         commits,
         group_by="ticket",
-        ticket_regex=r"(b+)+$",
+        ticket_regex=r"(a+)+$",
     )
 
     assert grouped["regex_warnings"]
     assert grouped["change_sets"][0]["id"] == "ABC-1"
+    assert time.perf_counter() - started < 2.0
 
 
 def test_pathological_fix_regex_degrades_without_hanging(monkeypatch) -> None:
@@ -234,7 +286,11 @@ def test_pathological_fix_regex_degrades_without_hanging(monkeypatch) -> None:
 
 
 def test_fix_regex_worker_crash_degrades_with_warning(monkeypatch) -> None:
-    monkeypatch.setattr("engram_mcp.regexsafe._search_many_worker", _crash_regex_worker)
+    monkeypatch.setattr(
+        regexsafe,
+        "_run_worker",
+        lambda *args, **kwargs: (False, None, "simulated child crash"),
+    )
     changes = [
         {
             "id": "c1",

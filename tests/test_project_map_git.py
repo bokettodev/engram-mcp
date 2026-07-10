@@ -177,7 +177,8 @@ def test_project_map_include_git_uncached_builds_live_in_memory(tmp_path, monkey
     by_path = {row["path"]: row for row in out["files"]}
     assert by_path["alpha.py"]["git"]["changes"] == 1
     assert by_path["alpha.py"]["git"]["churn_lines"] == 6
-    assert by_path["alpha.py"]["git"]["fix_density"] == 1.0
+    assert by_path["alpha.py"]["git"]["fix_density"] is None
+    assert out["git_analytics"]["hotspots"][0]["fix_density"] is None
     assert "defect_hotspot_score" not in by_path["alpha.py"]["git"]
     assert by_path["alpha.py"]["git"]["cochanges"][0]["path"] == "beta.py"
     assert "lift" in by_path["alpha.py"]["git"]["cochanges"][0]
@@ -1009,7 +1010,11 @@ def test_project_map_regex_worker_crash_degrades_to_warning(tmp_path, monkeypatc
     root, _provider = _project(tmp_path)
     _save_history(root, _ready_history())
     monkeypatch.setattr(gitmeta, "repo_ref_fingerprint", lambda *_args, **_kwargs: _fingerprint())
-    monkeypatch.setattr(regexsafe, "_extract_first_worker", _crash_regex_worker)
+    monkeypatch.setattr(
+        regexsafe,
+        "_run_worker",
+        lambda *args, **kwargs: (False, None, "simulated child crash"),
+    )
 
     out = server.do_project_map(
         str(root),
@@ -1027,7 +1032,18 @@ def test_project_map_regex_worker_crash_degrades_to_warning(tmp_path, monkeypatc
 
 def test_grep_index_worker_crash_degrades_to_partial_warning(tmp_path, monkeypatch) -> None:
     root, _provider = _project(tmp_path)
-    monkeypatch.setattr(pipeline, "grep_rows_worker", _crash_grep_worker)
+
+    class CrashedProc:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return b"", b""
+
+    monkeypatch.setattr(
+        pipeline.diagnostics.subprocess,
+        "Popen",
+        lambda *args, **kwargs: CrashedProc(),
+    )
 
     out = pipeline.grep_index(str(root), "alpha")
 
@@ -1054,7 +1070,11 @@ def test_project_map_regex_pipe_allocation_failure_degrades_to_warning(tmp_path,
     root, _provider = _project(tmp_path)
     _save_history(root, _ready_history())
     monkeypatch.setattr(gitmeta, "repo_ref_fingerprint", lambda *_args, **_kwargs: _fingerprint())
-    monkeypatch.setattr(regexsafe.mp, "get_context", lambda name: _BoomMpContext())
+    monkeypatch.setattr(
+        regexsafe.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("simulated launch failure")),
+    )
 
     out = server.do_project_map(
         str(root),
@@ -1071,7 +1091,11 @@ def test_project_map_regex_pipe_allocation_failure_degrades_to_warning(tmp_path,
 
 def test_grep_index_pipe_allocation_failure_degrades_to_partial_warning(tmp_path, monkeypatch) -> None:
     root, _provider = _project(tmp_path)
-    monkeypatch.setattr(pipeline.mp, "get_context", lambda name: _BoomMpContext())
+    monkeypatch.setattr(
+        pipeline.diagnostics.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("simulated launch failure")),
+    )
 
     out = pipeline.grep_index(str(root), "alpha")
 
@@ -1165,9 +1189,26 @@ class _FakeGrepCtx:
 def test_grep_rows_with_timeout_terminate_failure_still_runs_kill_and_closes_both_ends(
     tmp_path, monkeypatch
 ) -> None:
-    fake_proc = _FakeGrepProc()
-    fake_ctx = _FakeGrepCtx(fake_proc)
-    monkeypatch.setattr(pipeline.mp, "get_context", lambda name: fake_ctx)
+    class TimeoutProc:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise pipeline.diagnostics.subprocess.TimeoutExpired("grep-child", timeout)
+            return b"", b""
+
+    fake_proc = TimeoutProc()
+    killed = []
+    monkeypatch.setattr(
+        pipeline.diagnostics.subprocess,
+        "Popen",
+        lambda *args, **kwargs: fake_proc,
+    )
+    monkeypatch.setattr(gitmeta, "kill_process_tree", lambda proc: killed.append(proc))
 
     result = pipeline._grep_rows_with_timeout(
         pattern="alpha",
@@ -1180,14 +1221,8 @@ def test_grep_rows_with_timeout_terminate_failure_still_runs_kill_and_closes_bot
 
     assert result["stopped"] is True
     assert "timed out" in result["warning"]
-    assert fake_proc.terminate_called
-    assert fake_proc.kill_called
-    assert fake_proc.join_calls >= 2
-    assert fake_proc.closed
-    assert len(fake_ctx.pipes) == 2
-    for recv_conn, send_conn in fake_ctx.pipes:
-        assert recv_conn.closed
-        assert send_conn.closed
+    assert killed == [fake_proc]
+    assert fake_proc.calls == 2
 
 
 class _CapturingProc:
@@ -1257,27 +1292,32 @@ class _CapturingCtx:
 
 
 def test_grep_rows_with_timeout_does_not_copy_corpus_through_process_args() -> None:
-    """Item 5 of the search-hot-path audit: the row corpus must never be
-    handed to multiprocessing.Process(args=...) -- on spawn (the only start
-    method on Windows), those args are serialized and copied into the child
-    synchronously inside Process.start(), before the timeout below even
-    starts being measured. This is non-vacuous against the pre-fix code: the
-    old signature was args=(send_conn, pattern, flags, rows, include_lines,
-    max_matches), which would fail the "no list in args" assertion below (and
-    also does not match this fake context's two-pipe expectations at all).
-    """
-    fake_ctx = _CapturingCtx()
-    real_get_context = pipeline.mp.get_context
-    try:
-        pipeline.mp.get_context = lambda name: fake_ctx
+    """The corpus is streamed through private stdin, never process argv."""
+    captured = {}
 
-        # A corpus large enough (~2MB) that copying it would be obviously
-        # expensive if it ended up in Process(args=...).
+    class CapturingProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return (
+                b'{"status":"ok","payload":{"by_path":{},'
+                b'"total_matches":0,"stopped":false}}',
+                b"",
+            )
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        captured["stdin"] = kwargs["stdin"].read()
+        return CapturingProc()
+
+    real_popen = pipeline.diagnostics.subprocess.Popen
+    pipeline.diagnostics.subprocess.Popen = fake_popen
+    try:
         big_rows = [
             {"rel_path": f"file_{i}.py", "start_line": 1, "content": "x" * 1000}
             for i in range(2000)
         ]
-
         result = pipeline._grep_rows_with_timeout(
             pattern="x",
             flags=0,
@@ -1287,21 +1327,22 @@ def test_grep_rows_with_timeout_does_not_copy_corpus_through_process_args() -> N
             timeout_sec=1.0,
         )
     finally:
-        pipeline.mp.get_context = real_get_context
+        pipeline.diagnostics.subprocess.Popen = real_popen
 
-    # The canned result (not derived from big_rows) proves this really went
-    # through the fake Process path rather than silently falling back to
-    # something else.
     assert result == {"by_path": {}, "total_matches": 0, "stopped": False}
-
-    assert fake_ctx.captured_args is not None
-    assert big_rows not in fake_ctx.captured_args
-    assert not any(isinstance(a, list) for a in fake_ctx.captured_args)
-    # Everything handed to Process(args=...) other than the two Connection
-    # objects must be small, fixed-size arguments -- not a serialized copy of
-    # the ~2MB row corpus.
-    small_args = [a for a in fake_ctx.captured_args if not hasattr(a, "poll")]
-    assert len(repr(small_args)) < 500
+    assert captured["args"][-1] == "engram_mcp.grepworker"
+    assert len(repr(captured["args"])) < 500
+    assert b"file_1999.py" in captured["stdin"]
+    assert captured["kwargs"]["stdout"] is pipeline.diagnostics.subprocess.PIPE
+    assert captured["kwargs"]["stderr"] is pipeline.diagnostics.subprocess.DEVNULL
+    assert captured["kwargs"]["close_fds"] is True
+    if os.name == "nt":
+        assert (
+            captured["kwargs"]["creationflags"]
+            == pipeline.diagnostics.subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        assert captured["kwargs"]["start_new_session"] is True
 
 
 def test_regex_worker_crash_on_later_pass_does_not_desync_szz_identity(tmp_path, monkeypatch) -> None:
