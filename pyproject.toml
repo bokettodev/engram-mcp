@@ -1,6 +1,6 @@
 [project]
 name = "engram-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local, private semantic code and prose search MCP stdio server for AI coding agents."
 readme = "README.md"
 authors = [{ name = "Rafael Dzhancherov", email = "bokettodev@gmail.com" }]
