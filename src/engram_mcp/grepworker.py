@@ -1,61 +1,21 @@
-"""Small regex worker for grep_index timeout isolation.
+"""Bare stdlib-only child for bounded ``grep_index`` regex execution."""
 
-The parent never passes the row corpus through ``multiprocessing.Process``'s
-``args`` -- on the ``spawn`` start method (the only one available on
-Windows), those args are serialized and copied into the child as part of
-``Process.start()``, which runs synchronously *before* the parent's timeout
-window begins. For a large corpus that copy could itself take longer than
-the timeout is supposed to allow, defeating the whole point of isolating the
-regex in a subprocess. Instead the parent streams the rows to this worker in
-small batches over a pipe *after* the child is already running and the
-timeout clock has started, so both the transfer and the matching happen
-inside the same bounded window, and peak memory is one batch's content
-rather than the whole corpus.
-
-This module intentionally imports nothing beyond the standard library: it is
-the multiprocessing ``spawn`` entry point, so whatever it imports gets
-reloaded from scratch in the child interpreter. It must stay clear of torch,
-lancedb, and the ``engram_mcp.pipeline``/``engram_mcp.server`` module graph
-so a hung or crashed regex never drags a model or DB handle into a bare
-worker process.
-"""
-
-from __future__ import annotations
-
+import json
 import re
+import sys
 
 
-def grep_rows_worker(
-    data_conn,
-    result_conn,
-    pattern: str,
-    flags: int,
-    include_lines: bool,
-    max_matches: int,
-) -> None:
-    """Read row batches from ``data_conn`` until ``None`` (end of stream).
-
-    ``data_conn`` carries one ``list[dict]`` batch per ``recv()``, terminated
-    by a ``None`` sentinel. Once ``max_matches`` is hit, this worker stops
-    reading and sends its result right away instead of draining the rest of
-    the stream -- an early exit, same as the pre-streaming version. Closing
-    ``data_conn`` here (see ``finally``) then makes the parent's still-in-
-    flight batch sends fail fast (broken pipe) rather than block forever on a
-    reader that is gone, so ``diagnostics.grep_rows_with_timeout``'s feeder
-    thread and its own timeout/cleanup sequence are unaffected either way.
-    """
+def main():
     try:
-        rx = re.compile(pattern, flags)
-        by_path: dict[str, dict] = {}
+        header = json.loads(sys.stdin.buffer.readline())
+        rx = re.compile(str(header["pattern"]), int(header.get("flags", 0)))
+        include_lines = bool(header.get("include_lines"))
+        max_matches = int(header["max_matches"])
+        by_path = {}
         total_matches = 0
         stopped = False
-        while True:
-            try:
-                batch = data_conn.recv()
-            except EOFError:
-                break
-            if batch is None:
-                break
+        for line in sys.stdin.buffer:
+            batch = json.loads(line)
             for row in batch:
                 content = row.get("content") or ""
                 rel = row.get("rel_path") or ""
@@ -83,18 +43,21 @@ def grep_rows_worker(
                     break
             if stopped:
                 break
-        result_conn.send(("ok", {"by_path": by_path, "total_matches": total_matches, "stopped": stopped}))
+        for item in by_path.values():
+            item["line_numbers"] = sorted(item["line_numbers"])
+        result = {
+            "status": "ok",
+            "payload": {
+                "by_path": by_path,
+                "total_matches": total_matches,
+                "stopped": stopped,
+            },
+        }
     except Exception as exc:
-        try:
-            result_conn.send(("error", str(exc) or repr(exc)))
-        except Exception:
-            pass
-    finally:
-        try:
-            data_conn.close()
-        except Exception:
-            pass
-        try:
-            result_conn.close()
-        except Exception:
-            pass
+        result = {"status": "error", "error": str(exc) or repr(exc)}
+    sys.stdout.write(json.dumps(result, ensure_ascii=False))
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

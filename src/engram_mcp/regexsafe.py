@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-import multiprocessing as mp
+import json
 import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass, field
-from collections.abc import Callable
+
+from engram_mcp import gitmeta
 
 MAX_USER_REGEX_CHARS = 500
 DEFAULT_USER_REGEX_TIMEOUT_SEC = 1.0
@@ -23,105 +26,64 @@ def _regex_timeout_seconds() -> float:
     return max(0.05, min(value, 30.0))
 
 
-def _search_many_worker(conn, pattern: str, flags: int, texts: list[str]) -> None:
-    try:
-        rx = re.compile(pattern, flags)
-        conn.send(("ok", [bool(rx.search(text)) for text in texts]))
-    except Exception as exc:
-        conn.send(("error", str(exc) or repr(exc)))
-    finally:
-        conn.close()
-
-
-def _extract_first_worker(conn, pattern: str, flags: int, texts: list[str]) -> None:
-    try:
-        rx = re.compile(pattern, flags)
-        out: list[str] = []
-        for text in texts:
-            match = rx.search(text)
-            if not match:
-                out.append("")
-            elif "ticket" in match.groupdict():
-                out.append(match.group("ticket"))
-            elif match.groups():
-                out.append(match.group(1))
-            else:
-                out.append(match.group(0))
-        conn.send(("ok", out))
-    except Exception as exc:
-        conn.send(("error", str(exc) or repr(exc)))
-    finally:
-        conn.close()
-
-
 def _run_worker(
-    target: Callable,
+    op: str,
     *,
     pattern: str,
     flags: int,
     texts: list[str],
     timeout_sec: float,
 ) -> tuple[bool, object, str]:
-    # Context/pipe/process construction and start() live inside the guarded
-    # region below: an OSError while allocating the pipe or spawning the
-    # process must degrade like a timeout, not escape as a server error.
-    proc = None
-    recv_conn = None
-    send_conn = None
-    started = False
+    """Run a regex job in a bare interpreter with private stdio."""
+
+    if os.environ.get("ENGRAM_USER_REGEX_SUBPROCESS", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False, None, "regex subprocess disabled by ENGRAM_USER_REGEX_SUBPROCESS=0"
+    job = json.dumps(
+        {"op": op, "pattern": pattern, "flags": flags, "texts": texts},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    creation = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
     try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "engram_mcp._regex_child"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            **creation,
+        )
+    except Exception as exc:
+        return False, None, str(exc) or repr(exc)
+    try:
+        stdout, _ = proc.communicate(input=job, timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        gitmeta.kill_process_tree(proc)
         try:
-            ctx = mp.get_context("spawn")
-            recv_conn, send_conn = ctx.Pipe(duplex=False)
-            proc = ctx.Process(target=target, args=(send_conn, pattern, flags, texts))
-            proc.start()
-            started = True
-            send_conn.close()
-            send_conn = None
-            if recv_conn.poll(timeout_sec):
-                status, payload = recv_conn.recv()
-                proc.join(timeout=1)
-                if status == "ok":
-                    return True, payload, ""
-                return False, None, str(payload or "")
-            return False, None, f"regex execution timed out after {timeout_sec:.2f}s"
-        except Exception as exc:
-            return False, None, str(exc) or repr(exc)
-    finally:
-        # Each cleanup step is independently best-effort: a failure in one
-        # (e.g. terminate() raising) must not skip the rest of the sequence.
-        if send_conn is not None:
-            try:
-                send_conn.close()
-            except OSError:
-                pass
-        if started and proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.join(timeout=1)
-            except Exception:
-                pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.join(timeout=1)
-            except Exception:
-                pass
-        if recv_conn is not None:
-            try:
-                recv_conn.close()
-            except OSError:
-                pass
-        if proc is not None:
-            try:
-                proc.close()
-            except Exception:
-                pass
+            proc.communicate(timeout=1)
+        except Exception:
+            gitmeta.kill_process_tree(proc)
+        return False, None, f"regex execution timed out after {timeout_sec:.2f}s"
+    except Exception as exc:
+        gitmeta.kill_process_tree(proc)
+        return False, None, str(exc) or repr(exc)
+    try:
+        result = json.loads(stdout)
+        if proc.returncode != 0:
+            return False, None, f"regex child exited with status {proc.returncode}"
+        if result.get("status") == "ok":
+            return True, result.get("payload"), ""
+        return False, None, str(result.get("error") or "regex child failed")
+    except Exception as exc:
+        return False, None, str(exc) or repr(exc)
 
 
 def _validated_pattern(
@@ -216,7 +178,7 @@ def search_many_or_default(
     if candidate == default:
         return candidate, _search_many_in_process(candidate, flags, text_list), warnings
     ok, payload, reason = _run_worker(
-        _search_many_worker,
+        "search",
         pattern=candidate,
         flags=flags,
         texts=text_list,
@@ -244,7 +206,7 @@ def extract_first_or_default(
     if candidate == default:
         return candidate, _extract_first_in_process(candidate, flags, text_list), warnings
     ok, payload, reason = _run_worker(
-        _extract_first_worker,
+        "extract",
         pattern=candidate,
         flags=flags,
         texts=text_list,

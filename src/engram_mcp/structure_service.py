@@ -91,11 +91,16 @@ def _file_git_payload(
 ) -> dict:
     churn_row = churn_by_file.get(path) or {}
     hotspot = hotspot_by_file.get(path) or {}
+    raw_fix_density = churn_row.get("fix_density", 0.0)
     payload = {
         "changes": int(churn_row.get("changes", 0) or 0),
         "churn_lines": int(churn_row.get("churn_lines", 0) or 0),
         "last_touched_ts": int(churn_row.get("last_touched_ts", 0) or 0),
-        "fix_density": float(churn_row.get("fix_density", 0.0) or 0.0),
+        "fix_density": (
+            None
+            if raw_fix_density is None
+            else float(raw_fix_density or 0.0)
+        ),
         "complexity": float(hotspot.get("complexity", 0.0) or 0.0),
         "indent_complexity": float(hotspot.get("indent_complexity", 0.0) or 0.0),
         "hotspot_quadrant": hotspot.get("hotspot_quadrant") or "low_churn_low_complexity",
@@ -222,6 +227,7 @@ def _attach_git_analytics(
         recent_days=recent_days,
         fix_regex=fix_regex,
         regex_cache=regex_cache,
+        fix_density_ready=szz_ready,
     )
     churn_by_file = churn_result["files"]
     warnings.extend(str(w) for w in (churn_result.get("regex_warnings") or []) if str(w))

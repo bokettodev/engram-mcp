@@ -199,13 +199,21 @@ def _subprocess_index(
         cmd.extend(["--git-max-commits", str(git_max_commits)])
     if git_analytics is not None:
         cmd.append("--git-analytics" if git_analytics else "--no-git-analytics")
+    creation = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
     try:
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            close_fds=True,
+            **creation,
         )
     except Exception as exc:
         _registry.update(

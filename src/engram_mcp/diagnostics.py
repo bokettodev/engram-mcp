@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import multiprocessing as mp
+import json
 import os
 import re
-import threading
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Callable
 
 from engram_mcp import catalog, config, errors, gcreclaim, gitmeta, manifest, paths
 from engram_mcp.embeddings import cache as embedding_cache
-from engram_mcp.grepworker import grep_rows_worker
 from engram_mcp.index_repository import (
     ProjectNotIndexedError,
     QueryIndex,
@@ -226,125 +227,71 @@ def grep_rows_with_timeout(
     include_lines: bool,
     max_matches: int,
     timeout_sec: float,
-    worker: Callable = grep_rows_worker,
 ) -> dict:
-    """Run the regex over ``rows`` in an isolated, timed-out subprocess.
+    """Run grep in a bare child, streaming rows through private temporary stdin."""
 
-    ``rows`` is never handed to ``Process(args=...)``: on ``spawn`` (the only
-    start method on Windows) that would serialize and copy the whole corpus
-    into the child during ``proc.start()``, before ``timeout_sec`` even starts
-    being measured below. Instead the child is started with only the small,
-    fixed-size arguments (pattern/flags/include_lines/max_matches) plus its
-    end of a data pipe, and a background feeder thread streams ``rows`` to it
-    in ``GREP_WORKER_BATCH_ROWS``-sized batches while the main thread waits on
-    the *same* ``timeout_sec`` for a result -- so both the transfer and the
-    regex work are inside one bounded window, and peak memory is one batch,
-    not the whole corpus.
-    """
     def degraded(reason: str) -> dict:
         warning = str(reason or "regex execution unavailable")
         return {"by_path": {}, "total_matches": 0, "stopped": True, "warning": warning}
 
-    # Context/pipe/process construction and start() live inside the guarded
-    # region below: an OSError while allocating the pipe or spawning the
-    # process must degrade to a partial result, not escape as a server error.
-    proc = None
-    result_recv = None
-    result_send = None
-    data_recv = None
-    data_send = None
-    started = False
-    feeder = None
+    if os.environ.get("ENGRAM_GREP_REGEX_SUBPROCESS", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return degraded("grep regex subprocess disabled by ENGRAM_GREP_REGEX_SUBPROCESS=0")
+    creation = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
     try:
-        try:
-            ctx = mp.get_context("spawn")
-            data_recv, data_send = ctx.Pipe(duplex=False)
-            result_recv, result_send = ctx.Pipe(duplex=False)
-            proc = ctx.Process(
-                target=worker,
-                args=(data_recv, result_send, pattern, flags, include_lines, max_matches),
+        with tempfile.TemporaryFile() as child_stdin:
+            header = {
+                "pattern": pattern,
+                "flags": flags,
+                "include_lines": include_lines,
+                "max_matches": max_matches,
+            }
+            child_stdin.write(json.dumps(header, ensure_ascii=False).encode("utf-8") + b"\n")
+            for i in range(0, len(rows), GREP_WORKER_BATCH_ROWS):
+                child_stdin.write(
+                    json.dumps(rows[i : i + GREP_WORKER_BATCH_ROWS], ensure_ascii=False).encode("utf-8")
+                    + b"\n"
+                )
+            child_stdin.seek(0)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "engram_mcp.grepworker"],
+                stdin=child_stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                **creation,
             )
-            proc.start()
-            started = True
-            # Only the child needs to read the data channel or write the
-            # result channel; drop our copies so the child holds the only
-            # live ends (mirrors the original single-pipe close-after-start
-            # pattern, generalized to the two channels below).
-            data_recv.close()
-            data_recv = None
-            result_send.close()
-            result_send = None
-
-            def feed() -> None:
+            try:
+                stdout, _ = proc.communicate(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                gitmeta.kill_process_tree(proc)
                 try:
-                    for i in range(0, len(rows), GREP_WORKER_BATCH_ROWS):
-                        data_send.send(rows[i : i + GREP_WORKER_BATCH_ROWS])
-                    data_send.send(None)
-                except (BrokenPipeError, OSError, EOFError):
-                    pass
-
-            feeder = threading.Thread(target=feed, daemon=True)
-            feeder.start()
-            if result_recv.poll(timeout_sec):
-                status, payload = result_recv.recv()
-                proc.join(timeout=1)
-                if status == "ok":
-                    return payload
-                return degraded(f"regex execution failed: {payload}")
-            return degraded(f"regex execution timed out after {timeout_sec:.2f}s")
-        except Exception as exc:
-            return degraded(str(exc) or repr(exc))
-    finally:
-        # Each cleanup step is independently best-effort: a failure in one
-        # (e.g. terminate() raising) must not skip the rest of the sequence.
-        if started and proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.join(timeout=1)
-            except Exception:
-                pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.join(timeout=1)
-            except Exception:
-                pass
-        # Closing our end of the data pipe here unblocks a feeder thread
-        # still mid-send (broken pipe) after the process above has been
-        # terminated/killed, instead of leaving it parked on a syscall
-        # indefinitely.
-        if data_send is not None:
-            try:
-                data_send.close()
-            except OSError:
-                pass
-        if feeder is not None:
-            feeder.join(timeout=1)
-        if data_recv is not None:
-            try:
-                data_recv.close()
-            except OSError:
-                pass
-        if result_send is not None:
-            try:
-                result_send.close()
-            except OSError:
-                pass
-        if result_recv is not None:
-            try:
-                result_recv.close()
-            except OSError:
-                pass
-        if proc is not None:
-            try:
-                proc.close()
-            except Exception:
-                pass
+                    proc.communicate(timeout=1)
+                except Exception:
+                    gitmeta.kill_process_tree(proc)
+                return degraded(f"regex execution timed out after {timeout_sec:.2f}s")
+            except Exception as exc:
+                gitmeta.kill_process_tree(proc)
+                return degraded(str(exc) or repr(exc))
+    except Exception as exc:
+        return degraded(str(exc) or repr(exc))
+    try:
+        result = json.loads(stdout)
+        if proc.returncode != 0:
+            return degraded(f"grep child exited with status {proc.returncode}")
+        if result.get("status") == "ok" and isinstance(result.get("payload"), dict):
+            return result["payload"]
+        return degraded(f"regex execution failed: {result.get('error') or 'grep child failed'}")
+    except Exception as exc:
+        return degraded(str(exc) or repr(exc))
 
 
 def grep_index(

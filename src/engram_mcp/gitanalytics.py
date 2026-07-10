@@ -368,6 +368,7 @@ def churn_result(
     recent_days: int = 90,
     fix_regex: str | None = DEFAULT_FIX_REGEX,
     regex_cache: regexsafe.RegexRequestCache | None = None,
+    fix_density_ready: bool = True,
 ) -> dict:
     """Compute per-file churn/recency/fix-density counts and regex warnings."""
 
@@ -424,7 +425,7 @@ def churn_result(
                     "churn_lines": 0,
                     "last_touched_ts": 0,
                     "recent_changes": 0,
-                    "fix_density": 0.0,
+                    "fix_density": 0.0 if fix_density_ready else None,
                 },
             )
             row["changes"] += 1
@@ -434,9 +435,10 @@ def churn_result(
                 row["recent_changes"] += 1
             if is_fix:
                 fix_hits[path] += 1
-    for path, row in stats.items():
-        changes = max(1, int(row["changes"]))
-        row["fix_density"] = round(fix_hits[path] / changes, 6)
+    if fix_density_ready:
+        for path, row in stats.items():
+            changes = max(1, int(row["changes"]))
+            row["fix_density"] = round(fix_hits[path] / changes, 6)
     return {
         "files": dict(sorted(stats.items())),
         "regex_warnings": regex_warnings,
@@ -574,13 +576,18 @@ def hotspots(
         defect_commits = int(defect.get("defect_introducing_commits", 0) or 0)
         defect_lines = int(defect.get("defect_introducing_lines", 0) or 0)
         defect_hotspot_score = defect_commits * max(1, changes) + defect_lines
+        raw_fix_density = churn_row.get("fix_density", 0.0)
         item = {
             "path": path,
             "changes": changes,
             "churn_lines": int(churn_row.get("churn_lines", 0) or 0),
             "recent_changes": int(churn_row.get("recent_changes", 0) or 0),
             "last_touched_ts": int(churn_row.get("last_touched_ts", 0) or 0),
-            "fix_density": float(churn_row.get("fix_density", 0.0) or 0.0),
+            "fix_density": (
+                None
+                if raw_fix_density is None
+                else float(raw_fix_density or 0.0)
+            ),
             "defect_introducing_commits": defect_commits,
             "defect_introducing_lines": defect_lines,
             "defect_hotspot_score": defect_hotspot_score,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import multiprocessing
 from pathlib import Path
 
 from engram_mcp import diagnostics, index_repository as _index_repository
@@ -15,7 +14,6 @@ from engram_mcp.diagnostics import (
     doctor_project as doctor_project,
     grep_regex_timeout_seconds as grep_regex_timeout_seconds,
 )
-from engram_mcp.grepworker import grep_rows_worker
 from engram_mcp.index_repository import (
     IndexPlan as IndexPlan,
     IndexStats as IndexStats,
@@ -59,7 +57,6 @@ from engram_mcp.structure_service import (
 )
 
 # Compatibility module/global names retained for existing callers and tests.
-mp = multiprocessing
 _catalog_deep_validation_error = _index_repository.catalog_deep_validation_error
 _catalog_ref_count = _index_repository.catalog_ref_count
 _catalog_validation_error = _index_repository.catalog_validation_error
@@ -86,7 +83,6 @@ def _grep_rows_with_timeout(
         include_lines=include_lines,
         max_matches=max_matches,
         timeout_sec=timeout_sec,
-        worker=grep_rows_worker,
     )
 
 

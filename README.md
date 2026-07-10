@@ -381,8 +381,10 @@ Search and rerank environment knobs:
 | `ENGRAM_GIT_STALENESS` | `on` | set to `0`/`false`/`no`/`off` to disable all git staleness and analytics probes |
 | `ENGRAM_GIT_ANALYTICS` | `on` | default for whether indexing/`project_map` compute git-history/SZZ analytics at all; set to `0`/`false`/`no`/`off` to default it off. An explicit `--git-analytics`/`--no-git-analytics` CLI flag or MCP `index_project` `git_analytics` argument always overrides this env var for that call. A project indexed with analytics disabled reports `project_map` `git_analytics.status == "disabled"` instead of doing a live git walk on the request path |
 | `ENGRAM_GIT_INDEX_TIMEOUT` | `120` | timeout in seconds for heavy index-time shared git history walks and SZZ diff/blame subprocesses; search-time staleness checks keep their short 3 second cap |
-| `ENGRAM_GREP_REGEX_TIMEOUT_SEC` | `2` | regex execution timeout for `grep_index`; clamped to `0.05..30` seconds |
-| `ENGRAM_USER_REGEX_TIMEOUT_SEC` | `1` | validation timeout for caller-supplied `ticket_regex`/`git_fix_regex` patterns before they are allowed to run in-process |
+| `ENGRAM_GREP_REGEX_TIMEOUT_SEC` | `2` | bare-child execution timeout for `grep_index`; clamped to `0.05..30` seconds |
+| `ENGRAM_GREP_REGEX_SUBPROCESS` | `on` | set to `0`/`false`/`no`/`off` to disable caller-regex execution for `grep_index` and return a partial warning |
+| `ENGRAM_USER_REGEX_TIMEOUT_SEC` | `1` | bare-child execution timeout for caller-supplied `ticket_regex`/`git_fix_regex`; trusted defaults still run in-process |
+| `ENGRAM_USER_REGEX_SUBPROCESS` | `on` | set to `0`/`false`/`no`/`off` to force caller-supplied ticket/fix regexes to degrade to the trusted default with a warning |
 | `ENGRAM_CACHE_MAX_MB` | unset (unlimited) | opt-in retention budget for the global embedding cache (`ENGRAM_HOME/global-cache/embeddings.sqlite`), in MB. Unset/`0`/negative means unlimited -- the cache never auto-deletes anything by default, since an evicted entry is invisible until the next time that exact chunk needs embedding again (then it's just a cache miss, silently re-paid). Only takes effect via `engram gc --prune` or the startup task (`ENGRAM_GC_ON_START`); never applied from a search or index path |
 | `ENGRAM_GC_ON_START` | `off` | set to `1`/`true`/`yes`/`on` to run the stale-generation reclaim (and, if `ENGRAM_CACHE_MAX_MB` is set, the embedding-cache prune) once in the background at server startup. Off by default: one server process runs per MCP client window and they share `ENGRAM_HOME`, so a generation this process calls stale may be the one another live process is mid-search on. Prefer the explicit `engram gc --prune`. Always skipped under `ENGRAM_READONLY=1` regardless of this setting |
 
@@ -420,7 +422,8 @@ ranked by lift, indentation complexity, and hotspot quadrant. Once the
 generation's SZZ sidecar is ready, rows also include SZZ defect signals
 (`defect_introducing_commits`, `defect_introducing_lines`,
 `defect_hotspot_score`); before that, `git_analytics.szz.status` reports
-`computing`, `partial`, or `unavailable` and defect fields are omitted.
+`computing`, `partial`, or `unavailable`, defect fields are omitted, and
+`fix_density` is `null` rather than a placeholder number.
 Indentation complexity is the sum of leading
 indentation depth over non-blank, non-comment-ish lines, with one depth unit per
 4 columns and tabs advancing to the next tab stop. SZZ attribution detects fix
