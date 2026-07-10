@@ -7,6 +7,7 @@ file kinds. Raw bodies stay in LanceDB.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,24 @@ def _atomic_write_json(path: Path, data) -> None:
 
 def save_catalog(pdir: Path, data: dict) -> None:
     _atomic_write_json(catalog_path(pdir, int(data.get("generation", 0))), data)
+
+
+def generation_for_table(table_name: str) -> int | None:
+    prefix = "chunks_g"
+    if not table_name.startswith(prefix):
+        return None
+    raw = table_name[len(prefix):]
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def drop_catalogs_for_generations(pdir: Path, generations: set[int]) -> None:
+    for generation in generations:
+        try:
+            catalog_path(pdir, generation).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def mark_catalog_stale(
@@ -112,9 +131,16 @@ def load_catalog(pdir: Path, generation: int) -> dict | None:
     return data
 
 
-def _dir_for(rel_path: str) -> str:
+def directory_for(rel_path: str) -> str:
+    """Return the normalized catalog directory facet for a relative path."""
+
     parent = Path(rel_path.replace("\\", "/")).parent.as_posix()
     return "." if parent == "." else parent
+
+
+# Compatibility alias for existing external callers; production code uses the
+# documented public name above.
+_dir_for = directory_for
 
 
 def derive_file_kinds(rel_path: str, language: str | None = None) -> list[dict]:
@@ -153,6 +179,30 @@ def derive_file_kinds(rel_path: str, language: str | None = None) -> list[dict]:
     return kinds
 
 
+def compute_catalog_token(
+    *, generation: int, active_table: str, row_count: int, rows: Iterable[dict]
+) -> str:
+    """Commit token for one generation's catalog, computed once at build time.
+
+    Covers exactly what the old per-search full id-set comparison protected --
+    generation number, active table name, row count, and a digest of the
+    chunk-id set -- but is computed exactly once, under the project lock, at
+    the same moment the catalog itself is written (see
+    ``index_repository._save_catalog_from_rows``). The identical string is also
+    written to the project manifest (``ProjectManifest.catalog_token``) in
+    the same locked section, so a search-time reader can compare the two
+    already-loaded strings in O(1) instead of re-scanning the active table.
+    The full id-set recomputation this token stands in for is still
+    available -- see ``index_repository.catalog_deep_validation_error``, used
+    only by ``diagnostics.doctor_project`` -- so genuine drift between a
+    catalog and its table remains detectable, just not on every search.
+    """
+
+    ids = sorted(str(r.get("chunk_id") or "") for r in rows if r.get("chunk_id"))
+    digest = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:32]
+    return f"{int(generation)}:{active_table}:{int(row_count)}:{digest}"
+
+
 def _symbol_entry(row: dict) -> dict | None:
     symbol = row.get("symbol") or ""
     if not symbol:
@@ -187,6 +237,7 @@ def build_catalog(
     rows: Iterable[dict],
     indexed_at: float,
 ) -> dict:
+    rows = list(rows)
     by_file: dict[str, dict] = {}
     role_counts: dict[str, Counter] = defaultdict(Counter)
     symbols: dict[str, list[dict]] = defaultdict(list)
@@ -197,7 +248,7 @@ def build_catalog(
         lang = meta.get("language") or ""
         by_file[rel_path] = {
             "path": rel_path,
-            "dir": _dir_for(rel_path),
+            "dir": directory_for(rel_path),
             "language": lang,
             "chunks": int(meta.get("chunks", 0) or 0),
             "indent_complexity": float(meta.get("indent_complexity", 0.0) or 0.0),
@@ -215,7 +266,7 @@ def build_catalog(
             lang = row.get("language") or ""
             by_file[rel] = {
                 "path": rel,
-                "dir": _dir_for(rel),
+                "dir": directory_for(rel),
                 "language": lang,
                 "chunks": 0,
                 "indent_complexity": 0.0,
@@ -260,6 +311,12 @@ def build_catalog(
         "indexed_at": indexed_at,
         "totals": totals,
         "files": files,
+        "catalog_token": compute_catalog_token(
+            generation=generation,
+            active_table=active_table,
+            row_count=len(rows),
+            rows=rows,
+        ),
     }
     return data
 
@@ -278,13 +335,18 @@ def chunk_lookup(data: dict) -> dict[str, tuple[dict, dict, int]]:
     return out
 
 
+#: Server-side maximum page size for project_map's dirs/files/symbols pages.
+#: A caller-supplied limit above this is clamped down (never rejected); see
+#: README "Server-side limits".
 _MAX_MAP_LIMIT = 1000
 
 
-def _coerce_limit(value: int | None, *, default: int) -> int:
+def _coerce_limit(value: int | None, *, default: int) -> tuple[int, bool]:
+    """Clamp a page-size limit to ``_MAX_MAP_LIMIT``. Returns ``(value, clamped)``."""
     if value is None:
         value = default
-    return max(0, min(int(value), _MAX_MAP_LIMIT))
+    coerced = max(0, min(int(value), _MAX_MAP_LIMIT))
+    return coerced, int(value) > _MAX_MAP_LIMIT
 
 
 def _coerce_offset(value: int) -> int:
@@ -346,6 +408,14 @@ def _filtered_totals(files: list[dict]) -> dict:
 
 def _page(items: list[dict], *, offset: int, limit: int) -> tuple[list[dict], dict]:
     total = len(items)
+    if limit <= 0:
+        return [], {
+            "offset": offset,
+            "limit": limit,
+            "count": 0,
+            "total": total,
+            "has_more": False,
+        }
     selected = items[offset : offset + limit]
     return selected, {
         "offset": offset,
@@ -372,6 +442,55 @@ def _compact_file_row(file_row: dict, *, include_symbols: bool, symbols_limit: i
         row["symbols"] = list(symbols[:symbols_limit])
         row["symbols_has_more"] = len(symbols) > symbols_limit
     return row
+
+
+# Server-side budgets for path_glob: without them, a pattern built entirely
+# from "**" segments (e.g. "**/**/**/.../x") makes the naive recursive
+# matcher below explore exponentially many (path_idx, pattern_idx) pairs on a
+# path that doesn't match -- see test_catalog_path_glob_pathological_pattern
+# for a pattern that would not finish in any reasonable time without the
+# memoization added below.
+_MAX_GLOB_PATTERN_CHARS = 512
+_MAX_GLOB_PATTERN_SEGMENTS = 64
+
+
+def _segment_glob_match(path: str, pattern: str) -> bool:
+    if len(pattern) > _MAX_GLOB_PATTERN_CHARS:
+        return False
+    path_parts = [part for part in path.replace("\\", "/").split("/") if part]
+    pattern_parts = [part for part in pattern.replace("\\", "/").split("/") if part]
+    if len(pattern_parts) > _MAX_GLOB_PATTERN_SEGMENTS:
+        return False
+
+    # Memoized on (path_idx, pattern_idx): each pair is evaluated at most
+    # once, bounding the whole match to O(len(path_parts) * len(pattern_parts))
+    # instead of the naive recursion's exponential blowup on adversarial "**"
+    # runs.
+    memo: dict[tuple[int, int], bool] = {}
+
+    def match_from(path_idx: int, pattern_idx: int) -> bool:
+        key = (path_idx, pattern_idx)
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
+        if pattern_idx == len(pattern_parts):
+            result = path_idx == len(path_parts)
+        else:
+            part = pattern_parts[pattern_idx]
+            if part == "**":
+                result = match_from(path_idx, pattern_idx + 1) or (
+                    path_idx < len(path_parts) and match_from(path_idx + 1, pattern_idx)
+                )
+            elif path_idx >= len(path_parts):
+                result = False
+            else:
+                result = fnmatchcase(path_parts[path_idx], part) and match_from(
+                    path_idx + 1, pattern_idx + 1
+                )
+        memo[key] = result
+        return result
+
+    return match_from(0, 0)
 
 
 def _filter_files(
@@ -417,7 +536,7 @@ def _filter_files(
             continue
         if prefix and not _matches_prefix(path, prefix):
             continue
-        if glob and not fnmatchcase(path, glob):
+        if glob and not _segment_glob_match(path, glob):
             continue
         if symbol_kind_filter and not _symbol_kind_values(file_row).intersection(symbol_kind_filter):
             continue
@@ -449,13 +568,25 @@ def project_map(
     min_symbols: int = 0,
     non_empty: bool = True,
 ) -> dict:
-    depth = max(0, min(int(depth), 20))
-    dirs_limit_value = _coerce_limit(dirs_limit, default=200)
+    depth_requested = int(depth)
+    depth = max(0, min(depth_requested, 20))
+    dirs_limit_value, dirs_limit_clamped = _coerce_limit(dirs_limit, default=200)
     dirs_offset_value = _coerce_offset(dirs_offset)
-    files_limit_value = _coerce_limit(files_limit, default=50)
+    files_limit_value, files_limit_clamped = _coerce_limit(files_limit, default=50)
     files_offset_value = _coerce_offset(files_offset)
-    symbols_limit_value = _coerce_limit(symbols_limit, default=20)
+    symbols_limit_value, symbols_limit_clamped = _coerce_limit(symbols_limit, default=20)
     sort = sort if sort in {"path", "files", "chunks", "symbols"} else "path"
+    warnings: list[str] = []
+    if depth_requested > 20:
+        warnings.append(f"depth clamped to server maximum 20 (requested {depth_requested})")
+    if dirs_limit_clamped:
+        warnings.append(f"dirs_limit clamped to server maximum {_MAX_MAP_LIMIT} (requested {dirs_limit})")
+    if files_limit_clamped:
+        warnings.append(f"files_limit clamped to server maximum {_MAX_MAP_LIMIT} (requested {files_limit})")
+    if symbols_limit_clamped:
+        warnings.append(
+            f"symbols_limit clamped to server maximum {_MAX_MAP_LIMIT} (requested {symbols_limit})"
+        )
 
     filtered_files = _filter_files(
         data.get("files", []),
@@ -566,6 +697,7 @@ def project_map(
         "filtered_totals": _filtered_totals(files),
         "dirs_page": dirs_page,
         "files_page": files_page,
+        "warnings": warnings,
         "dirs": dirs_page_rows,
         "files": file_rows,
     }

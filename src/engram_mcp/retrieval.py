@@ -50,7 +50,9 @@ def _rrf(rank: int, k: int = 60) -> float:
     return 1.0 / (k + rank)
 
 
-def _role_boost(role: str | None) -> float:
+def role_boost(role: str | None) -> float:
+    """Return the deterministic ranking adjustment for a chunk role."""
+
     return _ROLE_SCORE_BOOST.get(role or "", 0.0)
 
 
@@ -92,7 +94,7 @@ def hybrid_search(
             e["score"] += 0.20
         if qtoks & base_toks:
             e["score"] += 0.05
-        e["score"] += _role_boost(h.get("chunk_role"))
+        e["score"] += role_boost(h.get("chunk_role"))
 
     ranked = sorted(fused.values(), key=lambda e: e["score"], reverse=True)
     out = []

@@ -1,11 +1,19 @@
 """Chunking: tree-sitter AST-aware for grammar languages, line-window fallback.
 
 Strategy (AST path):
-  * Walk top-level nodes. Consecutive non-definition nodes (imports, constants)
-    are clustered into a ``module`` chunk.
+  * Walk top-level nodes. Consecutive non-definition nodes (imports, ...) are
+    clustered into a ``module`` chunk.
   * Each definition (function/class/method/type/...) becomes a symbol chunk.
     JS/TS ``export`` wrappers and ``const x = () => ...`` are unwrapped so they
     are recognized as definitions, not anonymous module text.
+  * At true module scope, a constant/variable definition (Python `NAME =
+    value`, JS/TS top-level `const`, Go `const`/`var`, Rust `const`/`static`)
+    also becomes its own symbol chunk instead of being folded into the
+    ``module`` bundle -- see `const_defs` in `_ast_chunks` for exactly which
+    languages/node shapes are covered. This is what makes `find_definition`
+    and the search symbol-boost (`retrieval.hybrid_search`) work for a bare
+    constant name like `MAX_FILE_BYTES`, since both key off a chunk's
+    `symbol`/`symbol_kind` regardless of what kind of definition it is.
   * A definition over the token cap is split: a header chunk (signature +
     decorators) is emitted, then we recurse into the body's nested definitions;
     if there are none, the whole span is line-window split.
@@ -385,6 +393,94 @@ def _ast_chunks(rel_path: str, language: str, text: str, parser) -> list[Chunk]:
             return (name_of(node), t, node.child_by_field_name("body"))
         return None
 
+    def const_defs(node) -> list[tuple[str, str, object]]:
+        """Module-level constant/variable definitions understood for `language`.
+
+        Returns ``[(symbol, kind, span_node), ...]`` -- a statement can name
+        more than one constant (JS/TS ``const A = 1, B = 2``; Go's grouped
+        ``const ( ... )`` block), so each gets its own (symbol, kind) using
+        its own sub-node's span, not the whole statement's. Only consulted at
+        true module scope (see `top_level` in `walk_children`) so a local
+        `x = 1` inside a function/method body is never mistaken for a
+        top-level definition.
+
+        Covered: Python (any `NAME = value` / `NAME: T = value` statement),
+        JavaScript/TypeScript/TSX (top-level `const` only -- `let`/`var` are
+        ordinary mutable bindings, not "constants"), Go (`const`/`var`
+        declarations, including the grouped `const ( ... )` form), Rust
+        (`const`/`static` items). Skipped: Java/C#/Ruby, which have no true
+        module scope -- every binding lives inside a class/module construct,
+        so "module-level" doesn't apply the same way and folding class-level
+        fields in here would blur this feature with class-member indexing,
+        a separate concern. C/C++ top-level `const` declarations use the
+        same value-bearing `declaration` node as ordinary (non-const)
+        declarations, and `#define` is a distinct preprocessor node
+        (`preproc_def`) needing its own name/value extraction -- both
+        skipped for now as a follow-up rather than folded into this pass.
+        """
+        t = node.type
+        if language == "python":
+            if t != "expression_statement" or len(node.named_children) != 1:
+                return []
+            inner = node.named_children[0]
+            if inner.type != "assignment":
+                return []
+            left = inner.child_by_field_name("left")
+            if left is None or left.type != "identifier":
+                return []  # skip tuple/attribute/subscript targets
+            return [(text_of(left), "assignment", node)]
+        if language in ("javascript", "typescript", "tsx"):
+            if t == "export_statement":
+                # `export const X = 1` -- unwrap like def_info() does, so an
+                # exported module-level constant isn't missed just because
+                # it's wrapped.
+                inner = next(
+                    (c for c in node.named_children if c.type == "lexical_declaration"), None
+                )
+                if inner is None:
+                    return []
+                node, t = inner, inner.type
+            if t != "lexical_declaration" or not node.children or node.children[0].type != "const":
+                return []
+            out = []
+            for decl in node.named_children:
+                if decl.type != "variable_declarator":
+                    continue
+                nm = decl.child_by_field_name("name")
+                if nm is None or nm.type != "identifier":
+                    continue
+                out.append((text_of(nm), "lexical_declaration", decl))
+            return out
+        if language == "go":
+            if t not in ("const_declaration", "var_declaration"):
+                return []
+            spec_type = "const_spec" if t == "const_declaration" else "var_spec"
+            out = []
+            for spec in node.named_children:
+                if spec.type != spec_type:
+                    continue
+                nm = spec.child_by_field_name("name")
+                if nm is None:
+                    continue
+                out.append((text_of(nm), spec_type, spec))
+            return out
+        if language == "rust":
+            if t not in ("const_item", "static_item"):
+                return []
+            nm = node.child_by_field_name("name")
+            if nm is None:
+                return []
+            return [(text_of(nm), t, node)]
+        return []
+
+    def emit_const(name: str, kind: str, node) -> None:
+        nt = text_of(node)
+        s, e = span(node)
+        if _est_tokens(nt) <= config.CHUNK_MAX_TOKENS:
+            chunks.append(Chunk(rel_path, language, name, kind, s, e, nt, _est_tokens(nt)))
+            return
+        chunks.extend(_line_window_chunks(rel_path, language, lines[s - 1 : e], s, name, kind))
+
     def emit_def(node, parent: str | None, info) -> None:
         nm, kind, body = info
         full = f"{parent}.{nm}" if parent and nm else (nm or parent)
@@ -409,7 +505,7 @@ def _ast_chunks(rel_path: str, language: str, text: str, parser) -> list[Chunk]:
         else:
             chunks.extend(_line_window_chunks(rel_path, language, lines[s - 1 : e], s, full, kind))
 
-    def walk_children(children, parent: str | None) -> None:
+    def walk_children(children, parent: str | None, top_level: bool = False) -> None:
         buf_start: int | None = None
         buf_end: int | None = None
 
@@ -436,13 +532,20 @@ def _ast_chunks(rel_path: str, language: str, text: str, parser) -> list[Chunk]:
             if info is not None:
                 flush()
                 emit_def(child, parent, info)
-            else:
-                s, e = span(child)
-                if buf_start is None:
-                    buf_start = s
-                buf_end = e
+                continue
+            if top_level:
+                consts = const_defs(child)
+                if consts:
+                    flush()
+                    for name, kind, cnode in consts:
+                        emit_const(name, kind, cnode)
+                    continue
+            s, e = span(child)
+            if buf_start is None:
+                buf_start = s
+            buf_end = e
         flush()
 
-    walk_children(tree.root_node.named_children, None)
+    walk_children(tree.root_node.named_children, None, top_level=True)
     chunks.sort(key=lambda c: (c.start_line, c.end_line))
     return chunks

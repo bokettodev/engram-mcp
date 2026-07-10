@@ -36,9 +36,10 @@ def fts_count_max_scan() -> int:
 
 class LanceStore:
     def __init__(self, db_dir: str | Path, dim: int, table: str = "chunks"):
-        self.db = lancedb.connect(str(db_dir))
+        self.db_dir = Path(db_dir)
         self.dim = dim
         self.table = table
+        self._db = None
         self._schema = pa.schema(
             [
                 ("chunk_id", pa.string()),
@@ -57,7 +58,20 @@ class LanceStore:
             ]
         )
 
+    @property
+    def db(self):
+        # Lazy: `lancedb.connect` creates a missing directory as a side effect, so
+        # this must not run merely from constructing a LanceStore (doctor_project
+        # and other read paths build one just to call `.exists()`).
+        if self._db is None:
+            self._db = lancedb.connect(str(self.db_dir))
+        return self._db
+
     def exists(self) -> bool:
+        # A missing db_dir means "no table" without ever connecting (connecting
+        # would create the directory, which read-only callers must not trigger).
+        if not self.db_dir.exists():
+            return False
         # list_tables() returns a ListTablesResponse; the names live in .tables
         return self.table in self.db.list_tables().tables
 
@@ -121,21 +135,29 @@ class LanceStore:
         if self.exists():
             self.db.drop_table(self.table)
 
-    def drop_stale_generations(self, keep: set[str]) -> None:
+    def drop_stale_generations(self, keep: set[str]) -> set[str]:
         """Drop leftover ``chunks*`` tables not in ``keep`` (post-swap cleanup)."""
         try:
             names = self.db.list_tables().tables
         except Exception:
-            return
+            return set()
+        dropped: set[str] = set()
         for name in names:
             if name.startswith("chunks") and name not in keep:
                 try:
                     self.db.drop_table(name)
+                    dropped.add(name)
                 except Exception:
                     pass
+        return dropped
 
     def count(self) -> int:
         return self.db.open_table(self.table).count_rows() if self.exists() else 0
+
+    def expected_schema_names(self) -> list[str]:
+        """Return the schema columns expected for a table managed by this store."""
+
+        return list(self._schema.names)
 
     def schema_names(self) -> list[str]:
         if not self.exists():
@@ -268,6 +290,22 @@ class LanceStore:
         pred = f"symbol = '{safe}' OR symbol LIKE '%.{like}' ESCAPE '\\'"
         try:
             rows = self.db.open_table(self.table).search().where(pred).limit(k).to_list()
+        except Exception:
+            return []
+        for r in rows:  # drop the bulky embed-side columns
+            r.pop("vector", None)
+            r.pop("search_text", None)
+        return rows
+
+    def by_rel_path(self, rel_path: str, k: int = 500) -> list[dict]:
+        """Metadata lookup: all chunk rows indexed for one file path."""
+        if not self.exists():
+            return []
+        safe = rel_path.replace("'", "''")
+        try:
+            rows = self.db.open_table(self.table).search().where(
+                f"rel_path = '{safe}'"
+            ).limit(k).to_list()
         except Exception:
             return []
         for r in rows:  # drop the bulky embed-side columns
