@@ -1,16 +1,17 @@
 """Deterministic VCS analytics over compact git history.
 
 This module is intentionally pure: no git, no filesystem, no model calls. It
-consumes the compact records returned by ``gitmeta.commit_log`` or stored in a
-catalog sidecar.
+consumes compact records returned by ``gitmeta.commit_log_with_status`` or
+stored in the shared git-analytics sidecar.
 """
 
 from __future__ import annotations
 
-import re
 from collections import Counter, defaultdict
 from statistics import median
 from typing import Iterable
+
+from engram_mcp import regexsafe
 
 DEFAULT_TICKET_REGEX = r"(?P<ticket>[A-Z][A-Z0-9]+-\d+|#[0-9]+)"
 DEFAULT_FIX_REGEX = r"(?i)\b(fix(e[sd])?|bug|hotfix|patch|close[sd]?\s+#\d+)\b"
@@ -138,17 +139,23 @@ def _change_set(change_id: str, commits: list[dict]) -> dict | None:
     }
 
 
-def _compile_ticket_regex(ticket_regex: str | None) -> re.Pattern[str]:
-    return re.compile(ticket_regex or DEFAULT_TICKET_REGEX)
-
-
-def _ticket_id(commit: dict, rx: re.Pattern[str]) -> str:
-    match = rx.search(str(commit.get("message") or ""))
-    if not match:
-        return str(commit.get("commit") or "")
-    if "ticket" in match.groupdict():
-        return match.group("ticket")
-    return match.group(1) if match.groups() else match.group(0)
+def _ticket_ids(
+    commits: list[dict],
+    ticket_regex: str | None,
+    regex_cache: regexsafe.RegexRequestCache | None = None,
+) -> tuple[list[str], list[str]]:
+    messages = [str(commit.get("message") or "") for commit in commits]
+    runner = regex_cache.extract_first_or_default if regex_cache is not None else regexsafe.extract_first_or_default
+    _pattern, extracted, warnings = runner(
+        ticket_regex,
+        DEFAULT_TICKET_REGEX,
+        messages,
+        label="ticket_regex",
+    )
+    ids: list[str] = []
+    for commit, ticket in zip(commits, extracted, strict=False):
+        ids.append(str(ticket or commit.get("commit") or ""))
+    return ids, warnings
 
 
 def _append_filtered(
@@ -173,6 +180,7 @@ def group_changes_result(
     ticket_regex: str | None = None,
     window_hours: float = 2.0,
     max_files_per_change: int = 50,
+    regex_cache: regexsafe.RegexRequestCache | None = None,
 ) -> dict:
     """Group commits into logical changes and report skipped/noise counts."""
 
@@ -197,11 +205,10 @@ def group_changes_result(
                 max_files_per_change=max_files,
             )
     elif mode == "ticket":
-        rx = _compile_ticket_regex(ticket_regex)
+        ticket_ids, regex_warnings = _ticket_ids(items, ticket_regex, regex_cache=regex_cache)
         grouped: dict[str, list[dict]] = {}
         order: list[str] = []
-        for commit in items:
-            key = _ticket_id(commit, rx)
+        for commit, key in zip(items, ticket_ids, strict=False):
             if not key:
                 key = str(commit.get("commit") or f"commit-{len(order)}")
             if key not in grouped:
@@ -286,6 +293,7 @@ def group_changes_result(
         "skipped_merge_commits": int(skipped["merge"]),
         "skipped_empty_changes": int(skipped["empty"]),
         "group_by": mode,
+        "regex_warnings": regex_warnings if mode == "ticket" else [],
     }
 
 
@@ -295,6 +303,7 @@ def group_changes(
     ticket_regex: str | None = None,
     window_hours: float = 2.0,
     max_files_per_change: int = 50,
+    regex_cache: regexsafe.RegexRequestCache | None = None,
 ) -> list[dict]:
     """Return logical change-sets after merge/noise filtering."""
 
@@ -305,6 +314,7 @@ def group_changes(
             ticket_regex=ticket_regex,
             window_hours=window_hours,
             max_files_per_change=max_files_per_change,
+            regex_cache=regex_cache,
         )["change_sets"]
     )
 
@@ -352,23 +362,44 @@ def cochange(change_sets: Iterable[dict], limit: int | None = 5) -> dict[str, li
     return dict(sorted(out.items()))
 
 
-def churn(
+def churn_result(
     change_sets: Iterable[dict],
     now_ts: int | None = None,
     recent_days: int = 90,
     fix_regex: str | None = DEFAULT_FIX_REGEX,
-) -> dict[str, dict]:
-    """Compute per-file churn/recency/fix-density counts."""
+    regex_cache: regexsafe.RegexRequestCache | None = None,
+) -> dict:
+    """Compute per-file churn/recency/fix-density counts and regex warnings."""
 
     changes = [c for c in change_sets if isinstance(c, dict)]
     if now_ts is None:
         now_ts = max([int(c.get("ts", 0) or 0) for c in changes] or [0])
     recent_cutoff = int(now_ts) - max(0, int(recent_days or 0)) * 86400
-    fix_rx = re.compile(fix_regex or DEFAULT_FIX_REGEX)
+    messages_by_change: list[list[str]] = []
+    flat_messages: list[str] = []
+    for change in changes:
+        messages = [str(message or "") for message in (change.get("messages") or [])]
+        if not messages:
+            messages = [str(change.get("message") or "")]
+        messages_by_change.append(messages)
+        flat_messages.extend(messages)
+    runner = regex_cache.search_many_or_default if regex_cache is not None else regexsafe.search_many_or_default
+    _fix_pattern, message_hits, regex_warnings = runner(
+        fix_regex,
+        DEFAULT_FIX_REGEX,
+        flat_messages,
+        label="fix_regex",
+    )
+    fix_by_change: list[bool] = []
+    offset = 0
+    for messages in messages_by_change:
+        width = len(messages)
+        fix_by_change.append(any(message_hits[offset : offset + width]))
+        offset += width
 
     stats: dict[str, dict] = {}
     fix_hits: Counter[str] = Counter()
-    for change in changes:
+    for idx, change in enumerate(changes):
         files = sorted({_norm_path(path) for path in (change.get("files") or []) if _norm_path(path)})
         if not files:
             continue
@@ -376,10 +407,7 @@ def churn(
             ts = int(change.get("ts", 0) or 0)
         except (TypeError, ValueError):
             ts = 0
-        messages = [str(message or "") for message in (change.get("messages") or [])]
-        if not messages:
-            messages = [str(change.get("message") or "")]
-        is_fix = any(fix_rx.search(message) for message in messages)
+        is_fix = fix_by_change[idx] if idx < len(fix_by_change) else False
         churn_by_path: Counter[str] = Counter()
         for entry in change.get("paths") or []:
             if not isinstance(entry, dict):
@@ -409,7 +437,29 @@ def churn(
     for path, row in stats.items():
         changes = max(1, int(row["changes"]))
         row["fix_density"] = round(fix_hits[path] / changes, 6)
-    return dict(sorted(stats.items()))
+    return {
+        "files": dict(sorted(stats.items())),
+        "regex_warnings": regex_warnings,
+        "fix_regex": _fix_pattern,
+    }
+
+
+def churn(
+    change_sets: Iterable[dict],
+    now_ts: int | None = None,
+    recent_days: int = 90,
+    fix_regex: str | None = DEFAULT_FIX_REGEX,
+    regex_cache: regexsafe.RegexRequestCache | None = None,
+) -> dict[str, dict]:
+    """Compute per-file churn/recency/fix-density counts."""
+
+    return churn_result(
+        change_sets,
+        now_ts=now_ts,
+        recent_days=recent_days,
+        fix_regex=fix_regex,
+        regex_cache=regex_cache,
+    )["files"]
 
 
 def _complexity_for(file_row: dict) -> dict:

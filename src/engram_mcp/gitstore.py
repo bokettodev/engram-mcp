@@ -14,7 +14,7 @@ from typing import Any
 
 from engram_mcp import paths
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HISTORY_FILE = "history.json"
 SZZ_FILE = "szz.json"
 SZZ_STATUSES = {"computing", "partial", "ready", "unavailable"}

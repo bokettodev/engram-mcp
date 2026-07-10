@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from engram_mcp import paths
+from engram_mcp import paths, regexsafe
 
 # Env that makes git non-interactive and non-blocking: never prompt for
 # credentials, never wait on/ take .git/index.lock (git status), never talk to
@@ -33,15 +33,61 @@ _GIT_ENV = {
     "GIT_ASKPASS": "",
     "GIT_CONFIG_NOSYSTEM": "1",
 }
-_GIT_TIMEOUT_SEC = 3.0
+GIT_STALENESS_TIMEOUT_SEC = 3.0
+# Compatibility alias for tests and external callers using the former name.
+_GIT_STALENESS_TIMEOUT_SEC = GIT_STALENESS_TIMEOUT_SEC
+_GIT_INDEX_TIMEOUT_SEC = 120.0
 _LOG_RECORD_SEP = "\x1e"
 _LOG_FIELD_SEP = "\x1f"
 DEFAULT_FIX_REGEX = r"(?i)\b(fix(e[sd])?|bug|hotfix|patch|close[sd]?\s+#\d+)\b"
 _HUNK_RE = re.compile(r"@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+\d+(?:,\d+)? @@")
+_REGEX_DIAGNOSTIC_CHARS = 120
 
 
 def _ms_since(start: float) -> float:
     return round((time.perf_counter() - start) * 1000.0, 3)
+
+
+def requested_fix_regex_value(fix_regex: str | None) -> str:
+    """Return the operator-requested git fix regex identity."""
+
+    return str(fix_regex) if fix_regex is not None else DEFAULT_FIX_REGEX
+
+
+def _clip_regex_for_warning(pattern: str) -> str:
+    if len(pattern) <= _REGEX_DIAGNOSTIC_CHARS:
+        return pattern
+    return pattern[:_REGEX_DIAGNOSTIC_CHARS] + "..."
+
+
+def _fix_regex_warnings(
+    requested: str | None,
+    effective: str,
+    warnings: Iterable[str],
+) -> list[str]:
+    out = [str(w) for w in warnings if str(w)]
+    requested_text = requested_fix_regex_value(requested)
+    if requested_text != effective:
+        diagnostic = (
+            f"requested git_fix_regex {_clip_regex_for_warning(requested_text)!r} "
+            f"resolved to {effective!r}; using effective regex"
+        )
+        if diagnostic not in out:
+            out.insert(0, diagnostic)
+    return out[:50]
+
+
+def git_index_timeout_seconds() -> float:
+    """Return the generous git timeout used only for index/background analytics."""
+
+    raw = os.environ.get("ENGRAM_GIT_INDEX_TIMEOUT", "").strip()
+    if not raw:
+        return _GIT_INDEX_TIMEOUT_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        return _GIT_INDEX_TIMEOUT_SEC
+    return max(1.0, min(value, 3600.0))
 
 
 def _szz_worker_config() -> tuple[int, str | None]:
@@ -68,6 +114,20 @@ def _staleness_disabled() -> bool:
     return os.environ.get("ENGRAM_GIT_STALENESS", "").strip().lower() in {"0", "false", "no", "off"}
 
 
+def git_analytics_default() -> bool:
+    """Default for whether index/project_map compute git-history analytics.
+
+    Precedence (enforced by callers, not here): explicit argument >
+    ``ENGRAM_GIT_ANALYTICS`` > this built-in default (enabled). Parsed the
+    same way as ``ENGRAM_GIT_STALENESS``/``ENGRAM_RERANK_ENABLED``: only
+    ``0``/``false``/``no``/``off`` (case-insensitive) disables; unset or any
+    other value keeps analytics on.
+    """
+    return os.environ.get("ENGRAM_GIT_ANALYTICS", "").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
     try:
         if sys.platform == "win32":
@@ -86,7 +146,13 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def _git(root: Path, *args: str) -> str | None:
+def kill_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate a subprocess and its descendants without propagating errors."""
+
+    _kill_tree(proc)
+
+
+def _git(root: Path, *args: str, timeout_sec: float = _GIT_STALENESS_TIMEOUT_SEC) -> str | None:
     """Run a read-only git command, guaranteed to return (never hang).
 
     Diagnostic only: any failure/timeout returns None, and the whole process
@@ -126,7 +192,7 @@ def _git(root: Path, *args: str) -> str | None:
     except OSError:
         return None
     try:
-        out, _ = proc.communicate(timeout=_GIT_TIMEOUT_SEC)
+        out, _ = proc.communicate(timeout=timeout_sec)
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
         return None
@@ -138,7 +204,11 @@ def _git(root: Path, *args: str) -> str | None:
     return out.strip()
 
 
-def _git_dir(git_dir: Path, *args: str) -> str | None:
+def _git_dir(
+    git_dir: Path,
+    *args: str,
+    timeout_sec: float = _GIT_STALENESS_TIMEOUT_SEC,
+) -> str | None:
     """Run a read-only git command directly against a git common dir."""
 
     if _staleness_disabled():
@@ -174,7 +244,7 @@ def _git_dir(git_dir: Path, *args: str) -> str | None:
     except OSError:
         return None
     try:
-        out, _ = proc.communicate(timeout=_GIT_TIMEOUT_SEC)
+        out, _ = proc.communicate(timeout=timeout_sec)
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
         return None
@@ -208,6 +278,26 @@ def _canonical_git_path(value: str | None, *, base: Path) -> str:
 
 def _path_key(value: str) -> str:
     return os.path.normcase(value.replace("\\", "/"))
+
+
+def _parse_status_v2_branch(text: str | None) -> tuple[str, str, bool]:
+    ref = ""
+    commit = ""
+    dirty = False
+    for line in (text or "").splitlines():
+        if line.startswith("# branch.oid "):
+            oid = line.removeprefix("# branch.oid ").strip()
+            if oid != "(initial)":
+                commit = oid
+        elif line.startswith("# branch.head "):
+            head = line.removeprefix("# branch.head ").strip()
+            if head and head != "(detached)":
+                ref = head
+        elif line and not line.startswith("#"):
+            dirty = True
+    if not ref and commit:
+        ref = commit[:12]
+    return ref, commit, dirty
 
 
 def common_dir_for_worktree(root: str | Path) -> str:
@@ -467,13 +557,14 @@ def _blame_commits_for_range(
         revision,
         "--",
         path,
+        timeout_sec=git_index_timeout_seconds(),
     )
     commits: Counter[str] = Counter()
     if out is None:
         return commits
     for line in out.splitlines():
         token = line.split(" ", 1)[0]
-        if not re.fullmatch(r"[0-9a-f]{40}", token):
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", token):
             continue
         if token == excluded_commit or set(token) == {"0"}:
             continue
@@ -506,8 +597,11 @@ def _szz_empty_payload(
     }
 
 
-def _fix_commits_for_szz(commits: Iterable[dict], fix_rx: re.Pattern[str]) -> list[dict]:
-    out: list[dict] = []
+def _fix_candidates_and_messages(
+    commits: Iterable[dict],
+) -> tuple[list[dict], list[str]]:
+    candidates: list[dict] = []
+    messages: list[str] = []
     seen: set[str] = set()
     for commit in commits:
         if not isinstance(commit, dict):
@@ -518,11 +612,55 @@ def _fix_commits_for_szz(commits: Iterable[dict], fix_rx: re.Pattern[str]) -> li
         parents = [str(parent) for parent in (commit.get("parents") or []) if str(parent)]
         if len(parents) != 1:
             continue
-        if not fix_rx.search(str(commit.get("message") or "")):
-            continue
         seen.add(commit_id)
-        out.append(commit)
-    return out
+        candidates.append(commit)
+        messages.append(str(commit.get("message") or ""))
+    return candidates, messages
+
+
+def _fix_commits_for_szz(
+    commits: Iterable[dict],
+    fix_regex: str | None,
+) -> tuple[str, list[dict], list[str]]:
+    """Resolve requested git_fix_regex to the effective regex over real messages.
+
+    This is the single point where the caller-supplied regex is actually
+    executed against commit messages (in a bounded worker when non-default).
+    Callers that already have this result (e.g. from ``history_for_shared_store``)
+    must reuse it via ``fix_commits_from_ids`` instead of resolving again —
+    each additional resolution is a chance for a nondeterministic worker
+    timeout/crash to disagree with the first resolution and desync the
+    persisted fix-regex identity.
+    """
+
+    candidates, messages = _fix_candidates_and_messages(commits)
+    out: list[dict] = []
+    fix_regex_value, hits, regex_warnings = regexsafe.search_many_or_default(
+        fix_regex,
+        DEFAULT_FIX_REGEX,
+        messages,
+        label="git_fix_regex",
+    )
+    regex_warnings = _fix_regex_warnings(fix_regex, fix_regex_value, regex_warnings)
+    for commit, hit in zip(candidates, hits, strict=False):
+        if hit:
+            out.append(commit)
+    return fix_regex_value, out, regex_warnings
+
+
+def fix_commits_from_ids(commits: Iterable[dict], fix_commit_ids: Iterable[str] | None) -> list[dict]:
+    """Recover the fix-commit dicts a prior regex resolution selected.
+
+    Used to reuse a fix-commit identity computed once (e.g. at history-build
+    time) without re-executing the caller's regex against commit messages.
+    """
+
+    if fix_commit_ids is None:
+        return []
+    wanted = {str(cid) for cid in fix_commit_ids if str(cid)}
+    if not wanted:
+        return []
+    return [commit for commit in commits if isinstance(commit, dict) and str(commit.get("commit") or "") in wanted]
 
 
 def _normalize_szz_attribution(item: dict, *, fix_commit: str) -> dict | None:
@@ -659,6 +797,7 @@ def _szz_attributions_for_fix_commit(root: Path, commit: dict) -> dict:
         parent,
         commit_id,
         "--",
+        timeout_sec=git_index_timeout_seconds(),
     )
     if diff is None:
         return _failed_szz_commit_payload(commit_id, f"diff unavailable for {commit_id[:12]}")
@@ -773,6 +912,7 @@ def szz_attributions_with_status(
     commits: Iterable[dict],
     *,
     fix_regex: str | None = None,
+    fix_commits: Iterable[dict] | None = None,
     previous: dict | None = None,
     progress: Callable[[dict], None] | None = None,
 ) -> dict:
@@ -780,11 +920,26 @@ def szz_attributions_with_status(
 
     Failures are reported as ``partial``/``unavailable`` instead of raised so
     index jobs do not fail solely because optional VCS analytics degraded.
+
+    ``fix_commits``, when given, is the fix-commit identity a prior regex
+    resolution already computed (e.g. via ``history_for_shared_store`` /
+    ``fix_commits_from_ids``) for this exact ``fix_regex`` + corpus. Passing it
+    skips re-executing the caller regex here: a second execution of a
+    catastrophic-backtracking pattern is a second chance for the bounded
+    worker to time out/crash and disagree with the first resolution, which
+    would desync the persisted fix-regex identity between the history and the
+    SZZ sidecar. Omit it only for standalone callers (tests, ad-hoc CLI use)
+    that have not already resolved the regex.
     """
 
     total_start = time.perf_counter()
     workers, worker_warning = _szz_worker_config()
-    fix_regex_value = fix_regex or DEFAULT_FIX_REGEX
+    fix_regex_value, regex_warnings = regexsafe.pattern_or_default(
+        fix_regex,
+        DEFAULT_FIX_REGEX,
+        label="git_fix_regex",
+    )
+    regex_warnings = _fix_regex_warnings(fix_regex, fix_regex_value, regex_warnings)
     if _staleness_disabled():
         return {
             **_szz_empty_payload(
@@ -807,20 +962,10 @@ def szz_attributions_with_status(
             ),
             "timings_ms": {"total": _ms_since(total_start), "blame": 0.0},
         }
-    try:
-        fix_rx = re.compile(fix_regex_value)
-    except re.error as exc:
-        return {
-            **_szz_empty_payload(
-                status="unavailable",
-                warning=f"invalid fix regex: {exc}",
-                fix_regex=fix_regex_value,
-                workers=workers,
-            ),
-            "timings_ms": {"total": _ms_since(total_start), "blame": 0.0},
-        }
-
-    fix_commits = _fix_commits_for_szz(commits, fix_rx)
+    if fix_commits is not None:
+        fix_commits = [c for c in fix_commits if isinstance(c, dict)]
+    else:
+        fix_regex_value, fix_commits, regex_warnings = _fix_commits_for_szz(commits, fix_regex)
     cache = _szz_cache_from_previous(previous)
     fix_ids = {str(commit.get("commit") or "") for commit in fix_commits}
     cached = {fix_id: payload for fix_id, payload in cache.items() if fix_id in fix_ids}
@@ -828,6 +973,9 @@ def szz_attributions_with_status(
     cached_commits = len(cached)
     blamed_commits = 0
     blame_start = time.perf_counter()
+    combined_warning = "; ".join(
+        [*(regex_warnings or []), *([worker_warning] if worker_warning else [])]
+    ) or None
 
     def emit_progress() -> None:
         if progress is None:
@@ -840,7 +988,7 @@ def szz_attributions_with_status(
                 workers=workers,
                 cached_commits=cached_commits,
                 blamed_commits=blamed_commits,
-                worker_warning=worker_warning,
+                worker_warning=combined_warning,
                 total_start=total_start,
                 blame_start=blame_start,
                 complete=False,
@@ -886,7 +1034,7 @@ def szz_attributions_with_status(
         workers=workers,
         cached_commits=cached_commits,
         blamed_commits=blamed_commits,
-        worker_warning=worker_warning,
+        worker_warning=combined_warning,
         total_start=total_start,
         blame_start=blame_start,
         complete=True,
@@ -900,6 +1048,7 @@ def commit_log_with_status(
     *,
     all_refs: bool = False,
     git_dir: bool = False,
+    timeout_sec: float | None = None,
 ) -> dict:
     """Return a compact parsed git history or an unavailable status.
 
@@ -937,103 +1086,15 @@ def commit_log_with_status(
     if rev_range:
         args.append(rev_range)
     args.append("--")
-    out = _git_dir(path, *args) if git_dir else _git(path, *args)
+    timeout = _GIT_STALENESS_TIMEOUT_SEC if timeout_sec is None else timeout_sec
+    out = (
+        _git_dir(path, *args, timeout_sec=timeout)
+        if git_dir
+        else _git(path, *args, timeout_sec=timeout)
+    )
     if out is None:
         return {"status": "unavailable", "warning": "git log unavailable", "commits": []}
     return {"status": "ready", "warning": "", "commits": _parse_log_output(out)}
-
-
-def commit_log(root: str | Path, max_commits: int | None = None) -> list[dict]:
-    """Walk ``git log`` and return compact commit/file statistics.
-
-    Failures return an empty list; callers that need to distinguish empty
-    history from unavailable git should use ``commit_log_with_status``.
-    """
-
-    return list(commit_log_with_status(root, max_commits=max_commits).get("commits") or [])
-
-
-def head_commit(root: str | Path) -> str:
-    try:
-        path = Path(root).resolve()
-    except OSError:
-        return ""
-    return _git(path, "rev-parse", "HEAD") or ""
-
-
-def is_ancestor(root: str | Path, ancestor: str, descendant: str) -> bool:
-    if not ancestor or not descendant:
-        return False
-    try:
-        path = Path(root).resolve()
-    except OSError:
-        return False
-    out = _git(path, "merge-base", "--is-ancestor", ancestor, descendant)
-    return out is not None
-
-
-def history_for_catalog(
-    root: str | Path,
-    *,
-    max_commits: int | None = None,
-    previous: dict | None = None,
-    head: str | None = None,
-    fix_regex: str | None = None,
-) -> dict:
-    """Build/update the cheap raw git-history block stored in the catalog."""
-
-    max_commits = _coerce_max_commits(max_commits)
-    current_head = head or head_commit(root)
-    base = {
-        "schema_version": 1,
-        "status": "unavailable",
-        "max_commits": max_commits,
-        "head_commit": current_head or "",
-        "fix_regex": fix_regex or DEFAULT_FIX_REGEX,
-        "commits": [],
-    }
-    if not current_head:
-        return base | {"warning": "git head unavailable"}
-
-    old_head = ""
-    old_commits: list[dict] = []
-    if isinstance(previous, dict) and previous.get("status") == "ready":
-        old_head = str(previous.get("head_commit") or "")
-        old_commits = [c for c in (previous.get("commits") or []) if isinstance(c, dict)]
-    previous_max = _coerce_max_commits(previous.get("max_commits")) if isinstance(previous, dict) else None
-
-    if old_head and old_head == current_head and previous_max == max_commits:
-        return base | {
-            "status": "ready",
-            "commits": _limit_commits(old_commits, max_commits),
-        }
-
-    if old_head and previous_max == max_commits and is_ancestor(root, old_head, current_head):
-        delta = commit_log_with_status(root, max_commits=max_commits, rev_range=f"{old_head}..{current_head}")
-        if delta.get("status") != "ready":
-            return base | {"warning": delta.get("warning") or "git log unavailable"}
-        seen: set[str] = set()
-        commits: list[dict] = []
-        for item in list(delta.get("commits") or []) + old_commits:
-            commit = str(item.get("commit") or "")
-            if not commit or commit in seen:
-                continue
-            seen.add(commit)
-            commits.append(item)
-            if max_commits is not None and len(commits) >= max_commits:
-                break
-        return base | {
-            "status": "ready",
-            "commits": commits,
-        }
-
-    full = commit_log_with_status(root, max_commits=max_commits)
-    if full.get("status") != "ready":
-        return base | {"warning": full.get("warning") or "git log unavailable"}
-    return base | {
-        "status": "ready",
-        "commits": _limit_commits(list(full.get("commits") or []), max_commits),
-    }
 
 
 def history_for_shared_store(
@@ -1043,18 +1104,27 @@ def history_for_shared_store(
     checkout_kind: str = "",
     fingerprint: dict | None = None,
     fix_regex: str | None = None,
+    max_commits: int | None = None,
+    timeout_sec: float | None = None,
 ) -> dict:
     """Build the repo-wide git-history payload for the shared analytics store."""
 
     fp = fingerprint if isinstance(fingerprint, dict) else repo_ref_fingerprint(root)
-    fix_regex_value = fix_regex or DEFAULT_FIX_REGEX
+    max_commits = _coerce_max_commits(max_commits)
+    requested_fix_regex = requested_fix_regex_value(fix_regex)
+    fix_regex_value, regex_warnings = regexsafe.pattern_or_default(
+        fix_regex,
+        DEFAULT_FIX_REGEX,
+        label="git_fix_regex",
+    )
+    regex_warnings = _fix_regex_warnings(fix_regex, fix_regex_value, regex_warnings)
     common_dir = str(fp.get("common_dir") or "")
     base = {
         "schema_version": 1,
         "logical_project_id": logical_project_id,
         "checkout_kind": checkout_kind,
         "status": "unavailable",
-        "max_commits": None,
+        "max_commits": max_commits,
         "head_commit": str(fp.get("tip_commit") or ""),
         "git_common_dir": common_dir,
         "fingerprint": {
@@ -1065,20 +1135,41 @@ def history_for_shared_store(
             "tip_commit": str(fp.get("tip_commit") or ""),
         },
         "fix_regex": fix_regex_value,
+        "requested_fix_regex": requested_fix_regex,
         "commits": [],
+        "warning": "; ".join(regex_warnings),
+        "warnings": regex_warnings,
     }
     if fp.get("status") != "ready" or not common_dir:
-        return base | {"warning": str(fp.get("warning") or "git refs unavailable")}
-    status = commit_log_with_status(Path(common_dir), all_refs=True, git_dir=True)
+        warning = str(fp.get("warning") or "git refs unavailable")
+        warnings = [*regex_warnings, warning] if warning else regex_warnings
+        return base | {"warning": "; ".join(warnings), "warnings": warnings}
+    status = commit_log_with_status(
+        Path(common_dir),
+        max_commits=max_commits,
+        all_refs=True,
+        git_dir=True,
+        timeout_sec=_GIT_STALENESS_TIMEOUT_SEC if timeout_sec is None else timeout_sec,
+    )
     if status.get("status") != "ready":
-        return base | {"warning": status.get("warning") or "git log --all unavailable"}
+        warning = str(status.get("warning") or "git log --all unavailable")
+        warnings = [*regex_warnings, warning] if warning else regex_warnings
+        return base | {"warning": "; ".join(warnings), "warnings": warnings}
     commits = [c for c in (status.get("commits") or []) if isinstance(c, dict)]
     head_commit = str(fp.get("tip_commit") or (commits[0].get("commit") if commits else "") or "")
+    # Resolve the caller regex against real commit messages exactly once here;
+    # persist which commits matched so downstream counting/SZZ passes reuse
+    # this identity instead of re-executing the (possibly unsafe) regex.
+    fix_regex_value, fix_commits, warnings = _fix_commits_for_szz(commits, fix_regex)
     return base | {
         "status": "ready",
-        "warning": "",
+        "fix_regex": fix_regex_value,
+        "requested_fix_regex": requested_fix_regex,
+        "warning": "; ".join(warnings),
         "head_commit": head_commit,
         "commits": commits,
+        "fix_commit_ids": [str(c.get("commit") or "") for c in fix_commits],
+        "warnings": warnings,
     }
 
 
@@ -1089,15 +1180,31 @@ def snapshot(root: str | Path) -> dict:
         path = Path(root).resolve()
     except OSError:
         return _non_git_snapshot(None)
-    worktree = _git(path, "rev-parse", "--show-toplevel")
-    if not worktree:
-        return _non_git_snapshot(path)
-    worktree_root = _canonical_git_path(worktree, base=path)
-    common_dir = _canonical_git_path(
-        _git(path, "rev-parse", "--git-common-dir"),
-        base=path,
+    rev_parse = _git(
+        path,
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+        "--git-common-dir",
+        "--git-dir",
     )
-    git_dir = _canonical_git_path(_git(path, "rev-parse", "--git-dir"), base=path)
+    if not rev_parse:
+        rev_parse = _git(
+            path,
+            "rev-parse",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--git-dir",
+        )
+    if not rev_parse:
+        return _non_git_snapshot(path)
+    rev_lines = [line.strip() for line in rev_parse.splitlines()]
+    if len(rev_lines) < 3 or not rev_lines[0]:
+        return _non_git_snapshot(path)
+    worktree = rev_lines[0]
+    worktree_root = _canonical_git_path(worktree, base=path)
+    common_dir = _canonical_git_path(rev_lines[1], base=path)
+    git_dir = _canonical_git_path(rev_lines[2], base=path)
     checkout_kind = "main"
     if common_dir and git_dir and _path_key(common_dir) != _path_key(git_dir):
         checkout_kind = "worktree"
@@ -1112,18 +1219,16 @@ def snapshot(root: str | Path) -> dict:
             logical_project_id = paths.project_id_for(Path(worktree_root))
         except OSError:
             logical_project_id = ""
-    commit = _git(path, "rev-parse", "HEAD") or ""
-    ref = _git(path, "symbolic-ref", "--short", "-q", "HEAD")
-    if not ref:
-        ref = _git(path, "rev-parse", "--short", "HEAD") or ""
-    status = _git(path, "status", "--porcelain")
+    ref, commit, dirty = _parse_status_v2_branch(
+        _git(path, "status", "--porcelain=v2", "--branch")
+    )
     return {
         "logical_project_id": logical_project_id,
         "checkout_kind": checkout_kind,
         "git_worktree_root": worktree_root,
         "indexed_ref": ref,
         "indexed_commit": commit,
-        "indexed_dirty": bool(status),
+        "indexed_dirty": dirty,
     }
 
 
