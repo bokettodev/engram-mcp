@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "evalfile": "evals/self.json",
+  "mode": "auto",
+  "rerank": false,
+  "overall": {
+    "n": 80,
+    "hit1": 0.6125,
+    "hit5": 0.825,
+    "hit10": 0.8875,
+    "mrr": 0.7018
+  },
+  "by_category": {
+    "ambiguous": {
+      "n": 3,
+      "hit1": 1.0,
+      "hit5": 1.0,
+      "hit10": 1.0,
+      "mrr": 1.0
+    },
+    "error_string": {
+      "n": 5,
+      "hit1": 0.8,
+      "hit5": 1.0,
+      "hit10": 1.0,
+      "mrr": 0.9
+    },
+    "exact_symbol": {
+      "n": 10,
+      "hit1": 1.0,
+      "hit5": 1.0,
+      "hit10": 1.0,
+      "mrr": 1.0
+    },
+    "nl": {
+      "n": 15,
+      "hit1": 0.7333,
+      "hit5": 0.8667,
+      "hit10": 0.9333,
+      "mrr": 0.8
+    },
+    "paraphrase": {
+      "n": 30,
+      "hit1": 0.3667,
+      "hit5": 0.7,
+      "hit10": 0.8,
+      "mrr": 0.5065
+    },
+    "partial_id": {
+      "n": 7,
+      "hit1": 0.8571,
+      "hit5": 1.0,
+      "hit10": 1.0,
+      "mrr": 0.9286
+    },
+    "path_tool": {
+      "n": 5,
+      "hit1": 0.4,
+      "hit5": 0.8,
+      "hit10": 1.0,
+      "mrr": 0.5389
+    },
+    "structural": {
+      "n": 5,
+      "hit1": 0.4,
+      "hit5": 0.6,
+      "hit10": 0.6,
+      "mrr": 0.45
+    }
+  }
+}

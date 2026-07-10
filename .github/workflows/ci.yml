@@ -29,15 +29,15 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8.3.2
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -50,3 +50,62 @@ jobs:
 
       - name: Test
         run: uv run pytest -q
+
+      - name: Assert torch-free serving imports
+        run: uv run python -c "import sys; import engram_mcp.pipeline; import engram_mcp.server; assert 'torch' not in sys.modules, sorted(sys.modules)"
+
+  real-model:
+    name: real-model (ubuntu-latest / Python 3.12)
+    runs-on: ubuntu-latest
+    # Deliberately does NOT set ENGRAM_SKIP_MODEL: the fast `lint-test` lane
+    # above never exercises the real embedder, the real ONNX reranker, or real
+    # vector search, so a retrieval regression could land on an all-green
+    # build. This lane runs the full suite with the real models present, plus
+    # a dedicated ONNX smoke test and an eval run gated against the checked-in
+    # baseline (evals/baseline.json, see README "Baseline / regression gate").
+    env:
+      UV_FROZEN: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Keyed on config.py itself (not just a fixed string) so a pinned model
+      # revision bump in EMBED_MODEL_REVISION / RERANKER_ONNX_MODEL_REVISION
+      # automatically busts the cache instead of silently keeping a stale
+      # snapshot; restore-keys still lets an unrelated config.py edit reuse
+      # already-downloaded blobs (Hugging Face's local cache is content-
+      # addressed, so a prefix restore only needs to fetch what's new).
+      - name: Cache Hugging Face model artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ runner.os }}-${{ hashFiles('src/engram_mcp/config.py') }}
+          restore-keys: |
+            hf-models-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Test (real embedder + real ONNX reranker; model-dependent tests run for real)
+        run: uv run pytest -q
+
+      - name: ONNX smoke test (embed + rerank with the real models)
+        run: uv run pytest -q -v tests/test_model_fingerprint.py -k "onnx_embedder_smoke or onnx_reranker_smoke"
+
+      - name: Build a fresh self-index for the eval gate
+        run: uv run engram index . --rebuild
+
+      - name: Eval against the recorded baseline (fails the build on a real regression)
+        run: uv run engram eval . evals/self.json --mode auto --baseline evals/baseline.json

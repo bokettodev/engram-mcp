@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from engram_mcp import catalog, gitanalytics, gitmeta, gitstore, manifest, paths, pipeline
+from engram_mcp import catalog, gitanalytics, gitmeta, gitstore, gitorchestration, manifest, paths, pipeline
 
 
 def _size_bytes(payload: dict) -> int:
@@ -82,7 +82,7 @@ def _freshen_probe(root: Path, m: manifest.ProjectManifest | None) -> dict:
     if m is None:
         return {"available": False, "reason": "manifest unavailable"}
     source, ms = _timed(
-        lambda: pipeline._analytics_source(
+        lambda: gitorchestration.analytics_source(
             root,
             logical_project_id=m.logical_project_id,
             checkout_kind=m.checkout_kind,
@@ -162,10 +162,13 @@ def main() -> int:
     fingerprint = gitmeta.repo_ref_fingerprint(root)
     common_dir = fingerprint.get("common_dir") or root
     commits, log_ms = _timed(
-        lambda: gitmeta.commit_log_with_status(common_dir, all_refs=True, git_dir=bool(fingerprint.get("common_dir"))).get(
-            "commits",
-            [],
-        )
+        lambda: gitmeta.commit_log_with_status(
+            common_dir,
+            max_commits=args.git_max_commits,
+            all_refs=True,
+            git_dir=bool(fingerprint.get("common_dir")),
+            timeout_sec=gitmeta.git_index_timeout_seconds(),
+        ).get("commits", [])
     )
     pdir = paths.project_dir(root, create=False)
     manifest_data = manifest.load_project(pdir)
@@ -177,6 +180,7 @@ def main() -> int:
             logical_project_id=logical_project_id,
             checkout_kind=checkout_kind,
             fingerprint=fingerprint,
+            max_commits=args.git_max_commits,
         )
     )
     first_szz = _first_pass_szz_with_search_probe(root, commits)
@@ -224,27 +228,29 @@ def main() -> int:
             raise SystemExit(f"not a directory: {second}")
         second_manifest = manifest.load_project(paths.project_dir(second, create=False))
         first_ensure, first_ensure_ms = _timed(
-            lambda: pipeline._ensure_shared_git_analytics(
+            lambda: gitorchestration.ensure_shared_git_analytics(
                 root=root,
                 logical_project_id=logical_project_id,
                 checkout_kind=checkout_kind,
                 enabled=True,
                 fix_regex=None,
+                git_max_commits=args.git_max_commits,
             )
         )
-        pipeline.wait_for_szz_tasks(timeout=None)
+        gitorchestration.wait_for_szz_tasks(timeout=None)
         second_logical = second_manifest.logical_project_id if second_manifest is not None else ""
         second_kind = second_manifest.checkout_kind if second_manifest is not None else ""
         second_ensure, second_ensure_ms = _timed(
-            lambda: pipeline._ensure_shared_git_analytics(
+            lambda: gitorchestration.ensure_shared_git_analytics(
                 root=second,
                 logical_project_id=second_logical,
                 checkout_kind=second_kind,
                 enabled=True,
                 fix_regex=None,
+                git_max_commits=args.git_max_commits,
             )
         )
-        pipeline.wait_for_szz_tasks(timeout=None)
+        gitorchestration.wait_for_szz_tasks(timeout=None)
         first_szz = gitstore.load_szz(logical_project_id) if logical_project_id else None
         second_szz = gitstore.load_szz(second_logical) if second_logical else None
         reuse_probe = {
@@ -265,7 +271,8 @@ def main() -> int:
 
     out = {
         "project_path": str(root),
-        "git_max_commits": None,
+        "git_max_commits": args.git_max_commits,
+        "git_index_timeout_sec": gitmeta.git_index_timeout_seconds(),
         "szz_workers_chosen": gitmeta.szz_worker_count(),
         "shared_store": {
             "logical_project_id": logical_project_id,

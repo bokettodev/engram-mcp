@@ -32,3 +32,23 @@ indexing, must stay strictly opt-in.
 A scheduled/triggered "reindex the stale projects" command (or a watch mode) so an operator can keep many
 indexes fresh without hand-running `engram index` per project.
 **Reason deferred:** freshness belongs to an external scheduler, not the always-on server; not yet requested.
+
+## Enforced project capability boundary (read tools accept any project_path)
+Every read tool (`search_code`, `get_chunk`, `find_definition`, `project_map`, `doctor_project`,
+`model_status`, `index_status`) accepts an arbitrary `project_path`, and
+`list_indexed_projects` discloses every indexed project root on the machine. The server runs with the
+operator's full OS privileges, so a prompt-injected agent — even one whose host confined it to a single
+workspace — can call these tools to enumerate the user's other indexed repositories, search them, and
+hydrate chunks from them. In effect, a local MCP server can silently defeat the host agent's filesystem
+sandbox, turning prompt injection into cross-repo private-code disclosure. `ENGRAM_READONLY=1` only
+removes the mutating tools (`index_project`/`reindex_file`/`remove_project`); it is not a read boundary
+and does nothing to stop this.
+**Reason deferred:** today engram is single-user on one machine, indexing the operator's own repos — the
+blast radius is the operator's own filesystem, which they already have full access to outside the server.
+Worth closing before recommending engram for multi-agent setups where a host is relying on its own
+sandbox to confine an untrusted or prompt-injectable agent to one project.
+**Candidate fix:** an enforced project capability boundary — either bind one server instance to a single
+configured root, or add an `ENGRAM_ALLOWED_ROOTS` allowlist. Canonicalize paths *after* ref/worktree
+resolution (a worktree/ref can otherwise resolve outside an allowed root), filter
+`list_indexed_projects`'s inventory to allowed roots, and default to deny cross-root access, at least
+whenever `ENGRAM_READONLY=1` is set.
