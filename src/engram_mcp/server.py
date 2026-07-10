@@ -3,18 +3,30 @@
 The tool surface is registered at module bottom in ``register_tools`` so
 mutating tools can be withheld in read-only mode.
 
-Indexing runs on a single-worker background thread pool so a tool call returns
-immediately and concurrent index requests serialize on the one embedder.
+Indexing runs on a single-worker background thread pool so an index_project
+tool call returns immediately (before the project walk/plan even runs) and
+concurrent index requests for the *same* project coalesce onto one job. The
+embedding step itself always runs in a short-lived subprocess
+(``_subprocess_index``): this long-lived server process never constructs an
+embedding provider or embeds a passage for an index job, so a running index
+can never contend with the query path's cached-provider inference lock. See
+``_index_worker`` for the planning/routing/dispatch sequence and
+``ENGRAM_INPROCESS_CPU_MAX`` for the optional, off-by-default in-process
+small-delta fast path.
 
 Read-only mode: set ENGRAM_READONLY=1 (env) to expose ONLY the read tools
 (search_code / get_chunk / find_definition / project_map / doctor_project /
-grep_index / model_status / index_status / list_indexed_projects /
-server_info). The
-mutating tools (index_project / reindex_file / remove_project) are not
-registered, so a client physically cannot alter an index. Indexing is then
-driven out-of-band (e.g. the `engram` CLI/operator). Intended for hosts that
-hand the server to untrusted callers (agents) while a separate process owns
-indexing.
+model_status / index_status / list_indexed_projects / server_info). The
+mutating tools (index_project / cancel_index / reindex_file / remove_project)
+are not registered, so a client physically cannot alter an index. Indexing is
+then driven out-of-band (e.g. the `engram` CLI/operator). Intended for hosts
+that hand the server to untrusted callers (agents) while a separate process
+owns indexing.
+
+Note: `grep_index` (approximate regex probe over overlapping chunks) is not
+part of the MCP tool surface -- agents have better exact-search tools
+available already. The capability still exists as a CLI diagnostic
+(`engram grep`) and as `engram_mcp.diagnostics.grep_index`.
 """
 
 from __future__ import annotations
@@ -34,26 +46,25 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from engram_mcp import config, errors, inventory, paths, pipeline
+from engram_mcp import config, errors, gitmeta, inventory, paths, query_service
+from engram_mcp.diagnostics import doctor_project as _run_doctor_project
 from engram_mcp.embeddings import factory
+from engram_mcp.index_repository import ProjectNotIndexedError
+from engram_mcp.index_repository import index_project as _run_index
+from engram_mcp.index_repository import load_query_index
+from engram_mcp.index_repository import plan_index as _plan_index
+from engram_mcp.index_repository import reindex_file as _run_reindex_file
+from engram_mcp.index_repository import remove_project as _run_remove
 from engram_mcp.jobs import JobRegistry, snapshot
-from engram_mcp.pipeline import (
+from engram_mcp.query_service import (
     DEFAULT_RERANK_CANDIDATE_K,
     MAX_RERANK_CANDIDATES,
     MAX_SEARCH_K,
-    ProjectNotIndexedError,
 )
-from engram_mcp.pipeline import doctor_project as _run_doctor_project
-from engram_mcp.pipeline import find_definition as _run_find_def
-from engram_mcp.pipeline import get_chunk as _run_get_chunk
-from engram_mcp.pipeline import grep_index as _run_grep_index
-from engram_mcp.pipeline import index_project as _run_index
-from engram_mcp.pipeline import load_query_index
-from engram_mcp.pipeline import plan_index as _plan_index
-from engram_mcp.pipeline import project_map as _run_project_map
-from engram_mcp.pipeline import reindex_file as _run_reindex_file
-from engram_mcp.pipeline import remove_project as _run_remove
-from engram_mcp.pipeline import search_project as _run_search
+from engram_mcp.query_service import find_definition as _run_find_def
+from engram_mcp.query_service import get_chunk as _run_get_chunk
+from engram_mcp.query_service import search_project as _run_search
+from engram_mcp.structure_service import project_map as _run_project_map
 
 mcp = FastMCP("engram")
 _registry = JobRegistry()
@@ -62,9 +73,14 @@ _warmup_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cidx-warmup
 _model_loads = {}
 _model_loads_lock = Lock()
 
+# job_id -> the short-lived index subprocess currently running that job, so
+# cancel_index can find and kill it. Populated/cleared by _subprocess_index.
+_job_processes: dict[str, subprocess.Popen] = {}
+_job_processes_lock = Lock()
+
 _RESULT_FIELDS = (
-    "chunk_id", "rel_path", "start_line", "end_line", "language", "symbol", "symbol_kind",
-    "chunk_role", "score", "raw_score", "score_normalized", "relevance", "matched",
+    "chunk_id", "rel_path", "language", "symbol", "symbol_kind",
+    "chunk_role", "raw_score", "score_normalized", "relevance", "matched",
     "match_reason", "stale", "index_stale", "freshness_reason",
 )
 _CONTENT_MODES = {"none", "preview", "full"}
@@ -73,12 +89,17 @@ _MAX_RESULT_CHARS = 20_000
 _MODEL_RETRY_AFTER_SEC = 2
 _DEFAULT_SEARCH_WAIT_SEC = 8.0
 _DEFAULT_DELTA_CPU_MAX = 1024
+# Off by default: CPU indexing always runs in the short-lived subprocess (see
+# _subprocess_index) so the server process never embeds. Setting
+# ENGRAM_INPROCESS_CPU_MAX > 0 opts a deployment into an in-process fast path
+# for deltas at or below this many missing unique chunk embeddings, trading
+# the subprocess's fixed startup+model-load overhead for a small risk of
+# briefly contending with a concurrent search (mitigated by always using a
+# separate, uncached provider instance -- see factory.make_uncached_cpu_provider).
+_DEFAULT_INPROCESS_CPU_MAX = 0
 _MAX_TOTAL_CHARS = 200_000
-
-
-def _get_provider(index_device: str | None = None):
-    """Index-time provider for the selected backend."""
-    return factory.make_index_provider(index_device)
+_CANCEL_POLL_INTERVAL_SEC = 0.05
+_CANCEL_WAIT_SEC = 5.0
 
 
 def _apply_index_progress_event(job_id: str, event: dict) -> None:
@@ -122,21 +143,62 @@ def _drain_stderr(stream, tail: deque[str]) -> None:
         return
 
 
-def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, setting: str) -> None:
-    """Run a GPU/auto index in a short-lived subprocess.
+def _register_job_process(job_id: str, proc: subprocess.Popen) -> None:
+    with _job_processes_lock:
+        _job_processes[job_id] = proc
 
-    Keeps torch/CUDA out of the long-lived server process entirely: the child
-    resolves the device (auto prefers GPU), initializes CUDA if used, indexes,
-    writes the canonical FastEmbed manifest, and its whole CUDA context is
-    reclaimed when it exits — so the server stays 0-VRAM even after GPU jobs.
-    Explicit CPU indexing runs in-process (it never touches CUDA); search never
-    touches this path.
+
+def _unregister_job_process(job_id: str) -> None:
+    with _job_processes_lock:
+        _job_processes.pop(job_id, None)
+
+
+def _job_cancel_requested(job_id: str) -> bool:
+    job = _registry.get(job_id)
+    return bool(job is not None and job.cancel_requested)
+
+
+def _mark_cancelled(job_id: str, hint: str | None = "Index job cancelled.") -> None:
+    _registry.update(
+        job_id, status="cancelled", stage="cancelled", error=None, code=None,
+        hint=hint, finished_at=time.time(),
+    )
+
+
+def _subprocess_index(
+    job_id: str,
+    project_path: str,
+    full_rebuild: bool,
+    setting: str,
+    git_max_commits: int | None = None,
+    git_analytics: bool | None = None,
+) -> None:
+    """Run an index job in a short-lived subprocess.
+
+    Every index device (cpu/cuda/auto) runs here: the long-lived server
+    process never constructs an embedding provider or embeds a passage for an
+    index job, so it can never contend with the query path's inference lock
+    and never has to initialize CUDA. The child resolves the device (auto
+    prefers GPU), indexes, writes the canonical FastEmbed manifest, and its
+    whole process (and CUDA context, if any) is reclaimed when it exits.
+
+    ``git_analytics`` mirrors ``ENGRAM_GIT_ANALYTICS`` precedence: ``None``
+    means "let the child CLI resolve its own default from the inherited env
+    var", so no flag is passed at all. An explicit ``True``/``False`` always
+    wins over the env var, so it is passed as an explicit CLI flag.
     """
+    if _job_cancel_requested(job_id):
+        _mark_cancelled(job_id)
+        return
     _registry.update(job_id, stage="loading_model", index_device=setting)
     cmd = [sys.executable, "-m", "engram_mcp.cli", "index", project_path,
            "--index-device", setting, "--json"]
     if full_rebuild:
         cmd.append("--rebuild")
+    if git_max_commits is not None:
+        cmd.extend(["--git-max-commits", str(git_max_commits)])
+    if git_analytics is not None:
+        cmd.append("--git-analytics" if git_analytics else "--no-git-analytics")
     try:
         proc = subprocess.Popen(
             cmd,
@@ -148,39 +210,53 @@ def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, settin
     except Exception as exc:
         _registry.update(
             job_id, status="error", stage="error",
-            error=f"failed to launch GPU index subprocess: {exc!r}",
+            error=f"failed to launch index subprocess: {exc!r}",
             code=errors.E_MODEL_LOAD_FAILED, finished_at=time.time(),
         )
         return
 
-    stderr_tail: deque[str] = deque(maxlen=80)
-    stderr_thread = Thread(
-        target=_drain_stderr,
-        args=(proc.stderr, stderr_tail),
-        daemon=True,
-        name="cidx-index-stderr",
-    )
-    stderr_thread.start()
-    result = None
-    stdout = proc.stdout
-    if stdout is not None:
-        for line in stdout:
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                data = json.loads(line)
-            except ValueError:
-                continue
-            event = data.get("event")
-            if event == "progress":
-                _apply_index_progress_event(job_id, data)
-            elif event == "result" or "ok" in data:
-                result = data
-            elif "stage" in data:
-                _apply_index_progress_event(job_id, data)
-    returncode = proc.wait()
-    stderr_thread.join(timeout=1.0)
+    _register_job_process(job_id, proc)
+    try:
+        stderr_tail: deque[str] = deque(maxlen=80)
+        stderr_thread = Thread(
+            target=_drain_stderr,
+            args=(proc.stderr, stderr_tail),
+            daemon=True,
+            name="cidx-index-stderr",
+        )
+        stderr_thread.start()
+        result = None
+        stdout = proc.stdout
+        if stdout is not None:
+            for line in stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                event = data.get("event")
+                if event == "progress":
+                    _apply_index_progress_event(job_id, data)
+                elif event == "result" or "ok" in data:
+                    result = data
+                elif "stage" in data:
+                    _apply_index_progress_event(job_id, data)
+        returncode = proc.wait()
+        stderr_thread.join(timeout=1.0)
+    finally:
+        _unregister_job_process(job_id)
+
+    # A cancel may have killed the child mid-flight (no result emitted, or a
+    # non-zero exit from the kill itself). Cancellation always wins that race:
+    # a killed subprocess never reaches the atomic manifest/generation swap
+    # (see index_repository._full_rebuild/_incremental), so the previously published
+    # index is untouched and still searchable; there is nothing to "finish".
+    # If the child *did* emit a real result (ok or error) despite a late
+    # cancel request, the work already completed/failed on its own before the
+    # kill could land -- report that outcome normally instead.
+    cancelled = _job_cancel_requested(job_id)
 
     data = result
     if data is None:
@@ -200,17 +276,23 @@ def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, settin
                 data = candidate
                 break
     if data is None:
+        if cancelled:
+            _mark_cancelled(job_id)
+            return
         hint = _stderr_tail_text(stderr_tail)
         if returncode == 0:
             hint = hint or "The subprocess exited successfully but did not emit a result event."
         _registry.update(
             job_id, status="error", stage="error",
-            error=f"GPU index subprocess produced no result (exit {returncode})",
+            error=f"index subprocess produced no result (exit {returncode})",
             hint=hint,
             code=errors.E_MODEL_LOAD_FAILED, finished_at=time.time(),
         )
         return
     if not data.get("ok"):
+        if cancelled:
+            _mark_cancelled(job_id)
+            return
         _registry.update(
             job_id, status="error", stage="error", error=data.get("error"),
             code=data.get("code"), hint=data.get("hint") or _stderr_tail_text(stderr_tail),
@@ -232,22 +314,28 @@ def _subprocess_index(job_id: str, project_path: str, full_rebuild: bool, settin
     _schedule_query_model_warmup(data.get("embedder_id") or factory.CANONICAL_EMBEDDER_ID)
 
 
-def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_device: str) -> None:
-    _registry.update(
-        job_id,
-        status="running",
-        stage="loading_model",
-        index_device=index_device,
-        started_at=time.time(),
-    )
-    if index_device in ("cuda", "auto"):
-        # Isolate GPU/auto (which may load torch) in a child process so the
-        # long-lived server never initializes CUDA and stays ~0 VRAM.
-        _subprocess_index(job_id, project_path, full_rebuild, index_device)
-        return
+def _inprocess_cpu_index(
+    job_id: str,
+    project_path: str,
+    full_rebuild: bool,
+    git_max_commits: int | None = None,
+    git_analytics: bool | None = None,
+) -> None:
+    """Optional in-process CPU fast path for very small deltas.
+
+    Off by default (see ``ENGRAM_INPROCESS_CPU_MAX``/``_inprocess_cpu_max``).
+    Only ``_index_worker`` decides to call this, after confirming the plan's
+    ``missing_unique_chunks`` is at or below the configured threshold. Always
+    builds a fresh, uncached provider (``factory.make_uncached_cpu_provider``)
+    -- never the cached query provider -- so it cannot contend with the query
+    path's inference lock. Unlike the subprocess path, a mid-batch cancel
+    cannot interrupt this call; the job may finish (or fail) before a cancel
+    request is observed. Callers that need reliable cancellation should leave
+    this fast path disabled (the default).
+    """
     provider = None
     try:
-        provider = _get_provider(index_device)
+        provider = factory.make_uncached_cpu_provider()
         _registry.update(
             job_id,
             stage="loading_model",
@@ -258,7 +346,17 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
         def progress(event: dict) -> None:
             _apply_index_progress_event(job_id, event)
 
-        stats = _run_index(project_path, provider, full_rebuild=full_rebuild, progress=progress)
+        resolved_git_analytics = (
+            gitmeta.git_analytics_default() if git_analytics is None else bool(git_analytics)
+        )
+        stats = _run_index(
+            project_path,
+            provider,
+            full_rebuild=full_rebuild,
+            progress=progress,
+            git_analytics=resolved_git_analytics,
+            git_max_commits=git_max_commits,
+        )
         _registry.update(
             job_id,
             status="done",
@@ -295,6 +393,99 @@ def _index_worker(job_id: str, project_path: str, full_rebuild: bool, index_devi
                 pass
 
 
+def _plan_payload(plan) -> dict:
+    return {
+        "mode": plan.mode,
+        "files": plan.files,
+        "chunks": plan.chunks,
+        "added": plan.added,
+        "changed": plan.changed,
+        "deleted": plan.deleted,
+        "unchanged": plan.unchanged,
+        "missing_unique_chunks": plan.missing_unique_chunks,
+        "delta_cpu_max": _delta_cpu_max(),
+    }
+
+
+def _index_worker(
+    job_id: str,
+    project_path: str,
+    full_rebuild: bool,
+    index_device: str,
+    git_max_commits: int | None = None,
+    git_analytics: bool | None = None,
+) -> None:
+    """Background body of an index job: plan, route, then embed.
+
+    The walk/chunk/hash/cache-plan work (``plan_index``) used to run
+    synchronously inside the ``index_project`` tool call, blocking it on a
+    filesystem walk of the whole project before a job even existed. It now
+    runs here instead, so ``start_index_job``/the MCP tool returns a job_id
+    immediately and the plan (when computed) shows up as job progress.
+
+    Embedding itself always happens in the short-lived index subprocess
+    (``_subprocess_index``) unless the optional, off-by-default in-process CPU
+    fast path (``ENGRAM_INPROCESS_CPU_MAX``) is enabled and the delta is small
+    enough -- either way, this long-lived server process never embeds with
+    the cached query provider.
+    """
+    _registry.update(
+        job_id,
+        status="running",
+        stage="planning",
+        index_device_requested=index_device,
+        started_at=time.time(),
+    )
+    if _job_cancel_requested(job_id):
+        _mark_cancelled(job_id)
+        return
+
+    routed_device = index_device
+    plan = None
+    inprocess_max = _inprocess_cpu_max()
+    needs_plan = index_device == "auto" or (index_device == "cpu" and inprocess_max > 0)
+    if needs_plan:
+        try:
+            plan = _plan_index(
+                project_path,
+                full_rebuild=full_rebuild,
+                model_id=factory.CANONICAL_EMBEDDER_ID,
+                dim=config.DEFAULT_EMBED_DIM,
+            )
+        except Exception as exc:  # surface failure via status, never crash the server
+            payload = _error_payload(exc)
+            _registry.update(
+                job_id,
+                status="error",
+                stage="error",
+                error=payload.get("error", str(exc)),
+                code=payload.get("code"),
+                hint=payload.get("hint"),
+                finished_at=time.time(),
+            )
+            return
+        if index_device == "auto" and plan.missing_unique_chunks <= _delta_cpu_max():
+            routed_device = "cpu"
+        _registry.update(job_id, plan=_plan_payload(plan))
+
+    if _job_cancel_requested(job_id):
+        _mark_cancelled(job_id)
+        return
+
+    _registry.update(job_id, stage="loading_model", index_device=routed_device)
+
+    use_inprocess = (
+        routed_device == "cpu"
+        and plan is not None
+        and inprocess_max > 0
+        and plan.missing_unique_chunks <= inprocess_max
+    )
+    if use_inprocess:
+        _inprocess_cpu_index(job_id, project_path, full_rebuild, git_max_commits, git_analytics)
+    else:
+        _subprocess_index(job_id, project_path, full_rebuild, routed_device, git_max_commits, git_analytics)
+
+
 # --- plain, testable logic (the MCP tools are thin wrappers over these) ---
 
 def _delta_cpu_max() -> int:
@@ -305,6 +496,19 @@ def _delta_cpu_max() -> int:
         return max(0, int(raw))
     except ValueError:
         return _DEFAULT_DELTA_CPU_MAX
+
+
+def _inprocess_cpu_max() -> int:
+    """Threshold (missing unique chunks) below which the optional in-process
+    CPU fast path may run instead of the default subprocess. 0 (default)
+    disables the fast path entirely. See ``ENGRAM_INPROCESS_CPU_MAX``."""
+    raw = os.environ.get("ENGRAM_INPROCESS_CPU_MAX", "").strip()
+    if not raw:
+        return _DEFAULT_INPROCESS_CPU_MAX
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_INPROCESS_CPU_MAX
 
 
 def _rerank_candidate_k_default() -> int:
@@ -324,49 +528,116 @@ def start_index_job(
     full_rebuild: bool = False,
     gpu: bool = False,
     index_device: str | None = None,
+    git_max_commits: int | None = None,
+    git_analytics: bool | None = None,
 ) -> dict:
+    """Validate, coalesce, and hand off an index job; returns promptly.
+
+    No filesystem walk happens here: the delta-aware plan (``plan_index``)
+    that used to run synchronously in this function before a job existed now
+    runs inside the background job body (``_index_worker``), so this call
+    only ever does path validation plus in-memory registry bookkeeping before
+    returning. Poll ``index_status`` for the plan/routing decision and
+    progress.
+
+    A second call for the same resolved project path while a job is already
+    queued/running for it is coalesced onto that existing job (``coalesced``
+    is ``True`` in the response) instead of starting a duplicate.
+    """
     root = Path(project_path).expanduser()
     if not root.is_dir():
         raise ValueError(f"not a directory: {root}")
     device = factory.resolve_index_device(index_device, gpu=gpu)
     resolved = str(root.resolve())
-    routed_device = device
-    plan = None
-    if device == "auto":
-        plan = _plan_index(
-            resolved,
-            full_rebuild=full_rebuild,
-            model_id=factory.CANONICAL_EMBEDDER_ID,
-            dim=config.DEFAULT_EMBED_DIM,
-        )
-        if plan.missing_unique_chunks <= _delta_cpu_max():
-            routed_device = "cpu"
-    job = _registry.create(resolved)
-    _registry.update(job.job_id, index_device=routed_device, embedder_id=factory.CANONICAL_EMBEDDER_ID)
-    _index_pool.submit(_index_worker, job.job_id, resolved, full_rebuild, routed_device)
-    plan_payload = None
-    if plan is not None:
-        plan_payload = {
-            "mode": plan.mode,
-            "files": plan.files,
-            "chunks": plan.chunks,
-            "added": plan.added,
-            "changed": plan.changed,
-            "deleted": plan.deleted,
-            "unchanged": plan.unchanged,
-            "missing_unique_chunks": plan.missing_unique_chunks,
-            "delta_cpu_max": _delta_cpu_max(),
+    resolved_git_analytics = (
+        gitmeta.git_analytics_default() if git_analytics is None else bool(git_analytics)
+    )
+
+    existing = _registry.find_active(resolved)
+    if existing is not None:
+        return {
+            "job_id": existing.job_id,
+            "project_path": resolved,
+            "status": existing.status,
+            "index_device": existing.index_device or device,
+            "index_device_requested": device,
+            "git_max_commits": git_max_commits,
+            "git_analytics": resolved_git_analytics,
+            "coalesced": True,
+            "embedder_id": factory.CANONICAL_EMBEDDER_ID,
         }
+
+    job = _registry.create(resolved)
+    _registry.update(
+        job.job_id,
+        index_device=device,
+        index_device_requested=device,
+        embedder_id=factory.CANONICAL_EMBEDDER_ID,
+    )
+    _index_pool.submit(
+        _index_worker,
+        job.job_id,
+        resolved,
+        full_rebuild,
+        device,
+        git_max_commits,
+        git_analytics,
+    )
     return {
         "job_id": job.job_id,
         "project_path": resolved,
         "status": job.status,
-        "index_device": routed_device,
+        "index_device": device,
         "index_device_requested": device,
-        "routing": "delta_cpu" if device == "auto" and routed_device == "cpu" else "requested",
-        "plan": plan_payload,
+        "git_max_commits": git_max_commits,
+        "git_analytics": resolved_git_analytics,
+        "coalesced": False,
         "embedder_id": factory.CANONICAL_EMBEDDER_ID,
     }
+
+
+def do_cancel_index(job_id: str) -> dict:
+    """Cancel a running/queued index job; best-effort, idempotent.
+
+    Kills the index subprocess's whole process tree (mirroring
+    ``gitmeta.kill_process_tree``: a plain ``terminate()`` on the parent alone can
+    leave grandchildren alive on Windows) so a killed child never reaches the
+    atomic manifest/generation swap -- the previously published index is left
+    untouched and searchable. A job already in a terminal state is reported
+    as such rather than treated as an error.
+    """
+    job = _registry.get(job_id)
+    if job is None:
+        return {
+            "error": (
+                f"unknown job_id in this server process: {job_id}. "
+                "Index jobs are tracked only in the current process."
+            ),
+            "code": errors.E_BAD_REQUEST,
+            "scope": "current_process",
+        }
+    if job.is_terminal:
+        return snapshot(job) | {"already_terminal": True}
+
+    _registry.update(job_id, cancel_requested=True)
+    with _job_processes_lock:
+        proc = _job_processes.get(job_id)
+    if proc is not None:
+        gitmeta.kill_process_tree(proc)
+
+    deadline = time.time() + _CANCEL_WAIT_SEC
+    job = _registry.get(job_id)
+    while job is not None and not job.is_terminal and time.time() < deadline:
+        time.sleep(_CANCEL_POLL_INTERVAL_SEC)
+        job = _registry.get(job_id)
+    if job is None:
+        return {
+            "job_id": job_id,
+            "error": "job disappeared from the registry while cancelling",
+            "code": errors.E_BAD_REQUEST,
+            "scope": "current_process",
+        }
+    return snapshot(job) | {"already_terminal": False}
 
 
 def _not_indexed_hint() -> str:
@@ -480,19 +751,34 @@ def _model_status_for(model_id: str) -> dict:
 
 
 def _check_k(k: int) -> None:
-    if not isinstance(k, int) or not (1 <= k <= MAX_SEARCH_K):
-        raise ValueError(f"k must be between 1 and {MAX_SEARCH_K}")
+    """Reject only malformed/sub-minimum ``k``.
+
+    ``k`` above the server's ``MAX_SEARCH_K`` budget is not rejected here --
+    ``query_service.search_project`` clamps it to that budget and reports the
+    clamp as a warning in the response instead of failing the request. See
+    ``query_service._validate_search_k``.
+    """
+    if not isinstance(k, int) or k < 1:
+        raise ValueError(f"k must be an integer >= 1 (server maximum is {MAX_SEARCH_K})")
 
 
-def _check_content(content: str, max_chars_per_result: int) -> None:
+def _check_content(content: str, max_chars_per_result: int) -> tuple[int, bool]:
+    """Validate ``content``/``max_chars_per_result``, clamping only the over-budget side.
+
+    Returns ``(effective_max_chars_per_result, clamped)``. A sub-minimum or
+    malformed value is still rejected (degenerate request); a value above the
+    server's ``_MAX_RESULT_CHARS`` response-character budget is clamped down
+    instead, with the caller told via a response warning.
+    """
     if content not in _CONTENT_MODES:
         raise ValueError("content must be one of: none, preview, full")
-    if (
-        not isinstance(max_chars_per_result, int)
-        or max_chars_per_result < 1
-        or max_chars_per_result > _MAX_RESULT_CHARS
-    ):
-        raise ValueError(f"max_chars_per_result must be between 1 and {_MAX_RESULT_CHARS}")
+    if not isinstance(max_chars_per_result, int) or max_chars_per_result < 1:
+        raise ValueError(
+            f"max_chars_per_result must be an integer >= 1 (server maximum is {_MAX_RESULT_CHARS})"
+        )
+    if max_chars_per_result > _MAX_RESULT_CHARS:
+        return _MAX_RESULT_CHARS, True
+    return max_chars_per_result, False
 
 
 def _clip_text(text: str, limit: int) -> tuple[str, bool]:
@@ -579,7 +865,6 @@ def _format_search_hit(
 ) -> tuple[dict, int, bool]:
     out = {field: hit.get(field) for field in _RESULT_FIELDS}
     out["span"] = {"start_line": hit.get("start_line"), "end_line": hit.get("end_line")}
-    out["path"] = hit.get("rel_path")
     raw_content = hit.get("content") or ""
     budget = max_chars if remaining_budget is None else max(0, min(max_chars, remaining_budget))
     if budget <= 0 and content != "none":
@@ -598,7 +883,6 @@ def _format_search_hit(
             prefer_literal=mode_used == "hybrid",
         )
         out["preview"] = preview
-        out["excerpt"] = preview
         out["matched_in"] = _matched_in(hit, query)
         out["truncated"] = truncated
         return out, len(preview), truncated
@@ -610,27 +894,21 @@ def _format_search_hit(
         return out, len(body), truncated
 
 
-def _result_map(results: list[dict]) -> list[dict]:
-    return [
-        {
-            "rank": i,
-            "chunk_id": r.get("chunk_id"),
-            "path": r.get("path") or r.get("rel_path"),
-            "span": r.get("span"),
-            "score": r.get("score"),
-            "relevance": r.get("relevance"),
-            "symbol": r.get("symbol"),
-        }
-        for i, r in enumerate(results, 1)
-    ]
+def _validate_max_total_chars(value: int | None) -> tuple[int | None, bool]:
+    """Validate ``max_total_chars``, clamping only the over-budget side.
 
-
-def _validate_max_total_chars(value: int | None) -> int | None:
+    Returns ``(effective_value, clamped)``. See ``_check_content`` for the
+    same sub-minimum-errors/over-budget-clamps split.
+    """
     if value is None:
-        return None
-    if not isinstance(value, int) or value < 1 or value > _MAX_TOTAL_CHARS:
-        raise ValueError(f"max_total_chars must be between 1 and {_MAX_TOTAL_CHARS}")
-    return value
+        return None, False
+    if not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"max_total_chars must be an integer >= 1 (server maximum is {_MAX_TOTAL_CHARS})"
+        )
+    if value > _MAX_TOTAL_CHARS:
+        return _MAX_TOTAL_CHARS, True
+    return value, False
 
 
 def _search_hints(outcome: dict, results: list[dict], content: str, max_total_chars: int | None) -> list[str]:
@@ -703,12 +981,20 @@ def do_search(
 ) -> dict:
     try:
         _check_k(k)
-        _check_content(content, max_chars_per_result)
-        max_total_chars = _validate_max_total_chars(max_total_chars)
+        requested_max_chars_per_result = max_chars_per_result
+        max_chars_per_result, max_chars_per_result_clamped = _check_content(
+            content, max_chars_per_result
+        )
+        requested_max_total_chars = max_total_chars
+        max_total_chars, max_total_chars_clamped = _validate_max_total_chars(max_total_chars)
         if candidate_k is None:
             candidate_k = _rerank_candidate_k_default()
-        if not isinstance(candidate_k, int) or candidate_k < 1 or candidate_k > MAX_RERANK_CANDIDATES:
-            raise ValueError(f"candidate_k must be between 1 and {MAX_RERANK_CANDIDATES}")
+        # Sub-minimum/malformed candidate_k is still a bad request; a value
+        # above MAX_RERANK_CANDIDATES is a budget question, not a validation
+        # one -- query_service.search_project clamps it to the server maximum and
+        # reports the clamp as a response warning instead of failing here.
+        if not isinstance(candidate_k, int) or candidate_k < 1:
+            raise ValueError(f"candidate_k must be an integer >= 1 (server maximum is {MAX_RERANK_CANDIDATES})")
         root = Path(project_path).expanduser().resolve()
         qi = load_query_index(root, ref=ref)
         provider = _provider_for_query_model(qi.manifest.embedder_id)
@@ -743,6 +1029,18 @@ def do_search(
             used_chars += consumed
             truncated = truncated or item_truncated
             results.append(formatted)
+        response_warnings = list(outcome.get("warnings") or [])
+        if max_chars_per_result_clamped:
+            response_warnings.append(
+                f"max_chars_per_result clamped to server maximum {_MAX_RESULT_CHARS} "
+                f"(requested {requested_max_chars_per_result})"
+            )
+        if max_total_chars_clamped:
+            response_warnings.append(
+                f"max_total_chars clamped to server maximum {_MAX_TOTAL_CHARS} "
+                f"(requested {requested_max_total_chars})"
+            )
+        outcome["warnings"] = response_warnings
         return outcome | {
             "content": content,
             "max_chars_per_result": max_chars_per_result,
@@ -750,7 +1048,6 @@ def do_search(
             "body_chars": used_chars,
             "truncated": truncated,
             "count": len(results),
-            "map": _result_map(results),
             "hints": _search_hints(outcome, results, content, max_total_chars),
             "results": results,
         }
@@ -768,7 +1065,7 @@ def list_projects(
     limit: int = inventory.DEFAULT_LIST_LIMIT,
     cursor: str | None = None,
     verbose: bool = False,
-    prune_orphans: bool = True,
+    prune_orphans: bool = False,
 ) -> dict:
     return inventory.list_indexed_projects(
         limit=limit,
@@ -798,7 +1095,7 @@ def do_project_map(
     symbol_kinds: list[str] | None = None,
     min_symbols: int = 0,
     non_empty: bool = True,
-    include_git: bool = True,
+    include_git: bool | None = None,
     group_by: str = "commit",
     ticket_regex: str | None = None,
     window_hours: float = 2.0,
@@ -850,31 +1147,6 @@ def do_doctor_project(project_path: str, check_git: bool = True) -> dict:
         return _error_payload(exc)
 
 
-def do_grep_index(
-    project_path: str,
-    pattern: str,
-    ignore_case: bool = False,
-    limit: int = 50,
-    offset: int = 0,
-    max_matches: int = 500,
-    max_scan_chunks: int = 10000,
-    include_lines: bool = False,
-) -> dict:
-    try:
-        return _run_grep_index(
-            Path(project_path).expanduser().resolve(),
-            pattern,
-            ignore_case=ignore_case,
-            limit=limit,
-            offset=offset,
-            max_matches=max_matches,
-            max_scan_chunks=max_scan_chunks,
-            include_lines=include_lines,
-        )
-    except Exception as exc:
-        return _error_payload(exc, results=[])
-
-
 def _clip_nested_chunk_content(row: dict, max_chars: int | None) -> None:
     if max_chars is None:
         return
@@ -889,6 +1161,7 @@ def do_get_chunk(
     include_neighbors: bool = False,
     neighbor_window: int = 1,
     include_parent: bool = False,
+    ref: str | None = None,
 ) -> dict:
     try:
         row = _run_get_chunk(
@@ -897,12 +1170,22 @@ def do_get_chunk(
             include_neighbors=include_neighbors,
             neighbor_window=neighbor_window,
             include_parent=include_parent,
+            ref=ref,
         )
         content = row.get("content") or ""
         row["truncated"] = False
         if max_chars is not None:
-            if not isinstance(max_chars, int) or max_chars < 1 or max_chars > _MAX_RESULT_CHARS:
-                raise ValueError(f"max_chars must be between 1 and {_MAX_RESULT_CHARS}")
+            if not isinstance(max_chars, int) or max_chars < 1:
+                raise ValueError(
+                    f"max_chars must be an integer >= 1 (server maximum is {_MAX_RESULT_CHARS})"
+                )
+            # Over-budget max_chars is clamped (not rejected), same as
+            # search_code's max_chars_per_result/max_total_chars.
+            if max_chars > _MAX_RESULT_CHARS:
+                row.setdefault("warnings", []).append(
+                    f"max_chars clamped to server maximum {_MAX_RESULT_CHARS} (requested {max_chars})"
+                )
+                max_chars = _MAX_RESULT_CHARS
             row["content"], row["truncated"] = _clip_text(content, max_chars)
             for neighbor in row.get("neighbors") or []:
                 _clip_nested_chunk_content(neighbor, max_chars)
@@ -971,7 +1254,7 @@ def do_server_info() -> dict:
         "delta_cpu_max": _delta_cpu_max(),
         "search_warmup_executor": "single_worker",
         "reranker": {
-            "enabled": pipeline.rerank_enabled(),
+            "enabled": query_service.rerank_enabled(),
             "enable_env": "ENGRAM_RERANK_ENABLED",
             "gated_to_mode": "vector",
             "default_backend": DEFAULT_BACKEND,
@@ -983,7 +1266,6 @@ def do_server_info() -> dict:
                 "jina-v2-multilingual is CC-BY-NC-4.0; fine for local/private use, "
                 "revisit before commercial distribution"
             ),
-            "torch_fallback_backend": "sentence_transformers (needs 'gpu' extra)",
         },
         "source_type": "static_indexed_source",
     }
@@ -996,19 +1278,58 @@ def do_server_info() -> dict:
 
 
 async def index_project(
-    project_path: str, full_rebuild: bool = False, index_device: str | None = None
+    project_path: str,
+    full_rebuild: bool = False,
+    index_device: str | None = None,
+    git_max_commits: int | None = None,
+    git_analytics: bool | None = None,
 ) -> dict:
-    """Start a background index job and return job/routing details."""
-    return start_index_job(project_path, full_rebuild, index_device=index_device)
+    """Start a background index job and return its job_id immediately.
+
+    Returns before the project walk/plan runs, not after it: planning and
+    device routing happen inside the background job and show up via
+    ``index_status`` (``stage="planning"``, then a ``plan`` object once
+    computed). A second call for a project that already has a job
+    queued/running returns that job's id with ``coalesced: true`` instead of
+    starting a duplicate.
+
+    ``git_max_commits`` optionally caps shared git-history analytics; omitted
+    means full history. ``git_analytics`` controls whether git history/SZZ
+    analytics are captured at all; omitted (``None``) defers to the
+    ``ENGRAM_GIT_ANALYTICS`` env var (default: on). An explicit ``True``/
+    ``False`` here always overrides the env var for this job.
+    """
+    return start_index_job(
+        project_path,
+        full_rebuild,
+        index_device=index_device,
+        git_max_commits=git_max_commits,
+        git_analytics=git_analytics,
+    )
 
 
 async def index_status(job_id: str) -> dict:
     """Progress snapshot for an index job in this server process.
 
     Job tracking is in-memory and scoped to the current MCP process; completed
-    on-disk indexes are visible through list_indexed_projects.
+    on-disk indexes are visible through list_indexed_projects. In read-only
+    mode no index jobs are produced, so this tool is inert except for jobs
+    already started in this process before read-only registration.
     """
     return get_status(job_id)
+
+
+async def cancel_index(job_id: str) -> dict:
+    """Cancel a queued/running index job started in this process.
+
+    Kills the index subprocess's whole process tree. A cancelled job ends in
+    a terminal ``cancelled`` status; because the child is killed before it
+    can reach the atomic manifest/generation swap, the previously published
+    index (if any) is left fully intact and searchable. Calling this on a job
+    that already finished (``done``/``error``/``cancelled``) is a no-op that
+    reports the job's current terminal status rather than erroring.
+    """
+    return await asyncio.to_thread(do_cancel_index, job_id)
 
 
 async def search_code(
@@ -1021,7 +1342,11 @@ async def search_code(
     min_relevance: str | None = None,
     ref: str | None = None,
 ) -> dict:
-    """Search indexed source with compact bodies, facets, min relevance, and opt-in rerank."""
+    """Search indexed source with compact bodies, facets, min relevance, and opt-in rerank.
+
+    ``ref`` selects an already indexed git ref for the same logical project;
+    a missing ref returns ``E_REF_NOT_INDEXED`` instead of falling back.
+    """
     return await asyncio.to_thread(
         do_search,
         project_path=project_path,
@@ -1055,7 +1380,8 @@ async def find_definition(project_path: str, symbol: str, ref: str | None = None
 
     Use this when you already know the symbol name (`symbol` or `Parent.symbol`).
     It does not load an embedding model. On an exact miss, suggestions contains
-    nearby symbols from the indexed inventory.
+    nearby symbols from the indexed inventory. ``ref`` must already be indexed
+    for the same logical project or the response is ``E_REF_NOT_INDEXED``.
     """
     return await asyncio.to_thread(do_find_definition, project_path, symbol, ref)
 
@@ -1067,8 +1393,14 @@ async def get_chunk(
     include_neighbors: bool = False,
     neighbor_window: int = 1,
     include_parent: bool = False,
+    ref: str | None = None,
 ) -> dict:
-    """Fetch one chunk, optionally with adjacent/parent context."""
+    """Fetch one chunk, optionally with adjacent/parent context.
+
+    ``ref`` selects an already indexed git ref for the same logical project,
+    matching ``search_code``/``find_definition``; a missing ref returns
+    ``E_REF_NOT_INDEXED`` instead of silently hydrating against another index.
+    """
     return await asyncio.to_thread(
         do_get_chunk,
         project_path,
@@ -1077,6 +1409,7 @@ async def get_chunk(
         include_neighbors,
         neighbor_window,
         include_parent,
+        ref,
     )
 
 
@@ -1100,7 +1433,7 @@ async def project_map(
     symbol_kinds: list[str] | None = None,
     min_symbols: int = 0,
     non_empty: bool = True,
-    include_git: bool = True,
+    include_git: bool | None = None,
     group_by: str = "commit",
     ticket_regex: str | None = None,
     window_hours: float = 2.0,
@@ -1110,7 +1443,13 @@ async def project_map(
     cochange_limit: int = 5,
     hotspots_limit: int = 25,
 ) -> dict:
-    """Body-free dirs map; opt into compact files, filters, and VCS analytics."""
+    """Body-free dirs map; opt into compact files, filters, and VCS analytics.
+
+    ``include_git`` omitted defers to ``ENGRAM_GIT_ANALYTICS`` (default: on).
+    A project indexed with git analytics disabled always reports
+    ``git_analytics.status == "disabled"`` here rather than performing a live
+    git walk, regardless of ``include_git``.
+    """
     return await asyncio.to_thread(
         do_project_map,
         project_path=project_path,
@@ -1149,30 +1488,6 @@ async def doctor_project(project_path: str, check_git: bool = True) -> dict:
     return await asyncio.to_thread(do_doctor_project, project_path, check_git)
 
 
-async def grep_index(
-    project_path: str,
-    pattern: str,
-    ignore_case: bool = False,
-    limit: int = 50,
-    offset: int = 0,
-    max_matches: int = 500,
-    max_scan_chunks: int = 10000,
-    include_lines: bool = False,
-) -> dict:
-    """Bounded regex/count probe over indexed text; bodies omitted by default."""
-    return await asyncio.to_thread(
-        do_grep_index,
-        project_path,
-        pattern,
-        ignore_case,
-        limit,
-        offset,
-        max_matches,
-        max_scan_chunks,
-        include_lines,
-    )
-
-
 async def model_status(project_path: str | None = None) -> dict:
     """Report whether a project's recorded query model is loaded in this process.
 
@@ -1191,13 +1506,17 @@ async def list_indexed_projects(
     limit: int = inventory.DEFAULT_LIST_LIMIT,
     cursor: str | None = None,
     verbose: bool = False,
-    prune_orphans: bool = True,
+    prune_orphans: bool = False,
 ) -> dict:
     """List indexed projects with compact pagination and optional health checks.
 
     Compact mode reads manifests only. ``verbose=true`` may open LanceDB to add
-    table health. ``prune_orphans=true`` removes index dirs whose recorded root
-    path no longer exists and reports them under ``gc``.
+    table health. ``prune_orphans`` defaults to false: a listing call must
+    never delete an index merely because its recorded root looks momentarily
+    missing (disconnected drive, unmounted share, renamed workspace). Passing
+    ``prune_orphans=true`` here still works when explicitly requested, but the
+    preferred way to delete orphaned index directories is the explicit
+    operator path: `engram gc --prune` (or `engram gc --dry-run` to preview).
     """
     return list_projects(
         limit=limit,
@@ -1209,7 +1528,7 @@ async def list_indexed_projects(
 
 def read_only_enabled() -> bool:
     """True when ENGRAM_READONLY selects the read-only tool surface."""
-    return os.environ.get("ENGRAM_READONLY", "").strip().lower() in ("1", "true", "yes", "on")
+    return paths.read_only_enabled()
 
 
 def register_tools(read_only: bool) -> None:
@@ -1220,7 +1539,6 @@ def register_tools(read_only: bool) -> None:
     mcp.tool()(get_chunk)
     mcp.tool()(project_map)
     mcp.tool()(doctor_project)
-    mcp.tool()(grep_index)
     mcp.tool()(model_status)
     mcp.tool()(index_status)
     mcp.tool()(list_indexed_projects)
@@ -1228,6 +1546,7 @@ def register_tools(read_only: bool) -> None:
     # Mutating tools — only when not read-only.
     if not read_only:
         mcp.tool()(index_project)
+        mcp.tool()(cancel_index)
         mcp.tool()(reindex_file)
         mcp.tool()(remove_project)
 
@@ -1240,6 +1559,27 @@ def _maybe_warmup_on_start() -> None:
         _schedule_query_model_warmup(factory.CANONICAL_EMBEDDER_ID)
 
 
+def _maybe_reclaim_on_start() -> None:
+    """Kick off startup GC (stale generations + optional cache prune) in the background.
+
+    Opt-in via ENGRAM_GC_ON_START=1; a no-op otherwise, and always under
+    ENGRAM_READONLY=1. Backgrounded so a large ``ENGRAM_HOME`` (many indexed
+    projects) never delays the stdio handshake. See `engram_mcp.startup` for
+    why automatic reclaim is unsafe when several server processes share one
+    ENGRAM_HOME.
+    """
+
+    def _run() -> None:
+        from engram_mcp.startup import run_startup_maintenance
+
+        try:
+            run_startup_maintenance()
+        except Exception:
+            pass  # best-effort housekeeping; never let this affect server startup
+
+    Thread(target=_run, name="engram-startup-gc", daemon=True).start()
+
+
 def main() -> None:
     # Set up TLS trust (OS store / CA bundle / insecure) before the background
     # index worker loads a model over HTTPS.
@@ -1247,6 +1587,7 @@ def main() -> None:
 
     configure_tls()
     _maybe_warmup_on_start()
+    _maybe_reclaim_on_start()
     mcp.run()
 
 

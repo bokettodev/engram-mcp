@@ -11,15 +11,18 @@ import time
 import uuid
 from dataclasses import dataclass
 
+TERMINAL_STATUSES = ("done", "error", "cancelled")
+
 
 @dataclass
 class JobState:
     job_id: str
     project_path: str
     index_device: str = ""
+    index_device_requested: str = ""
     embedder_id: str = ""
     backend_id: str = ""
-    status: str = "queued"  # queued | running | done | error
+    status: str = "queued"  # queued | running | done | error | cancelled
     stage: str = ""
     files: int = 0
     chunks: int = 0
@@ -28,6 +31,8 @@ class JobState:
     progress_unit: str = ""
     done_units: int = 0
     total_units: int | None = None
+    plan: dict | None = None
+    cancel_requested: bool = False
     error: str | None = None
     code: str | None = None
     hint: str | None = None
@@ -36,6 +41,10 @@ class JobState:
     updated_at: float = 0.0
     finished_at: float = 0.0
     update_seq: int = 0
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL_STATUSES
 
     @property
     def duration_sec(self) -> float:
@@ -75,7 +84,7 @@ class JobRegistry:
         if len(self._jobs) < _MAX_HISTORY:
             return
         finished = sorted(
-            (j for j in self._jobs.values() if j.status in ("done", "error")),
+            (j for j in self._jobs.values() if j.status in TERMINAL_STATUSES),
             key=lambda j: j.finished_at,
         )
         for j in finished[: len(self._jobs) - _MAX_HISTORY + 1]:
@@ -95,6 +104,23 @@ class JobRegistry:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def find_active(self, project_path: str) -> JobState | None:
+        """Return an in-flight (queued/running) job for ``project_path``, if any.
+
+        Used to coalesce a second ``index_project`` call for the same resolved
+        project root into the already-running job instead of starting a
+        duplicate. Ties broken by most-recently-created so a caller always
+        sees the freshest active job.
+        """
+        with self._lock:
+            candidates = [
+                j for j in self._jobs.values()
+                if j.project_path == project_path and not j.is_terminal
+            ]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda j: j.created_at)
+
     def all(self) -> list[JobState]:
         with self._lock:
             return list(self._jobs.values())
@@ -108,11 +134,22 @@ def snapshot(job: JobState) -> dict:
     if job.status == "running" and job.done_units and job.total_units:
         per_unit = elapsed / job.done_units
         eta = max(0.0, per_unit * (job.total_units - job.done_units))
+    routing = None
+    if job.index_device_requested:
+        routing = (
+            "delta_cpu"
+            if job.index_device_requested == "auto" and job.index_device == "cpu"
+            else "requested"
+        )
     return {
         "scope": "current_process",
         "job_id": job.job_id,
         "project_path": job.project_path,
         "index_device": job.index_device,
+        "index_device_requested": job.index_device_requested or None,
+        "routing": routing,
+        "plan": job.plan,
+        "cancel_requested": job.cancel_requested,
         "embedder_id": job.embedder_id,
         "backend_id": job.backend_id,
         "status": job.status,

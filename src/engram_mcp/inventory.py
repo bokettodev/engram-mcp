@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 from engram_mcp import errors, paths
+from engram_mcp.index_repository import load_query_index
 
 
 DEFAULT_LIST_LIMIT = 50
@@ -122,8 +123,6 @@ def _verbose_health(project: dict, d: Path, raw: dict) -> dict:
             },
         }
     try:
-        from engram_mcp.pipeline import load_query_index
-
         qi = load_query_index(root)
         return project | {
             "valid": True,
@@ -159,21 +158,31 @@ def _prune_dir(d: Path, project_id: str, root_path: str) -> tuple[dict | None, d
     return item, None
 
 
+def _read_only_enabled() -> bool:
+    return paths.read_only_enabled()
+
+
 def list_indexed_projects(
     *,
     limit: int = DEFAULT_LIST_LIMIT,
     cursor: str | None = None,
     verbose: bool = False,
-    prune_orphans: bool = True,
+    prune_orphans: bool = False,
 ) -> dict:
     """Return a paginated compact inventory.
 
     Compact mode reads manifests only. ``verbose=True`` validates table health
-    and may open LanceDB for the current page.
+    and may open LanceDB for the current page. ``prune_orphans`` defaults to
+    False: a listing call must never delete an index just because its
+    recorded root looks momentarily missing (disconnected drive, unmounted
+    share, renamed workspace). Use the explicit ``engram gc --prune`` CLI path
+    (``gc_orphans(prune=True)``) to delete orphaned index directories.
     """
 
     limit = _parse_limit(limit)
     offset = _parse_cursor(cursor)
+    if _read_only_enabled():
+        prune_orphans = False
     home, base = _projects_base()
     if not home.exists():
         return _empty_response(home, home_exists=False)
@@ -221,6 +230,8 @@ def list_indexed_projects(
 def gc_orphans(*, prune: bool = False) -> dict:
     """Find or prune project index dirs whose recorded root_path is missing."""
 
+    if prune and _read_only_enabled():
+        prune = False
     home, base = _projects_base()
     result = {
         "data_home": str(home),

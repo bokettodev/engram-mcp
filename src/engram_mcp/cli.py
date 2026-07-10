@@ -119,7 +119,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
     # Imported lazily so `chunk` doesn't pay the embedder import cost.
-    from engram_mcp import errors
+    from engram_mcp import errors, gitmeta
     from engram_mcp.embeddings import factory
     from engram_mcp.pipeline import index_project
 
@@ -127,6 +127,11 @@ def cmd_index(args: argparse.Namespace) -> int:
     try:
         index_device = factory.resolve_index_device(
             index_device=getattr(args, "index_device", None), gpu=args.gpu, cpu=args.cpu
+        )
+        # Precedence: explicit --git-analytics/--no-git-analytics > ENGRAM_GIT_ANALYTICS > enabled.
+        requested_git_analytics = getattr(args, "git_analytics", None)
+        git_analytics = (
+            gitmeta.git_analytics_default() if requested_git_analytics is None else bool(requested_git_analytics)
         )
         if not as_json:
             print(f"loading embedder (index device {index_device}) ...", file=sys.stderr)
@@ -153,7 +158,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             provider,
             full_rebuild=args.rebuild,
             progress=_progress,
-            git_analytics=bool(getattr(args, "git_analytics", True)),
+            git_analytics=git_analytics,
             git_max_commits=getattr(args, "git_max_commits", None),
             git_fix_regex=getattr(args, "git_fix_regex", None),
         )
@@ -211,7 +216,7 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
-    from engram_mcp.pipeline import remove_project
+    from engram_mcp.index_repository import remove_project
 
     root = Path(args.path).resolve()
     removed = remove_project(root)
@@ -220,15 +225,25 @@ def cmd_remove(args: argparse.Namespace) -> int:
 
 
 def cmd_gc(args: argparse.Namespace) -> int:
+    from engram_mcp.embeddings.cache import global_cache_report
+    from engram_mcp.gcreclaim import reclaim_all
     from engram_mcp.inventory import gc_orphans
 
-    out = gc_orphans(prune=args.prune)
+    prune = args.prune
+    out = {
+        "dry_run": not prune,
+        "orphans": gc_orphans(prune=prune),
+        "stale_generations": reclaim_all(dry_run=not prune),
+        "embedding_cache": global_cache_report(dry_run=not prune),
+    }
     print(json.dumps(out, indent=2))
-    return 2 if out.get("errors") else 0
+    has_errors = bool(out["orphans"].get("errors") or out["stale_generations"].get("errors"))
+    return 2 if has_errors else 0
 
 
 def cmd_find_def(args: argparse.Namespace) -> int:
-    from engram_mcp.pipeline import ProjectNotIndexedError, find_definition
+    from engram_mcp.index_repository import ProjectNotIndexedError
+    from engram_mcp.query_service import find_definition
 
     root = Path(args.path).resolve()
     ref = getattr(args, "ref", None)
@@ -259,7 +274,8 @@ def cmd_find_def(args: argparse.Namespace) -> int:
 def cmd_evaluate(args: argparse.Namespace) -> int:
     from engram_mcp import evaluate
     from engram_mcp.embeddings import factory
-    from engram_mcp.pipeline import load_query_index, rerank_enabled
+    from engram_mcp.index_repository import load_query_index
+    from engram_mcp.query_service import rerank_enabled
 
     root = Path(args.path).resolve()
     cases = evaluate.load_cases(args.evalfile)
@@ -300,6 +316,89 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         for r in report.rows:
             tag = "ok  " if r["rank"] else "MISS"
             print(f"    [{tag}] {r['category']:<12} rank={r['rank']}  {r['query']!r} -> {r['top']}")
+
+    if args.save_baseline:
+        evaluate.save_baseline(
+            args.save_baseline, report, evalfile=args.evalfile, mode=args.mode, rerank=args.rerank
+        )
+        print(f"\nbaseline saved: {args.save_baseline}")
+
+    if args.baseline:
+        margin = args.margin if args.margin is not None else evaluate.DEFAULT_NONINFERIORITY_MARGIN
+        baseline = evaluate.load_baseline(args.baseline)
+        cmp = evaluate.compare_to_baseline(report, baseline, margin=margin)
+        print(f"\nbaseline check ({args.baseline}, margin={margin}):")
+        for c in cmp["checks"]:
+            status = "OK  " if c["ok"] else "FAIL"
+            reason = f"  ({c['reason']})" if c.get("reason") else ""
+            print(
+                f"  [{status}] {c['metric']:<24} current={c['current']}  "
+                f"baseline={c['baseline']}  delta={c['delta']}{reason}"
+            )
+        if not cmp["ok"]:
+            print(
+                f"\nNON-INFERIORITY CHECK FAILED: {len(cmp['failures'])} metric(s) dropped "
+                f"more than {margin} below baseline {args.baseline}",
+                file=sys.stderr,
+            )
+            return 1
+        print("\nnon-inferiority check passed.")
+    return 0
+
+
+def cmd_grep(args: argparse.Namespace) -> int:
+    """Bounded regex probe over indexed chunk text (CLI-only diagnostic).
+
+    Not exposed as an MCP tool: it approximates grep over overlapping chunks
+    (can double-count or miss cross-chunk matches), and agents already have
+    better exact-search tools. The underlying implementation stays available
+    here and via `engram_mcp.diagnostics.grep_index` for operators.
+    """
+    from engram_mcp import diagnostics
+    from engram_mcp.index_repository import ProjectNotIndexedError
+
+    root = Path(args.path).resolve()
+    try:
+        out = diagnostics.grep_index(
+            root,
+            args.pattern,
+            ignore_case=args.ignore_case,
+            limit=args.limit,
+            offset=args.offset,
+            max_matches=args.max_matches,
+            max_scan_chunks=args.max_scan_chunks,
+            include_lines=args.include_lines,
+        )
+    except ProjectNotIndexedError:
+        print(f'project not indexed: {root}\nrun: engram index "{root}"', file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        _json_result(out)
+        return 0
+
+    for warning in out.get("warnings") or []:
+        print(f"warning: {warning}", file=sys.stderr)
+    print(f"pattern:        {out['pattern']!r}  (ignore_case={out['ignore_case']})")
+    print(f"status:         {out['status']}")
+    print(
+        f"matches:        {out['total_matches']} across {out['total_paths']} path(s) "
+        f"(scanned {out['scanned_chunks']} chunks)"
+    )
+    results = out["results"]
+    if not results:
+        print("no matches.")
+        return 0
+    for item in results:
+        print(f"\n[{item['path']}] {item['match_count']} match(es)  lines={item['line_numbers']}")
+        if args.include_lines:
+            for line in item.get("lines", []):
+                print(f"  {line['line']}: {line['text']}")
+    if out.get("has_more"):
+        print(f"\n... more results available (offset={out['offset']}, limit={out['limit']})")
     return 0
 
 
@@ -340,9 +439,6 @@ def cmd_search(args: argparse.Namespace) -> int:
         )
         if revision_warning:
             print(f"warning: {revision_warning}", file=sys.stderr)
-        for warning in outcome.get("warnings") or []:
-            if warning.startswith("no index for ref "):
-                print(f"warning: {warning}", file=sys.stderr)
     except ProjectNotIndexedError:
         print(f'project not indexed: {root}\nrun: engram index "{root}"', file=sys.stderr)
         return 2
@@ -391,19 +487,30 @@ def main(argv: list[str] | None = None) -> int:
                     help="force CPU indexing — a slow fallback; only when you can't use a GPU")
     pi.add_argument("--index-device", choices=["auto", "cpu", "cuda"], default=None,
                     help=argparse.SUPPRESS)  # explicit setting; used by the MCP server subprocess
-    pi.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # machine-readable; used by the MCP server's GPU subprocess
+    pi.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # machine-readable; used by the MCP server's index subprocess
+    pi.add_argument(
+        "--git-analytics",
+        dest="git_analytics",
+        action="store_true",
+        default=None,
+        help=(
+            "capture git history/SZZ analytics in the catalog sidecar "
+            "(default: ENGRAM_GIT_ANALYTICS env var, or on if unset); "
+            "overrides ENGRAM_GIT_ANALYTICS for this run"
+        ),
+    )
     pi.add_argument(
         "--no-git-analytics",
         dest="git_analytics",
         action="store_false",
-        help="do not capture git history/SZZ analytics in the catalog sidecar",
+        help="do not capture git history/SZZ analytics in the catalog sidecar; overrides ENGRAM_GIT_ANALYTICS for this run",
     )
     pi.add_argument(
         "--git-max-commits",
         type=int,
         default=None,
         metavar="N",
-        help=argparse.SUPPRESS,
+        help="limit shared git-history analytics to the newest N commits (default: full history)",
     )
     pi.add_argument(
         "--git-fix-regex",
@@ -411,19 +518,37 @@ def main(argv: list[str] | None = None) -> int:
         metavar="REGEX",
         help=argparse.SUPPRESS,
     )
-    pi.set_defaults(git_analytics=True)
     pi.set_defaults(func=cmd_index)
 
     prm = sub.add_parser("remove", help="delete a project's index from disk")
     prm.add_argument("path", help="project root directory")
     prm.set_defaults(func=cmd_remove)
 
-    pgc = sub.add_parser("gc", help="find or prune index dirs whose project root is missing")
+    pgc = sub.add_parser(
+        "gc",
+        help=(
+            "report or reclaim disk usage: orphaned index dirs, superseded LanceDB "
+            "generations, and the global embedding cache"
+        ),
+    )
     gc_mode = pgc.add_mutually_exclusive_group()
-    gc_mode.add_argument("--dry-run", dest="prune", action="store_false",
-                         help="report orphaned index dirs without deleting them (default)")
-    gc_mode.add_argument("--prune", action="store_true",
-                         help="delete orphaned index dirs")
+    gc_mode.add_argument(
+        "--dry-run", dest="prune", action="store_false",
+        help=(
+            "report orphaned index dirs, stale generations, and embedding-cache size "
+            "without deleting anything (default)"
+        ),
+    )
+    gc_mode.add_argument(
+        "--prune", action="store_true",
+        help=(
+            "delete orphaned index dirs, drop superseded (non-active) LanceDB "
+            "generation tables + their catalog sidecars for every indexed project, "
+            "and prune the global embedding cache to ENGRAM_CACHE_MAX_MB (a no-op "
+            "on the cache if that env var is unset -- the cache has no default "
+            "budget). Never active generations. Refused under ENGRAM_READONLY=1."
+        ),
+    )
     pgc.set_defaults(func=cmd_gc, prune=False)
 
     pf = sub.add_parser("find-def", help="exact symbol definition lookup (no embedding)")
@@ -446,6 +571,26 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     pv.add_argument("-v", "--verbose", action="store_true", help="print per-query ranks")
+    pv.add_argument(
+        "--baseline", default=None, metavar="PATH",
+        help=(
+            "compare measured hit@1/5/10 + MRR (overall and per category) against a "
+            "baseline JSON saved by --save-baseline; exits 1 on a non-inferiority failure "
+            "(a metric more than --margin below its baseline value)"
+        ),
+    )
+    pv.add_argument(
+        "--save-baseline", default=None, metavar="PATH",
+        help="write the measured metrics as a new baseline JSON at PATH",
+    )
+    pv.add_argument(
+        "--margin", type=float, default=None,
+        help=(
+            "max allowed absolute drop below a --baseline metric before it counts as a "
+            "regression (default: engram_mcp.evaluate.DEFAULT_NONINFERIORITY_MARGIN, "
+            "currently 0.05)"
+        ),
+    )
     pv.set_defaults(func=cmd_evaluate)
 
     ps = sub.add_parser("search", help="semantic search over an indexed project")
@@ -465,6 +610,27 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     ps.set_defaults(func=cmd_search)
+
+    pg = sub.add_parser(
+        "grep",
+        help="bounded regex probe over indexed chunk text (operator diagnostic, not an MCP tool)",
+    )
+    pg.add_argument("path", help="project root directory")
+    pg.add_argument("pattern", help="Python regex pattern")
+    pg.add_argument("--ignore-case", action="store_true", help="case-insensitive match")
+    pg.add_argument("--limit", type=int, default=50, help="max paths returned per page")
+    pg.add_argument("--offset", type=int, default=0, help="pagination offset over matched paths")
+    pg.add_argument("--max-matches", type=int, default=500, help="stop scanning after this many matches")
+    pg.add_argument(
+        "--max-scan-chunks", type=int, default=10000,
+        help="max indexed chunks scanned for this query",
+    )
+    pg.add_argument(
+        "--include-lines", action="store_true",
+        help="include matched line text (truncated) alongside line numbers",
+    )
+    pg.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    pg.set_defaults(func=cmd_grep)
 
     args = p.parse_args(argv)
     # Set up TLS trust (OS store / CA bundle / insecure) before any embedder
