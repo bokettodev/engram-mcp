@@ -49,6 +49,94 @@ def test_reindex_rejects_path_escape(tmp_path, monkeypatch, provider):
         reindex_file(proj, provider, "../proj_evil/x.py")
 
 
+def test_manifest_missing_schema_version_is_incompatible(tmp_path):
+    pdir = tmp_path / "idx"
+    pdir.mkdir()
+    (pdir / "project.json").write_text(
+        '{"project_id":"p","root_path":"T:/repo","active_table":"chunks"}',
+        encoding="utf-8",
+    )
+
+    loaded = manifest.load_project(pdir)
+    assert loaded is not None
+    assert loaded.schema_version == 0
+    with pytest.raises(Exception) as exc:
+        manifest.load_project_strict(pdir)
+    assert "schema_version" in str(exc.value)
+
+
+def test_manifest_previous_schema_version_fails_loud_after_bump(tmp_path):
+    """manifest.SCHEMA_VERSION was bumped 3 -> 4 alongside the new
+    requested_git_fix_regex identity field; a manifest written by the
+    previous (v3) code must not be silently accepted with the field defaulted
+    — it must fail loud so the maintainer reindexes.
+    """
+
+    pdir = tmp_path / "idx"
+    pdir.mkdir()
+    import json
+
+    (pdir / "project.json").write_text(
+        json.dumps({"project_id": "p", "root_path": "T:/repo", "active_table": "chunks", "schema_version": 3}),
+        encoding="utf-8",
+    )
+
+    assert manifest.SCHEMA_VERSION == 4
+    with pytest.raises(Exception) as exc:
+        manifest.load_project_strict(pdir)
+    assert "schema_version" in str(exc.value)
+
+
+def test_legacy_git_history_schema_lacking_identity_is_treated_as_stale(tmp_path, monkeypatch):
+    """A history/SZZ sidecar written by the previous gitstore schema (v1, no
+    requested-regex identity) must be invalidated (never assumed fresh), not
+    silently loaded as if current.
+    """
+
+    import json
+
+    from engram_mcp import gitstore, paths
+
+    monkeypatch.setenv("ENGRAM_HOME", str(tmp_path / "home"))
+    paths._reset_data_home_for_tests()
+    logical_project_id = "legacy-proj"
+
+    assert gitstore.SCHEMA_VERSION == 2
+
+    history_path = gitstore.history_path(logical_project_id, create=True)
+    history_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,  # previous gitstore schema, predates requested_fix_regex
+                "logical_project_id": logical_project_id,
+                "status": "ready",
+                "fix_regex": r"(?i)\bfix\b",
+                # no requested_fix_regex: legacy payload
+                "commits": [],
+                "fingerprint": {"hash": "legacy-hash"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    szz_path = gitstore.szz_path(logical_project_id, create=True)
+    szz_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "logical_project_id": logical_project_id,
+                "status": "ready",
+                "fix_regex": r"(?i)\bfix\b",
+                "fingerprint": {"hash": "legacy-hash"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # The version-gate rejects the legacy payload outright...
+    assert gitstore.load_history(logical_project_id) is None
+    assert gitstore.load_szz(logical_project_id) is None
+
+
 def test_file_becoming_generated_is_removed(tmp_path, monkeypatch, provider):
     monkeypatch.setenv("ENGRAM_HOME", str(tmp_path / "home"))
     proj = tmp_path / "proj"

@@ -8,8 +8,8 @@ from typing import Sequence
 
 import pytest
 
-from engram_mcp import gitmeta, gitstore, manifest, paths, server
-from engram_mcp.pipeline import index_project, search_project, wait_for_szz_tasks
+from engram_mcp import gitmeta, gitstore, gitorchestration, manifest, paths, server
+from engram_mcp.pipeline import index_project, search_project
 
 
 class _BranchProvider:
@@ -151,6 +151,7 @@ def test_git_worktree_indexes_share_logical_project_id_and_ref_query(tmp_path, m
     assert found["indexed_ref"] == branch
     assert found["results"][0]["rel_path"] == "marker.py"
 
+    loaded_before_missing = list(loaded)
     missing = server.do_search(
         str(main),
         "main marker",
@@ -159,17 +160,53 @@ def test_git_worktree_indexes_share_logical_project_id_and_ref_query(tmp_path, m
         content="none",
         ref="missing/ref",
     )
-    assert loaded[-1] == main_provider.model_id
-    assert missing["project_id"] == main_manifest.project_id
-    assert missing["source_revision"]["indexed"]["ref"] == "main"
-    assert any(
-        "no index for ref 'missing/ref'" in warning and "searched 'main'" in warning
-        for warning in missing["warnings"]
-    )
+    assert loaded == loaded_before_missing
+    assert missing["code"] == "E_REF_NOT_INDEXED"
+    assert "missing/ref" in missing["error"]
 
     missing_def = server.do_find_definition(str(main), "branch_marker", ref="missing/ref")
-    assert missing_def["project_id"] == main_manifest.project_id
-    assert any("no index for ref 'missing/ref'" in warning for warning in missing_def["warnings"])
+    assert missing_def["code"] == "E_REF_NOT_INDEXED"
+    assert missing_def["results"] == []
+
+
+def test_get_chunk_resolves_ref_and_rejects_missing_ref(tmp_path, monkeypatch):
+    """get_chunk must resolve `ref` the same way search_code/find_definition
+    do: an agent that searched a specific ref must be able to hydrate the
+    chunk_id it was handed by passing that same ref back to get_chunk,
+    without get_chunk silently falling back to a different index.
+    """
+    main, worktree, branch = _tiny_worktree_repo(tmp_path)
+    main_provider = _BranchProvider("test:get-chunk-main")
+    branch_provider = _BranchProvider("test:get-chunk-branch")
+
+    index_project(main, main_provider, full_rebuild=True)
+    index_project(worktree, branch_provider, full_rebuild=True)
+
+    providers = {
+        main_provider.model_id: main_provider,
+        branch_provider.model_id: branch_provider,
+    }
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda model_id: providers[model_id])
+
+    branch_hit = server.do_search(
+        str(main), "branch marker", k=1, mode="vector", ref=branch
+    )["results"][0]
+    chunk_id = branch_hit["chunk_id"]
+
+    # Without ref, get_chunk resolves against main's own index. marker.py's
+    # content differs between main and the branch, so the branch's chunk_id
+    # (content-hash keyed) is genuinely absent from main's table -- it must
+    # not be silently served from a different index.
+    default_lookup = server.do_get_chunk(str(main), chunk_id)
+    assert "error" in default_lookup
+
+    resolved = server.do_get_chunk(str(main), chunk_id, ref=branch)
+    assert "error" not in resolved
+    assert "branch_marker" in resolved["content"]
+    assert resolved["indexed_ref"] == branch
+
+    missing = server.do_get_chunk(str(main), chunk_id, ref="missing/ref")
+    assert missing["code"] == "E_REF_NOT_INDEXED"
 
 
 def test_git_worktree_reuses_shared_repo_analytics(tmp_path, monkeypatch):
@@ -202,7 +239,7 @@ def test_git_worktree_reuses_shared_repo_analytics(tmp_path, monkeypatch):
     monkeypatch.setattr(gitmeta, "szz_attributions_with_status", fake_szz)
 
     index_project(main, _BranchProvider("test:shared-main"), full_rebuild=True)
-    wait_for_szz_tasks(timeout=5)
+    gitorchestration.wait_for_szz_tasks(timeout=5)
     main_manifest = manifest.load_project(paths.project_dir(main, create=False))
     assert main_manifest is not None
     history = gitstore.load_history(main_manifest.logical_project_id)
@@ -214,7 +251,7 @@ def test_git_worktree_reuses_shared_repo_analytics(tmp_path, monkeypatch):
     assert len(calls) == 1
 
     index_project(worktree, _BranchProvider("test:shared-worktree"), full_rebuild=True)
-    wait_for_szz_tasks(timeout=5)
+    gitorchestration.wait_for_szz_tasks(timeout=5)
     worktree_manifest = manifest.load_project(paths.project_dir(worktree, create=False))
     assert worktree_manifest is not None
     assert worktree_manifest.logical_project_id == main_manifest.logical_project_id
@@ -230,7 +267,7 @@ def test_git_worktree_reuses_shared_repo_analytics(tmp_path, monkeypatch):
     _git(worktree, "add", "extra.py")
     _git(worktree, "commit", "-m", "fix extra marker")
     index_project(worktree, _BranchProvider("test:shared-worktree-refresh"), full_rebuild=True)
-    wait_for_szz_tasks(timeout=5)
+    gitorchestration.wait_for_szz_tasks(timeout=5)
     refreshed = gitstore.load_history(main_manifest.logical_project_id)
     assert refreshed is not None
     assert refreshed["fingerprint"]["hash"] != history["fingerprint"]["hash"]

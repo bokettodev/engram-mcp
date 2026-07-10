@@ -6,6 +6,8 @@ these never touch the global ssl module or requests.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from engram_mcp import net
@@ -15,14 +17,35 @@ _ALL_ENV = (
     "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
 )
 
+# Snapshot taken at import time, before any test in this module has run, so
+# the final regression test (bottom of file) has a trustworthy "before" to
+# compare against.
+_ORIGINAL_ENV_SNAPSHOT = {v: os.environ.get(v) for v in _ALL_ENV}
+
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    # Record + clear every var so configure_tls()'s setdefault writes are torn
-    # down by monkeypatch (it removes keys that were originally absent).
+    # `configure_tls()` doesn't only setdefault through monkeypatch: its
+    # CA-bundle mirroring path (`os.environ[v] = bundle`) writes DIRECTLY to
+    # os.environ for vars monkeypatch never touched (e.g. a var that was
+    # absent before the test and that this test itself never called
+    # monkeypatch.setenv/delenv on). monkeypatch only undoes changes it made
+    # itself, so those direct writes have no registered undo action and leak
+    # into the rest of the test session -- previously observed as a leaked
+    # SSL_CERT_FILE breaking an unrelated real-subprocess test later in the
+    # suite. Snapshot + restore the real environment ourselves so this is
+    # correct regardless of how configure_tls() chooses to mutate os.environ.
+    saved = {v: os.environ.get(v) for v in _ALL_ENV}
     for v in _ALL_ENV:
         monkeypatch.delenv(v, raising=False)
-    return monkeypatch
+    try:
+        yield monkeypatch
+    finally:
+        for v, value in saved.items():
+            if value is None:
+                os.environ.pop(v, None)
+            else:
+                os.environ[v] = value
 
 
 def test_insecure_takes_precedence(clean_env, monkeypatch):
@@ -140,3 +163,16 @@ def test_guard_download_passes_through_other_errors():
     with pytest.raises(ValueError):
         with net.guard_download():
             raise ValueError("unrelated")
+
+
+# Must stay the LAST test defined in this module: it compares the ambient
+# process environment against the snapshot taken at import time (before any
+# test here ran), so it only proves something if every other TLS test in the
+# file has already executed. No ordering plugin (pytest-randomly/xdist) is
+# configured for this project, so in-file declaration order is reliable.
+def test_ambient_env_unchanged_after_tls_tests() -> None:
+    current = {v: os.environ.get(v) for v in _ALL_ENV}
+    assert current == _ORIGINAL_ENV_SNAPSHOT, (
+        "a TLS test leaked one of these vars into the real process "
+        "environment instead of restoring it on teardown"
+    )

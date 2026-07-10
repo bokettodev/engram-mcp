@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import subprocess
+import sys
 import types
 import threading
 import time
@@ -12,12 +15,14 @@ from typing import Sequence
 
 import pytest
 
-from engram_mcp import config, errors, manifest, paths, retrieval
+from engram_mcp import config, diagnostics, errors, manifest, paths, retrieval
 from engram_mcp.pipeline import (
     ProjectNotIndexedError,
     derive_chunk_role,
+    doctor_project,
     index_project,
     load_query_index,
+    reindex_file,
     search_project,
     _search_count_metadata,
     _is_compatible,
@@ -99,6 +104,7 @@ def _write_manifest_only(root: Path, dim: int = 4, **overrides) -> Path:
         embedder_id="test:fake",
         dim=dim,
         chunker_version=config.CHUNKER_VERSION,
+        chunk_id_scheme=config.CHUNK_ID_SCHEME,
         files=1,
         chunks=1,
     )
@@ -133,6 +139,8 @@ def _create_one_row_table(root: Path, *, embedder_id: str = "test:fake", dim: in
     manifest.save_files(
         pdir,
         {"a.py": {"file_hash": "h", "mtime_ns": 1, "size": 1, "language": "python", "chunks": 1}},
+        generation=0,
+        active_table="chunks",
     )
 
 
@@ -182,6 +190,26 @@ def test_load_query_index_rejects_missing_or_empty_active_table(tmp_path):
         load_query_index(proj)
     assert empty.value.code == errors.E_INDEX_INVALID
     assert "empty" in str(empty.value)
+
+
+def test_doctor_project_never_creates_missing_lancedb_dir(tmp_path, monkeypatch):
+    """doctor_project is a read path: a valid manifest whose lancedb/ dir is
+    missing must be reported as an error issue, not silently created by
+    `lancedb.connect` (which creates a missing directory as a side effect).
+    """
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    pdir = _write_manifest_only(proj)
+    lancedb_dir = pdir / "lancedb"
+    assert not lancedb_dir.exists()
+
+    monkeypatch.setenv("ENGRAM_READONLY", "1")
+    health = doctor_project(proj, check_git=False)
+
+    assert health["ok"] is False
+    assert any(issue["code"] == "table_missing" for issue in health["issues"])
+    assert not lancedb_dir.exists()
 
 
 def test_server_error_codes_and_read_only_hint(tmp_path, monkeypatch):
@@ -292,7 +320,7 @@ def test_search_shape_facets_budget_and_catalog_tools(tmp_path, monkeypatch):
         max_total_chars=12,
     )
     assert out["count"] == 2
-    assert out["map"][0]["chunk_id"] == out["results"][0]["chunk_id"]
+    assert "map" not in out  # CUT 1: top-level map[] removed, derivable from results[]
     assert out["body_chars"] <= 12
     assert out["truncated"] is True
     assert "total_matches" in out
@@ -331,7 +359,7 @@ def test_search_shape_facets_budget_and_catalog_tools(tmp_path, monkeypatch):
     assert health["ok"] is True
     assert health["summary"]["manifest_files"] == 2
 
-    grep = server.do_grep_index(str(proj), "EmbeddingCache")
+    grep = diagnostics.grep_index(str(proj), "EmbeddingCache")
     assert grep["total_matches"] >= 1
     assert grep["results"][0]["path"] == "cache.py"
 
@@ -362,7 +390,19 @@ def test_incremental_catalog_crash_window_leaves_unavailable_catalog(tmp_path, m
     assert mapped["code"] == errors.E_INDEX_INVALID
 
 
-def test_same_generation_catalog_drift_is_rejected_against_active_table(tmp_path, monkeypatch):
+def test_same_generation_catalog_drift_is_caught_by_doctor_not_search(tmp_path, monkeypatch):
+    """A table mutated outside the normal write path (same generation/active_table,
+    catalog+manifest token untouched) is the one class of drift the search-time
+    O(1) token check cannot see -- it never re-scans the table, only compares
+    the token written alongside the catalog at build time (see
+    pipeline._catalog_validation_error). That full id-set comparison still
+    exists -- pipeline._catalog_deep_validation_error, used only by
+    doctor_project -- so this drift is still detected, just not on every
+    search. This is a deliberate move (item 1 of the search-hot-path audit),
+    not a regression: before it, this same drift made project_map fail with
+    E_INDEX_INVALID on every call; now project_map/search succeed (the token
+    still matches what was written) and only doctor_project flags it.
+    """
     from engram_mcp import catalog, server
 
     proj, provider = _indexed_canonical_project(tmp_path)
@@ -371,6 +411,8 @@ def test_same_generation_catalog_drift_is_rejected_against_active_table(tmp_path
     m = manifest.load_project(pdir)
     stale_catalog = catalog.load_catalog(pdir, m.generation)
     assert stale_catalog is not None
+    assert m.catalog_token
+    assert stale_catalog["catalog_token"] == m.catalog_token
 
     LanceStore(pdir / "lancedb", provider.dim, table=m.active_table).add(
         [
@@ -392,12 +434,86 @@ def test_same_generation_catalog_drift_is_rejected_against_active_table(tmp_path
         ]
     )
 
+    # Search-time O(1) validation only compares the (untouched) token, so it
+    # does not notice the table now has one more row than the catalog knows
+    # about -- non-vacuous proof that the hot path no longer scans the table.
     mapped = server.do_project_map(str(proj), depth=1)
-    assert mapped["code"] == errors.E_INDEX_INVALID
-    assert "active table row count" in mapped["hint"]
+    assert "code" not in mapped
 
+    # doctor_project still does the full id-set comparison and catches it.
     health = server.do_doctor_project(str(proj), check_git=False)
     assert any(issue["code"] == "catalog_count_mismatch" for issue in health["issues"])
+
+
+def test_catalog_token_mismatch_is_detected_and_degrades(tmp_path, monkeypatch):
+    """The O(1) search-time check (pipeline._catalog_validation_error) compares
+    only the commit token written into both the catalog sidecar and the
+    project manifest at build time. If that token is corrupted/tampered on
+    either side -- simulating drift the write-path invariant is supposed to
+    prevent -- search-time validation must still catch it and degrade
+    (project_map fails loud; search falls back to a warning, same as any
+    other catalog-unavailable case), even though it never re-scans the table.
+    """
+    from engram_mcp import catalog, server
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    pdir = paths.project_dir(proj, create=False)
+    m = manifest.load_project(pdir)
+    assert m.catalog_token
+
+    data = catalog.load_catalog(pdir, m.generation)
+    assert data is not None
+    assert data["catalog_token"] == m.catalog_token
+    data["catalog_token"] = "tampered-token-does-not-match-manifest"
+    catalog.save_catalog(pdir, data)
+
+    mapped = server.do_project_map(str(proj), depth=1)
+    assert mapped.get("code") == errors.E_INDEX_INVALID
+    assert "token" in mapped["hint"]
+
+    out = server.do_search(str(proj), "add numbers", k=1)
+    assert out["count"] == 1  # search itself still works: catalog is optional there
+    assert any("catalog sidecar unavailable" in w for w in out["warnings"])
+
+
+def test_catalog_token_written_under_same_lock_as_catalog(tmp_path, monkeypatch):
+    """The token is computed once, at build time, and written verbatim to both
+    the catalog sidecar and the project manifest before the project lock is
+    released -- so a freshly built (full rebuild, incremental, and
+    single-file reindex) generation always has the two in agreement.
+    """
+    from engram_mcp import catalog
+
+    provider = FakeProvider()
+    proj = _write_project(tmp_path)
+    index_project(proj, provider, full_rebuild=True)
+    pdir = paths.project_dir(proj, create=False)
+
+    m = manifest.load_project(pdir)
+    data = catalog.load_catalog(pdir, m.generation)
+    assert m.catalog_token
+    assert data["catalog_token"] == m.catalog_token
+
+    # Incremental update: still in agreement afterward.
+    (proj / "math_utils.py").write_text(
+        "def add_numbers(a, b):\n    return a + b + 0\n", encoding="utf-8"
+    )
+    index_project(proj, provider)
+    m2 = manifest.load_project(pdir)
+    data2 = catalog.load_catalog(pdir, m2.generation)
+    assert m2.catalog_token
+    assert data2["catalog_token"] == m2.catalog_token
+    assert m2.catalog_token != m.catalog_token  # table content changed -> token changed
+
+    # Single-file reindex: still in agreement afterward.
+    from engram_mcp.pipeline import reindex_file
+
+    reindex_file(proj, provider, "cache.py")
+    m3 = manifest.load_project(pdir)
+    data3 = catalog.load_catalog(pdir, m3.generation)
+    assert m3.catalog_token
+    assert data3["catalog_token"] == m3.catalog_token
 
 
 def test_malformed_catalog_warns_but_search_returns_hits(tmp_path, monkeypatch):
@@ -427,8 +543,6 @@ def test_malformed_catalog_warns_but_search_returns_hits(tmp_path, monkeypatch):
 
 
 def test_grep_index_pathological_regex_times_out(tmp_path, monkeypatch):
-    from engram_mcp import server
-
     monkeypatch.setenv("ENGRAM_GREP_REGEX_TIMEOUT_SEC", "0.2")
     proj = tmp_path / "proj"
     proj.mkdir()
@@ -464,11 +578,96 @@ def test_grep_index_pathological_regex_times_out(tmp_path, monkeypatch):
                 "chunks": 1,
             }
         },
+        generation=0,
+        active_table="chunks",
     )
 
-    out = server.do_grep_index(str(proj), r"(a+)+$")
-    assert out["code"] == errors.E_BAD_REQUEST
-    assert "timed out" in out["error"]
+    out = diagnostics.grep_index(str(proj), r"(a+)+$")
+    assert "error" not in out
+    assert out["status"] == "partial"
+    assert "timed out" in out["warning"]
+
+
+def test_grep_index_limits_are_clamped_with_warning(tmp_path, monkeypatch):
+    from engram_mcp.pipeline import MAX_GREP_LIMIT, MAX_GREP_MAX_MATCHES, MAX_GREP_SCAN_CHUNKS
+
+    proj, _provider = _indexed_project(tmp_path)
+
+    out = diagnostics.grep_index(
+        str(proj),
+        "def",
+        limit=MAX_GREP_LIMIT + 50,
+        max_matches=MAX_GREP_MAX_MATCHES + 50,
+        max_scan_chunks=MAX_GREP_SCAN_CHUNKS + 50,
+    )
+    assert out["limit"] == MAX_GREP_LIMIT
+    assert out["max_matches"] == MAX_GREP_MAX_MATCHES
+    assert out["max_scan_chunks"] == MAX_GREP_SCAN_CHUNKS
+    assert any("limit clamped" in w for w in out["warnings"])
+    assert any("max_matches clamped" in w for w in out["warnings"])
+    assert any("max_scan_chunks clamped" in w for w in out["warnings"])
+
+    # A within-budget request is untouched and carries no clamp warning.
+    within_budget = diagnostics.grep_index(str(proj), "def", limit=10)
+    assert within_budget["warnings"] == []
+
+
+def test_cli_grep_json_output(tmp_path, capsys):
+    # grep_index is not an MCP tool (CUT 2): the capability survives only via
+    # `engram grep` (this CLI path) and engram_mcp.diagnostics.grep_index.
+    from engram_mcp import cli
+
+    proj, _provider = _indexed_project(tmp_path)
+    code = cli.cmd_grep(
+        types.SimpleNamespace(
+            path=str(proj),
+            pattern="EmbeddingCache",
+            ignore_case=False,
+            limit=50,
+            offset=0,
+            max_matches=500,
+            max_scan_chunks=10000,
+            include_lines=False,
+            json=True,
+        )
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    payload = json.loads(captured.out.strip())
+    assert payload["event"] == "result"
+    assert payload["total_matches"] >= 1
+    assert payload["results"][0]["path"] == "cache.py"
+
+
+def test_cli_grep_human_output(tmp_path, capsys):
+    from engram_mcp import cli
+
+    proj, _provider = _indexed_project(tmp_path)
+    code = cli.cmd_grep(
+        types.SimpleNamespace(
+            path=str(proj),
+            pattern="EmbeddingCache",
+            ignore_case=False,
+            limit=50,
+            offset=0,
+            max_matches=500,
+            max_scan_chunks=10000,
+            include_lines=False,
+            json=False,
+        )
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "cache.py" in captured.out
+    assert "matches:" in captured.out
+
+
+def test_grep_index_not_registered_as_mcp_tool():
+    from engram_mcp import server
+
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert "grep_index" not in names
+    assert not hasattr(server, "do_grep_index")
 
 
 def test_rerank_candidate_k_env_default_and_validation(tmp_path, monkeypatch):
@@ -483,6 +682,58 @@ def test_rerank_candidate_k_env_default_and_validation(tmp_path, monkeypatch):
 
     explicit = server.do_search(str(proj), "add numbers", k=1, candidate_k=9)
     assert explicit["candidate_k"] == 9
+
+
+def test_search_k_over_budget_is_clamped_with_warning(tmp_path, monkeypatch):
+    """k above MAX_SEARCH_K is clamped (not rejected); k below 1 is still an
+    error -- see pipeline._validate_search_k / item 3 of the search-hot-path
+    audit. Confirmed non-vacuous against the pre-fix behavior by the test
+    edit history: this used to assert E_BAD_REQUEST for an over-budget k.
+    """
+    from engram_mcp import server
+    from engram_mcp.pipeline import MAX_SEARCH_K
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+
+    clamped = server.do_search(str(proj), "add numbers", k=MAX_SEARCH_K + 25)
+    assert "code" not in clamped
+    assert any(f"k clamped to server maximum {MAX_SEARCH_K}" in w for w in clamped["warnings"])
+
+    still_bad = server.do_search(str(proj), "add numbers", k=0)
+    assert still_bad["code"] == errors.E_BAD_REQUEST
+
+
+def test_search_response_char_budgets_are_clamped_with_warning(tmp_path, monkeypatch):
+    from engram_mcp import server
+    from engram_mcp.server import _MAX_RESULT_CHARS, _MAX_TOTAL_CHARS
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+
+    out = server.do_search(
+        str(proj),
+        "add numbers",
+        k=1,
+        content="full",
+        max_chars_per_result=_MAX_RESULT_CHARS + 5000,
+        max_total_chars=_MAX_TOTAL_CHARS + 5000,
+    )
+    assert "code" not in out
+    assert out["max_chars_per_result"] == _MAX_RESULT_CHARS
+    assert out["max_total_chars"] == _MAX_TOTAL_CHARS
+    assert any("max_chars_per_result clamped" in w for w in out["warnings"])
+    assert any("max_total_chars clamped" in w for w in out["warnings"])
+
+    # Sub-minimum is still a request error, not a clamp.
+    bad = server.do_search(str(proj), "add numbers", k=1, max_chars_per_result=0)
+    assert bad["code"] == errors.E_BAD_REQUEST
+
+    # get_chunk's max_chars follows the same rule.
+    found = server.do_find_definition(str(proj), "EmbeddingCache")
+    chunk_id = found["results"][0]["chunk_id"]
+    chunk = server.do_get_chunk(str(proj), chunk_id, max_chars=_MAX_RESULT_CHARS + 1)
+    assert any("max_chars clamped" in w for w in chunk.get("warnings") or [])
 
 
 def test_search_response_source_revision_branch_mismatch_top_level(tmp_path, monkeypatch):
@@ -736,8 +987,17 @@ def test_rerank_gated_to_vector_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("ENGRAM_RERANK_CANDIDATE_K", "bad")
     assert server._rerank_candidate_k_default() == 20
 
-    bad = server.do_search(str(proj), "add numbers", k=1, candidate_k=51)
-    assert bad["code"] == errors.E_BAD_REQUEST
+    # candidate_k above the server budget is clamped (not rejected): the
+    # search still runs, capped at MAX_RERANK_CANDIDATES, with a warning
+    # instead of an error (see pipeline.search_project / item 3 of the
+    # search-hot-path audit).
+    clamped = server.do_search(str(proj), "add numbers", k=1, candidate_k=51)
+    assert "code" not in clamped
+    assert clamped["candidate_k"] == 50
+    assert any("candidate_k clamped" in w for w in clamped["warnings"])
+
+    still_bad = server.do_search(str(proj), "add numbers", k=1, candidate_k=0)
+    assert still_bad["code"] == errors.E_BAD_REQUEST
 
 
 def test_fts_count_metadata_labels_capped_lower_bound(monkeypatch):
@@ -806,6 +1066,85 @@ def test_fts_count_metadata_labels_capped_lower_bound(monkeypatch):
     assert warnings == []
 
 
+def test_fts_count_scan_skipped_when_facets_not_requested(monkeypatch):
+    """Item 2 of the search-hot-path audit: in hybrid mode, the second FTS
+    metadata scan (up to ENGRAM_FTS_COUNT_MAX_SCAN rows) must not run unless
+    the caller actually requested facets. Proven directly (not just by
+    absence of a slowdown): fts_metadata() raises if called at all.
+    """
+
+    class MustNotScanStore:
+        def fts_metadata(self, query, columns, where=None):
+            raise AssertionError("fts_metadata must not be called when facets were not requested")
+
+    total, facets, warnings = _search_count_metadata(
+        types.SimpleNamespace(store=MustNotScanStore()),
+        "needle",
+        None,
+        "hybrid",
+        [],
+        [],  # no facets requested
+        None,
+    )
+    assert facets is None
+    assert warnings == []
+    assert total["fts_exact"]["available"] is False
+    assert total["fts_exact"]["count"] is None
+    assert "reason" in total["fts_exact"]
+
+    # Non-vacuity / no-regression: requesting facets in hybrid mode still
+    # triggers the scan and still returns the same exact numbers as before.
+    class ScanningStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fts_metadata(self, query, columns, where=None):
+            self.calls += 1
+            return (
+                [{"chunk_id": "a", "rel_path": "a.py", "language": "python", "chunk_role": "executable"}],
+                None,
+                {"capped": False, "cap": 50, "limit": 1, "table_rows": 1},
+            )
+
+    store = ScanningStore()
+    total2, facets2, _warnings2 = _search_count_metadata(
+        types.SimpleNamespace(store=store), "needle", None, "hybrid", [], ["language"], None,
+    )
+    assert store.calls == 1
+    assert total2["fts_exact"]["available"] is True
+    assert total2["fts_exact"]["count"] == 1
+    assert facets2["scope"] == "fts_exact"
+
+
+def test_search_code_skips_fts_scan_end_to_end_when_facets_omitted(tmp_path, monkeypatch):
+    """End-to-end version of the unit test above, through the real MCP
+    search_code path: a hybrid-routed query (an exact identifier) with no
+    facets requested must not touch the store's fts_metadata at all.
+    """
+    from engram_mcp import server
+    from engram_mcp.store.lancedb_store import LanceStore as _LS
+
+    proj, provider = _indexed_canonical_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+
+    def boom(self, query, columns, where=None):
+        raise AssertionError("fts_metadata must not run when facets were not requested")
+
+    monkeypatch.setattr(_LS, "fts_metadata", boom)
+
+    out = server.do_search(str(proj), "EmbeddingCache", k=2)  # identifier -> hybrid mode
+    assert out["mode_used"] == "hybrid"
+    assert out["total_matches"]["fts_exact"]["available"] is False
+
+    # Requesting facets flips the scan back on: it now reaches the monkeypatched
+    # fts_metadata, which raises -- do_search converts that into an error
+    # payload instead of silently succeeding, proving the scan path really is
+    # reached once facets are requested (i.e. the first assertion above was
+    # not vacuously true because this query type never scans).
+    with_facets = server.do_search(str(proj), "EmbeddingCache", k=2, facets=["language"])
+    assert "error" in with_facets
+
+
 def test_get_chunk_neighbors_are_opt_in(tmp_path):
     from engram_mcp import server
 
@@ -850,7 +1189,10 @@ def test_plan_index_reports_missing_unique_without_loading_model(tmp_path):
     assert after.missing_unique_chunks == 0
 
 
-def test_start_index_job_auto_routes_small_delta_to_cpu(tmp_path, monkeypatch):
+def test_start_index_job_returns_before_planning_and_routes_small_delta_to_cpu(tmp_path, monkeypatch):
+    """start_index_job must not walk/plan the project itself (that used to
+    block the index_project tool call on a filesystem walk); planning and
+    "auto" delta-cpu routing now happen inside the background job body."""
     from engram_mcp import server
 
     proj = tmp_path / "proj"
@@ -867,19 +1209,52 @@ def test_start_index_job_auto_routes_small_delta_to_cpu(tmp_path, monkeypatch):
         missing_unique_chunks=1,
     )
     submitted = []
+    plan_calls = []
 
     class Pool:
         def submit(self, fn, *args):
             submitted.append((fn, args))
 
-    monkeypatch.setattr(server, "_plan_index", lambda *a, **k: plan)
+    def fake_plan_index(*a, **k):
+        plan_calls.append((a, k))
+        return plan
+
+    monkeypatch.setattr(server, "_plan_index", fake_plan_index)
     monkeypatch.setattr(server, "_index_pool", Pool())
     monkeypatch.setenv("ENGRAM_DELTA_CPU_MAX", "5")
+
     out = server.start_index_job(str(proj), index_device="auto")
-    assert out["index_device"] == "cpu"
+
+    # The tool call itself never plans/walks: it only queued the job.
+    assert plan_calls == []
+    assert out["index_device"] == "auto"
     assert out["index_device_requested"] == "auto"
-    assert out["routing"] == "delta_cpu"
-    assert submitted[0][1][-1] == "cpu"
+    assert out["coalesced"] is False
+    assert "routing" not in out
+    assert "plan" not in out
+    assert submitted and submitted[0][0] is server._index_worker
+    job_id = submitted[0][1][0]
+    status_before = server.get_status(job_id)
+    assert status_before["stage"] in ("", "planning", "queued")
+
+    # Now run the queued worker body (as the real thread pool would) with the
+    # subprocess dispatch stubbed out so this stays a unit test of routing.
+    subprocess_calls = []
+    monkeypatch.setattr(
+        server, "_subprocess_index",
+        lambda job_id, project_path, full_rebuild, setting, git_max_commits, git_analytics:
+        subprocess_calls.append(setting),
+    )
+    fn, args = submitted[0]
+    fn(*args)
+
+    assert plan_calls  # planning happened inside the background job, not before
+    status = server.get_status(job_id)
+    assert status["index_device"] == "cpu"
+    assert status["index_device_requested"] == "auto"
+    assert status["routing"] == "delta_cpu"
+    assert status["plan"]["missing_unique_chunks"] == 1
+    assert subprocess_calls == ["cpu"]
 
 
 def test_relevance_bucket_thresholds():
@@ -1083,26 +1458,57 @@ def test_manifest_compat_uses_canonical_model_id():
         embedder_id=factory.CANONICAL_EMBEDDER_ID,
         dim=config.DEFAULT_EMBED_DIM,
         chunker_version=config.CHUNKER_VERSION,
+        chunk_id_scheme=config.CHUNK_ID_SCHEME,
+        schema_version=manifest.SCHEMA_VERSION,
     )
     assert _is_compatible(m, CanonicalProvider())
 
 
-def test_cpu_index_job_errors_are_structured(tmp_path, monkeypatch):
-    # The CPU (in-process) path structures a provider-construction failure.
+def test_cpu_index_job_subprocess_launch_failure_is_structured(tmp_path, monkeypatch):
+    """CPU indexing now always dispatches to the subprocess (see the CPU
+    indexing-blocks-search fix): a launch failure there must surface the same
+    structured error as the GPU/auto path, and _get_provider/_run_index must
+    never be consulted for a plain "cpu" request (ENGRAM_INPROCESS_CPU_MAX
+    defaults to 0/disabled)."""
     from engram_mcp import server
 
     job = server._registry.create(str(tmp_path))
 
-    def fail(_device):
-        raise errors.EngramError("missing extra", errors.E_EXTRA_MISSING, hint="install gpu")
+    def fail_popen(*_a, **_k):
+        raise OSError("no such executable")
 
-    monkeypatch.setattr(server, "_get_provider", fail)
+    monkeypatch.setattr(server.subprocess, "Popen", fail_popen)
     server._index_worker(job.job_id, str(tmp_path), False, "cpu")
     status = server.get_status(job.job_id)
     assert status["status"] == "error"
-    assert status["error"] == "missing extra"
-    assert status["code"] == errors.E_EXTRA_MISSING
-    assert status["hint"] == "install gpu"
+    assert "failed to launch index subprocess" in status["error"]
+    assert status["code"] == errors.E_MODEL_LOAD_FAILED
+
+
+def test_index_worker_planning_error_is_structured(tmp_path, monkeypatch):
+    """When the optional in-process CPU fast path is enabled, _index_worker
+    plans before routing/dispatching; a planning failure must end the job in
+    a structured error without ever spawning a subprocess."""
+    from engram_mcp import server
+
+    monkeypatch.setenv("ENGRAM_INPROCESS_CPU_MAX", "10")
+    job = server._registry.create(str(tmp_path))
+    popen_calls = []
+    monkeypatch.setattr(
+        server.subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)) or None
+    )
+
+    def fail_plan(*_a, **_k):
+        raise errors.EngramError("bad plan", errors.E_BAD_REQUEST, hint="fix the project")
+
+    monkeypatch.setattr(server, "_plan_index", fail_plan)
+    server._index_worker(job.job_id, str(tmp_path), False, "cpu")
+    status = server.get_status(job.job_id)
+    assert status["status"] == "error"
+    assert status["error"] == "bad plan"
+    assert status["code"] == errors.E_BAD_REQUEST
+    assert status["hint"] == "fix the project"
+    assert popen_calls == []
 
 
 class _StreamingStdout:
@@ -1196,3 +1602,400 @@ def test_subprocess_progress_updates_registry_before_result(tmp_path, monkeypatc
     assert not thread.is_alive()
     final = server.get_status(job.job_id)
     assert final["status"] == "done"
+
+
+def test_index_job_never_constructs_cached_query_provider(tmp_path, monkeypatch):
+    """No index path may embed inside the server process: with the optional
+    in-process fast path disabled (the default, ENGRAM_INPROCESS_CPU_MAX=0),
+    a "cpu" index job must never construct the cached FastEmbed singleton
+    shared with search (embeddings/factory._fastembed_granite_cpu) -- only
+    the subprocess it spawns is allowed to embed."""
+    from engram_mcp import server
+    from engram_mcp.embeddings import factory
+
+    def fail_if_called():
+        raise AssertionError(
+            "an index job constructed the cached query provider -- it would "
+            "share its inference lock with concurrent search"
+        )
+
+    monkeypatch.setattr(factory, "_fastembed_granite_cpu", fail_if_called)
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+
+    success_line = (
+        '{"event": "result", "version": 1, "ok": true, "mode": "full", "files": 1, '
+        '"chunks": 1, "embedded_unique": 1, "reused_unique": 0, '
+        '"embedder_id": "fastembed:granite", "backend_id": "fastembed:granite", '
+        '"device": "cpu", "seconds": 0.01}\n'
+    )
+    popen_calls = []
+
+    def fake_popen(cmd, **_k):
+        popen_calls.append(cmd)
+        return _FakePopen([success_line], 0)
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    started = server.start_index_job(str(proj), index_device="cpu")
+    job_id = started["job_id"]
+    status = {}
+    for _ in range(200):
+        status = server.get_status(job_id)
+        if status["status"] in ("done", "error"):
+            break
+        time.sleep(0.01)
+    assert status["status"] == "done", status
+    assert popen_calls, "the index job must dispatch to the subprocess"
+
+
+def test_inprocess_cpu_fast_path_never_reuses_cached_query_provider(tmp_path, monkeypatch):
+    """The optional ENGRAM_INPROCESS_CPU_MAX fast path (off by default) must
+    build a fresh, uncached provider -- never the process-wide singleton
+    shared with search -- so turning it on can never reintroduce the
+    query-lock contention defect."""
+    from engram_mcp import server
+    from engram_mcp.embeddings import factory
+
+    def fail_if_called():
+        raise AssertionError("in-process fast path must not touch the cached query provider")
+
+    monkeypatch.setattr(factory, "_fastembed_granite_cpu", fail_if_called)
+
+    built = []
+
+    class _FakeUncachedProvider:
+        # Deliberately not CANONICAL_EMBEDDER_ID: the post-index query-model
+        # warmup (_schedule_query_model_warmup) legitimately touches the real
+        # cached provider for the *canonical* id, which is unrelated to what
+        # this test checks (that the index job itself never does). A
+        # non-canonical id makes warmup a fast no-op (unsupported embedder)
+        # instead of racing a background thread against this test's mock.
+        model_id = "test:fake-uncached"
+        backend_id = model_id
+        dim = 4
+        device = "cpu"
+
+        def embed_passages(self, texts):
+            return [[0.0, 0.0, 0.0, 1.0] for _ in texts]
+
+        def embed_queries(self, texts):
+            return [[0.0, 0.0, 0.0, 1.0] for _ in texts]
+
+        def release_unused_cache(self):
+            pass
+
+    def fake_make_uncached():
+        provider = _FakeUncachedProvider()
+        built.append(provider)
+        return provider
+
+    monkeypatch.setattr(factory, "make_uncached_cpu_provider", fake_make_uncached)
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+
+    job = server._registry.create(str(proj.resolve()))
+    server._inprocess_cpu_index(job.job_id, str(proj.resolve()), True)
+
+    status = server.get_status(job.job_id)
+    assert status["status"] == "done", status
+    assert len(built) == 1  # exactly one fresh, uncached provider was constructed
+
+
+def test_index_project_tool_returns_before_planning_completes(tmp_path, monkeypatch):
+    """The MCP index_project tool call must hand off to the background job
+    and return immediately, not block on plan_index's filesystem walk (the
+    second half of the CPU-indexing-blocks-search fix)."""
+    from engram_mcp import server
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+
+    planning_may_return = threading.Event()
+
+    def blocking_plan_index(*_a, **_k):
+        assert planning_may_return.wait(timeout=5)
+        return types.SimpleNamespace(
+            mode="full", files=1, chunks=1, added=1, changed=0, deleted=0,
+            unchanged=0, missing_unique_chunks=1,
+        )
+
+    monkeypatch.setattr(server, "_plan_index", blocking_plan_index)
+    monkeypatch.setattr(server, "_subprocess_index", lambda *_a, **_k: None)
+
+    async def _call() -> dict:
+        return await server.index_project(str(proj), index_device="auto")
+
+    t0 = time.time()
+    started = asyncio.run(_call())
+    elapsed = time.time() - t0
+
+    assert "job_id" in started
+    assert elapsed < 1.0  # plan_index blocks for up to 5s; the tool call must not wait on it
+
+    planning_may_return.set()
+    job_id = started["job_id"]
+    for _ in range(200):
+        status = server.get_status(job_id)
+        if status["status"] in ("done", "error", "cancelled"):
+            break
+        time.sleep(0.01)
+
+
+def test_second_index_project_call_coalesces_onto_running_job(tmp_path, monkeypatch):
+    """Two concurrent index_project calls for the same resolved project path
+    must not both run: the second returns the first job's id, marked
+    coalesced, instead of starting a duplicate job."""
+    from engram_mcp import server
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+
+    submissions = []
+
+    class Pool:
+        def submit(self, fn, *args):
+            # Deliberately never run the job body, so it stays "queued" and
+            # the second call below observes it as still active.
+            submissions.append((fn, args))
+
+    monkeypatch.setattr(server, "_index_pool", Pool())
+
+    first = server.start_index_job(str(proj), index_device="cpu")
+    second = server.start_index_job(str(proj), index_device="cpu")
+
+    assert first["coalesced"] is False
+    assert second["coalesced"] is True
+    assert second["job_id"] == first["job_id"]
+    assert len(submissions) == 1  # only one job was ever actually submitted
+
+
+def test_cancel_index_moves_job_to_cancelled_and_leaves_previous_index_searchable(
+    tmp_path, monkeypatch
+):
+    """cancel_index must: request a kill of the tracked subprocess, end the
+    job in a terminal "cancelled" status (never "error"), and never disturb
+    whatever index was already published before the cancelled job started --
+    the atomic manifest/generation swap must simply never happen."""
+    from engram_mcp import server
+
+    proj, provider = _indexed_project(tmp_path)
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _m: provider)
+    before = server.do_search(str(proj), "add numbers", k=1)
+    assert before["count"] == 1
+
+    reached_embedding = threading.Event()
+    allow_unblock = threading.Event()
+
+    class BlockingStdout:
+        def __iter__(self):
+            yield (
+                '{"event": "progress", "version": 1, "seq": 1, "stage": "embedding", '
+                '"unit": "embeddings", "done": 1, "total": 99, "chunks": 99, '
+                '"embedded": 1, "reused": 0}\n'
+            )
+            reached_embedding.set()
+            allow_unblock.wait(timeout=5)
+            return  # simulates the pipe closing when the child is killed
+
+    class BlockingPopen:
+        stdout = BlockingStdout()
+        stderr = io.StringIO("")
+        returncode = 1  # a killed child's exit code
+
+        def wait(self):
+            return self.returncode
+
+    killed = []
+
+    def fake_kill_tree(proc):
+        killed.append(proc)
+        allow_unblock.set()
+
+    monkeypatch.setattr(server.gitmeta, "_kill_tree", fake_kill_tree)
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: BlockingPopen())
+
+    started = server.start_index_job(str(proj), index_device="cpu")
+    job_id = started["job_id"]
+    assert reached_embedding.wait(timeout=2)
+
+    cancel_result = server.do_cancel_index(job_id)
+
+    assert killed  # the tracked subprocess was targeted for a real kill
+    assert cancel_result["status"] == "cancelled"
+    assert cancel_result["already_terminal"] is False
+
+    final = server.get_status(job_id)
+    assert final["status"] == "cancelled"
+    assert final["error"] is None
+
+    # The previously published index is untouched and still searchable.
+    after = server.do_search(str(proj), "add numbers", k=1)
+    assert after["count"] == 1
+    assert after["results"][0]["chunk_id"] == before["results"][0]["chunk_id"]
+
+
+def test_cancel_index_already_terminal_job_is_a_noop(tmp_path):
+    from engram_mcp import server
+
+    job = server._registry.create(str(tmp_path))
+    server._registry.update(job.job_id, status="done", stage="done", finished_at=time.time())
+
+    result = server.do_cancel_index(job.job_id)
+    assert result["status"] == "done"
+    assert result["already_terminal"] is True
+
+
+def test_cancel_index_unknown_job_id_is_structured_error():
+    from engram_mcp import server
+
+    result = server.do_cancel_index("no-such-job")
+    assert result["code"] == errors.E_BAD_REQUEST
+
+
+def test_cancel_index_kills_real_process_tree(tmp_path, monkeypatch):
+    """End-to-end with a real child process and the real (not mocked)
+    gitmeta._kill_tree: cancel_index must actually terminate the OS process,
+    and _subprocess_index's own loop -- observing the pipe close -- must end
+    the job in "cancelled", not "error"."""
+    from engram_mcp import server
+
+    real_popen = subprocess.Popen
+
+    def spawn_sleeper(cmd, **kwargs):
+        # Swap only the `engram_mcp.cli index` invocation for a plain
+        # sleeping child (so this test needs neither a model nor a real
+        # project index, while still exercising a genuine OS process/pipe/
+        # kill). subprocess.Popen is a single process-wide name -- patching
+        # it also redirects gitmeta._kill_tree's own `subprocess.run(taskkill
+        # ...)` call (subprocess.run constructs a Popen internally), so
+        # anything that isn't the index invocation must fall through to the
+        # real Popen or the kill itself would be swallowed by this fake.
+        if any("engram_mcp.cli" in str(part) for part in cmd):
+            return real_popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr(server.subprocess, "Popen", spawn_sleeper)
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    job = server._registry.create(str(proj.resolve()))
+    thread = threading.Thread(
+        target=server._subprocess_index,
+        args=(job.job_id, str(proj.resolve()), False, "cpu"),
+    )
+    thread.start()
+    try:
+        proc = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with server._job_processes_lock:
+                proc = server._job_processes.get(job.job_id)
+            if proc is not None:
+                break
+            time.sleep(0.02)
+        assert proc is not None, "the subprocess should have registered by now"
+        assert proc.poll() is None  # really running
+
+        result = server.do_cancel_index(job.job_id)
+
+        assert result["status"] == "cancelled"
+        assert proc.poll() is not None  # the real OS process is actually gone
+    finally:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def test_chunk_id_stable_across_full_and_single_file_reindex_batches(tmp_path):
+    """chunk_id must be a pure function of the chunk, not the batch ordinal.
+
+    Regression for the bug where `_rows()` keyed chunk_id on the global
+    enumeration index of the current indexing batch: b.py's chunk got a
+    different id in a full build that also included a.py (nonzero global
+    index) than when b.py alone was re-embedded via `reindex_file` (index 0
+    in that isolated batch), even though b.py's own content never changed.
+    """
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a.py").write_text("def helper_a():\n    return 1\n", encoding="utf-8")
+    (proj / "b.py").write_text("def helper_b():\n    return 2\n", encoding="utf-8")
+    provider = FakeProvider()
+    index_project(proj, provider, full_rebuild=True)
+
+    qi = load_query_index(proj)
+    before = sorted(r["chunk_id"] for r in qi.store.metadata_rows(where="rel_path = 'b.py'"))
+    assert before  # b.py produced at least one chunk
+
+    result = reindex_file(proj, provider, "b.py")
+    assert result["action"] == "reindexed"
+
+    qi_after = load_query_index(proj)
+    after = sorted(r["chunk_id"] for r in qi_after.store.metadata_rows(where="rel_path = 'b.py'"))
+    assert after == before
+
+
+def test_search_hit_chunk_id_hydrates_via_get_chunk_after_unrelated_reindex(tmp_path, monkeypatch):
+    """A chunk_id handed out by search_code must stay valid after an
+    unrelated file is added and the project is reindexed -- otherwise a
+    cached citation rots the moment anything else in the project changes.
+    """
+    from engram_mcp import server
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "target.py").write_text(
+        "def target_marker():\n    return 'target marker'\n", encoding="utf-8"
+    )
+    provider = FakeProvider()
+    monkeypatch.setattr(server, "_provider_for_query_model", lambda _model_id: provider)
+    index_project(proj, provider, full_rebuild=True)
+
+    hit = server.do_search(str(proj), "target marker", k=1, mode="vector")["results"][0]
+    chunk_id = hit["chunk_id"]
+    fetched = server.do_get_chunk(str(proj), chunk_id)
+    assert "error" not in fetched
+
+    # An unrelated file that sorts before target.py joins the project and the
+    # index is rebuilt; target.py's own chunk never changed.
+    (proj / "aaa_new.py").write_text(
+        "def new_marker():\n    return 'new marker'\n", encoding="utf-8"
+    )
+    index_project(proj, provider, full_rebuild=True)
+
+    rehydrated = server.do_get_chunk(str(proj), chunk_id)
+    assert "error" not in rehydrated
+    assert rehydrated["content"] == fetched["content"]
+
+
+def test_corrupt_files_manifest_forces_full_rebuild_not_silent_incremental(tmp_path):
+    """A corrupt files.json must not be treated as "nothing was ever
+    indexed": that silently drops deletion detection and leaves rows for
+    files no longer on disk searchable. The index run must instead force a
+    full rebuild, which naturally re-derives the correct file set.
+    """
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a.py").write_text("def keep():\n    return 1\n", encoding="utf-8")
+    (proj / "deleted.py").write_text("def gone():\n    return 2\n", encoding="utf-8")
+    provider = FakeProvider()
+    index_project(proj, provider, full_rebuild=True)
+
+    pdir = paths.project_dir(proj, create=False)
+    (pdir / "files.json").write_text("{not json", encoding="utf-8")
+    (proj / "deleted.py").unlink()
+
+    stats = index_project(proj, provider)  # incremental requested; must not trust files.json
+    assert stats.mode == "full"
+
+    qi = load_query_index(proj)
+    assert qi.store.metadata_rows(where="rel_path = 'deleted.py'") == []
+    assert len(qi.store.metadata_rows(where="rel_path = 'a.py'")) == 1

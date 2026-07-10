@@ -30,8 +30,23 @@ def _clear_loaded() -> None:
 
 
 def test_single_supported_embedder_constants():
+    from engram_mcp import config
+    from engram_mcp.embeddings import hf_pin
+
     assert factory.GRANITE_MODEL == "ibm-granite/granite-embedding-97m-multilingual-r2"
-    assert factory.CANONICAL_EMBEDDER_ID == f"fastembed:{factory.GRANITE_MODEL}"
+    assert factory.CANONICAL_EMBEDDER_ID == hf_pin.canonical_model_id(
+        backend="fastembed",
+        repo_id=factory.GRANITE_MODEL,
+        revision=config.EMBED_MODEL_REVISION,
+        dim=config.DEFAULT_EMBED_DIM,
+        pooling="cls",
+    )
+    # The revision pin is what makes an upstream weight/tokenizer swap under
+    # the same repo name detectable -- it must actually be embedded in the id,
+    # not just accepted as a parameter that happens to compute the same
+    # string without it.
+    assert config.EMBED_MODEL_REVISION in factory.CANONICAL_EMBEDDER_ID
+    assert factory.CANONICAL_EMBEDDER_ID.startswith(f"fastembed:{factory.GRANITE_MODEL}@")
     assert factory.SUPPORTED_INDEX_DEVICES == ("auto", "cpu", "cuda")
 
 
@@ -198,9 +213,10 @@ def test_canonical_st_provider_identity_and_loaded_tracking(monkeypatch):
             return [[1.0] * 384 for _ in range(self.n)]
 
     class _FakeSentenceTransformer:
-        def __init__(self, model_name, device, trust_remote_code, truncate_dim):
+        def __init__(self, model_name, device, truncate_dim, revision=None):
             self.model_name = model_name
             self.device = device
+            self.revision = revision
 
         def encode(self, texts, **_kwargs):
             return _FakeVecs(len(texts))
@@ -231,13 +247,9 @@ def test_canonical_st_provider_identity_and_loaded_tracking(monkeypatch):
     assert not factory.is_model_loaded(p.model_id)
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec("sentence_transformers") is not None,
-    reason="gpu extra installed; loading the reranker would be heavy",
-)
-def test_sentence_transformers_backend_without_extra_raises_helpful_error():
-    # The opt-in torch backend still needs the 'gpu' extra; the default
-    # fastembed ONNX backend does not (covered separately).
+def test_unsupported_reranker_backend_raises_helpful_error():
+    # The reranker has exactly one backend (fastembed); any other requested
+    # backend name is a clear, immediate error rather than a silent fallback.
     from engram_mcp.rerankers import get_reranker
 
     get_reranker.cache_clear()
@@ -267,6 +279,13 @@ def test_fastembed_onnx_reranker_is_default_and_torch_free(monkeypatch):
     mod.TextCrossEncoder = _FakeTCE
     monkeypatch.setitem(sys.modules, "fastembed.rerank.cross_encoder", mod)
     monkeypatch.setenv("ENGRAM_RERANKER_BACKEND", "sentence_transformers")
+    # The default reranker's revision pin resolves a local snapshot dir (see
+    # rerankers.py / embeddings/hf_pin.py) -- fake it too, so this stays a
+    # network-free unit test instead of quietly depending on Hugging Face
+    # reachability just to fetch a few KB of config files.
+    from engram_mcp.embeddings import hf_pin
+
+    monkeypatch.setattr(hf_pin, "pinned_snapshot_dir", lambda *a, **k: "/fake/snapshot/dir")
 
     rerankers.get_reranker.cache_clear()
     r = rerankers.get_reranker()  # default backend ignores ENGRAM_RERANKER_BACKEND

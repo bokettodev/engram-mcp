@@ -1,10 +1,132 @@
 from __future__ import annotations
 
+import os
 import shutil
 
 import pytest
 
-from engram_mcp import gitanalytics, gitmeta
+from engram_mcp import gitanalytics, gitmeta, regexsafe
+
+
+def _crash_regex_worker(*_args) -> None:
+    os._exit(1)
+
+
+class _FakeProc:
+    """A stand-in multiprocessing.Process whose terminate() always raises.
+
+    start()/is_alive() never actually run the target, so the caller's
+    recv_conn.poll(timeout) always times out and the cleanup finally-block
+    runs deterministically without spawning a real subprocess.
+    """
+
+    def __init__(self) -> None:
+        self.terminate_called = False
+        self.kill_called = False
+        self.join_calls = 0
+        self.closed = False
+
+    def start(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return True
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+        raise RuntimeError("simulated terminate() failure")
+
+    def kill(self) -> None:
+        self.kill_called = True
+
+    def join(self, timeout=None) -> None:
+        self.join_calls += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeConn:
+    """A stand-in Connection that never delivers data, so poll(timeout) always
+    times out deterministically (a real OS pipe whose write end is closed
+    without ever having a live child on the other end behaves inconsistently
+    across platforms — e.g. WinError 109 instead of a clean timeout).
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def poll(self, timeout=None) -> bool:
+        return False
+
+    def recv(self):
+        raise EOFError("no data sent")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeCtx:
+    def __init__(self, proc: _FakeProc) -> None:
+        self._proc = proc
+        self.recv_conn = None
+        self.send_conn = None
+
+    def Pipe(self, duplex: bool = False):
+        self.recv_conn, self.send_conn = _FakeConn(), _FakeConn()
+        return self.recv_conn, self.send_conn
+
+    def Process(self, target=None, args=()):
+        return self._proc
+
+
+class _BoomCtx:
+    """A context whose Pipe() raises, simulating OS-level allocation failure."""
+
+    def Pipe(self, duplex: bool = False):
+        raise OSError("simulated pipe allocation failure")
+
+
+def test_regexsafe_run_worker_terminate_failure_still_runs_kill_and_closes_both_ends(
+    monkeypatch,
+) -> None:
+    fake_proc = _FakeProc()
+    fake_ctx = _FakeCtx(fake_proc)
+    monkeypatch.setattr(regexsafe.mp, "get_context", lambda name: fake_ctx)
+
+    ok, payload, reason = regexsafe._run_worker(
+        regexsafe._search_many_worker,
+        pattern="foo",
+        flags=0,
+        texts=["foo bar"],
+        timeout_sec=0.05,
+    )
+
+    assert ok is False
+    assert payload is None
+    assert "timed out" in reason
+    assert fake_proc.terminate_called
+    assert fake_proc.kill_called
+    assert fake_proc.join_calls >= 2
+    assert fake_proc.closed
+    assert fake_ctx.recv_conn is not None and fake_ctx.recv_conn.closed
+    assert fake_ctx.send_conn is not None and fake_ctx.send_conn.closed
+
+
+def test_regexsafe_run_worker_pipe_allocation_oserror_degrades(monkeypatch) -> None:
+    monkeypatch.setattr(regexsafe.mp, "get_context", lambda name: _BoomCtx())
+
+    ok, payload, reason = regexsafe._run_worker(
+        regexsafe._search_many_worker,
+        pattern="foo",
+        flags=0,
+        texts=["foo bar"],
+        timeout_sec=1.0,
+    )
+
+    assert ok is False
+    assert payload is None
+    assert reason  # OSError message surfaced, not raised
 
 
 def _commit(commit: str, paths: list[str], *, ts: int = 1000, author: str = "A", message: str = "") -> dict:
@@ -57,6 +179,78 @@ def test_group_by_commit_vs_ticket_keeps_unmatched_commit() -> None:
     assert len(by_commit) == 3
     assert len(by_ticket) == 2
     assert {tuple(change["files"]) for change in by_ticket} == {("a.py", "b.py"), ("c.py",)}
+
+
+def test_invalid_ticket_and_fix_regex_fall_back_to_defaults() -> None:
+    commits = [
+        _commit("c1", ["a.py"], message="ABC-1 add a"),
+        _commit("c2", ["a.py"], message="fix bug"),
+    ]
+
+    grouped = gitanalytics.group_changes_result(
+        commits,
+        group_by="ticket",
+        ticket_regex="[",
+    )
+    churn = gitanalytics.churn(grouped["change_sets"], fix_regex="[")
+
+    assert grouped["regex_warnings"]
+    assert len(grouped["change_sets"]) == 2
+    assert churn["a.py"]["fix_density"] == 0.5
+
+
+def test_pathological_ticket_regex_degrades_without_hanging(monkeypatch) -> None:
+    monkeypatch.setenv("ENGRAM_USER_REGEX_TIMEOUT_SEC", "0.05")
+    commits = [_commit("c1", ["a.py"], message="ABC-1 " + ("b" * 128) + "!")]
+
+    grouped = gitanalytics.group_changes_result(
+        commits,
+        group_by="ticket",
+        ticket_regex=r"(b+)+$",
+    )
+
+    assert grouped["regex_warnings"]
+    assert grouped["change_sets"][0]["id"] == "ABC-1"
+
+
+def test_pathological_fix_regex_degrades_without_hanging(monkeypatch) -> None:
+    monkeypatch.setenv("ENGRAM_USER_REGEX_TIMEOUT_SEC", "0.05")
+    changes = [
+        {
+            "id": "c1",
+            "ts": 1000,
+            "message": "fix bug " + ("b" * 128) + "!",
+            "messages": ["fix bug " + ("b" * 128) + "!"],
+            "files": ["a.py"],
+            "paths": [{"path": "a.py", "status": "M", "added": 1, "deleted": 1}],
+        }
+    ]
+
+    churn = gitanalytics.churn_result(changes, now_ts=1000, fix_regex=r"(b+)+$")
+
+    assert churn["regex_warnings"]
+    assert churn["fix_regex"] == gitanalytics.DEFAULT_FIX_REGEX
+    assert churn["files"]["a.py"]["fix_density"] == 1.0
+
+
+def test_fix_regex_worker_crash_degrades_with_warning(monkeypatch) -> None:
+    monkeypatch.setattr("engram_mcp.regexsafe._search_many_worker", _crash_regex_worker)
+    changes = [
+        {
+            "id": "c1",
+            "ts": 1000,
+            "message": "fix bug",
+            "messages": ["fix bug"],
+            "files": ["a.py"],
+            "paths": [{"path": "a.py", "status": "M", "added": 1, "deleted": 1}],
+        }
+    ]
+
+    churn = gitanalytics.churn_result(changes, now_ts=1000, fix_regex=r"(?i)\bfix\b")
+
+    assert churn["regex_warnings"]
+    assert churn["fix_regex"] == gitanalytics.DEFAULT_FIX_REGEX
+    assert churn["files"]["a.py"]["fix_density"] == 1.0
 
 
 def test_noise_filter_and_merge_file_stats_are_skipped() -> None:
@@ -179,7 +373,7 @@ def test_commit_log_synthetic_repo_parses_stats_merge_and_rename(tmp_path) -> No
     except RuntimeError as exc:
         pytest.skip(str(exc))
 
-    commits = gitmeta.commit_log(repo, max_commits=20)
+    commits = gitmeta.commit_log_with_status(repo, max_commits=20)["commits"]
 
     assert commits
     assert any(len(commit["parents"]) > 1 for commit in commits)
@@ -222,7 +416,7 @@ def test_szz_synthetic_repo_attributes_fix_to_introducing_commit(tmp_path) -> No
     except RuntimeError as exc:
         pytest.skip(str(exc))
 
-    commits = gitmeta.commit_log(repo, max_commits=None)
+    commits = gitmeta.commit_log_with_status(repo, max_commits=None)["commits"]
     szz = gitmeta.szz_attributions_with_status(repo, commits)
 
     assert szz["status"] in {"ready", "partial"}
@@ -268,7 +462,7 @@ def test_parallel_szz_matches_sequential_on_synthetic_repo(tmp_path, monkeypatch
     except RuntimeError as exc:
         pytest.skip(str(exc))
 
-    commits = gitmeta.commit_log(repo, max_commits=None)
+    commits = gitmeta.commit_log_with_status(repo, max_commits=None)["commits"]
     monkeypatch.setenv("ENGRAM_SZZ_WORKERS", "1")
     sequential = gitmeta.szz_attributions_with_status(repo, commits)
     monkeypatch.setenv("ENGRAM_SZZ_WORKERS", "4")
@@ -381,3 +575,149 @@ def test_szz_incremental_cache_blames_only_new_fix_commits(tmp_path, monkeypatch
         "b" * 40,
         "d" * 40,
     }
+
+
+def test_blame_parser_accepts_sha256_commit_ids(tmp_path, monkeypatch) -> None:
+    intro = "a" * 64
+    excluded = "b" * 64
+    boundary = "0" * 64
+
+    def fake_git(*_args, **_kwargs):
+        return "\n".join(
+            [
+                f"{intro} 1 1 1",
+                "\told line",
+                f"{excluded} 1 1 1",
+                "\texcluded line",
+                f"{boundary} 1 1 1",
+                "\tboundary line",
+            ]
+        )
+
+    monkeypatch.setattr(gitmeta, "_git", fake_git)
+
+    blamed = gitmeta._blame_commits_for_range(
+        tmp_path,
+        revision="HEAD^",
+        path="bug.py",
+        start_line=1,
+        line_count=3,
+        excluded_commit=excluded,
+    )
+
+    assert blamed == {intro: 1}
+
+
+def test_shared_history_uses_explicit_index_git_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ENGRAM_GIT_INDEX_TIMEOUT", "123")
+    seen: dict[str, float | None] = {}
+
+    def fake_log(*_args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout_sec")
+        return {"status": "ready", "warning": "", "commits": []}
+
+    monkeypatch.setattr(gitmeta, "commit_log_with_status", fake_log)
+    out = gitmeta.history_for_shared_store(
+        tmp_path,
+        logical_project_id="logical",
+        fingerprint={
+            "status": "ready",
+            "common_dir": str(tmp_path),
+            "hash": "fp",
+            "refs": 1,
+            "max_commit_ts": 1,
+            "tip_commit": "c",
+        },
+        timeout_sec=gitmeta.git_index_timeout_seconds(),
+    )
+
+    assert out["status"] == "ready"
+    assert seen["timeout"] == 123.0
+
+
+def test_szz_fix_regex_degrades_on_real_message_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ENGRAM_USER_REGEX_TIMEOUT_SEC", "0.05")
+    monkeypatch.setenv("ENGRAM_SZZ_WORKERS", "1")
+    blamed: list[str] = []
+
+    def fake_blame(_root, commit):
+        blamed.append(commit["commit"])
+        return {
+            "fix_commit": commit["commit"],
+            "status": "ready",
+            "attributions": [],
+            "blamed_lines": 0,
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(gitmeta, "_szz_attributions_for_fix_commit", fake_blame)
+    commits = [
+        _commit(
+            "a" * 40,
+            ["bug.py"],
+            message="fix bug " + ("b" * 128) + "!",
+        )
+    ]
+
+    szz = gitmeta.szz_attributions_with_status(tmp_path, commits, fix_regex=r"(b+)+$")
+
+    assert szz["fix_regex"] == gitmeta.DEFAULT_FIX_REGEX
+    assert szz["warnings"]
+    assert szz["fix_commits"] == 1
+    assert blamed == ["a" * 40]
+
+
+def test_snapshot_uses_two_git_spawns_for_normal_repo(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(_root, *args, **_kwargs):
+        calls.append(tuple(args))
+        if args[:2] == ("rev-parse", "--path-format=absolute"):
+            return "\n".join([str(tmp_path), str(tmp_path / ".git"), str(tmp_path / ".git")])
+        if args[:2] == ("status", "--porcelain=v2"):
+            return "\n".join(
+                [
+                    "# branch.oid " + ("a" * 40),
+                    "# branch.head main",
+                    "1 .M N... 100644 100644 100644 x x a.py",
+                ]
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(gitmeta, "_git", fake_git)
+
+    snap = gitmeta.snapshot(tmp_path)
+
+    assert len(calls) == 2
+    assert snap["indexed_ref"] == "main"
+    assert snap["indexed_commit"] == "a" * 40
+    assert snap["indexed_dirty"] is True
+
+
+def test_snapshot_falls_back_when_git_lacks_path_format(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(_root, *args, **_kwargs):
+        calls.append(tuple(args))
+        if args[:2] == ("rev-parse", "--path-format=absolute"):
+            return None
+        if args[:2] == ("rev-parse", "--show-toplevel"):
+            return "\n".join([".", ".git", ".git"])
+        if args[:2] == ("status", "--porcelain=v2"):
+            return "\n".join(
+                [
+                    "# branch.oid " + ("b" * 40),
+                    "# branch.head main",
+                ]
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(gitmeta, "_git", fake_git)
+
+    snap = gitmeta.snapshot(tmp_path)
+
+    assert calls[0][:2] == ("rev-parse", "--path-format=absolute")
+    assert calls[1][:2] == ("rev-parse", "--show-toplevel")
+    assert snap["git_worktree_root"] == tmp_path.resolve().as_posix()
+    assert snap["indexed_ref"] == "main"
+    assert snap["indexed_commit"] == "b" * 40
