@@ -14,6 +14,19 @@ from engram_mcp.indexing.ignore import IgnoreMatcher
 from engram_mcp.indexing.walker import walk
 
 
+def _configure_standard_streams() -> None:
+    """Keep Unicode documentation output reliable on Windows consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError, ValueError):
+            # Test captures and embedded hosts may expose immutable streams.
+            pass
+
+
 def _read_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
@@ -466,6 +479,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_standard_streams()
     p = argparse.ArgumentParser(
         prog="engram", description="Semantic code index."
     )

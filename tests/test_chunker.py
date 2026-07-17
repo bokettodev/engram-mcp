@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from engram_mcp import config
 from engram_mcp.indexing.chunker import chunk_file
+from engram_mcp.indexing.languages import detect_language
 
 
 def _symbols(chunks):
@@ -246,6 +247,63 @@ def test_plain_text_packs_by_paragraph():
     assert "first para" in chunks[0].text and "third para" in chunks[0].text
 
 
+def test_rst_extension_has_structured_language():
+    assert detect_language(".rst") == "rst"
+
+
+def test_rst_sections_split_with_first_seen_hierarchy():
+    src = (
+        ".. _guide:\n\n"
+        "Guide\n=====\n\nintro\n\n"
+        "Install\n-------\n\ninstall text\n\n"
+        "Requirements\n~~~~~~~~~~~~\n\nrequirements text\n\n"
+        "Usage\n-----\n\nusage text\n"
+    )
+    chunks = chunk_file("guide.rst", "rst", src)
+    syms = _symbols(chunks)
+    assert "Guide" in syms
+    assert "Guide > Install" in syms
+    assert "Guide > Install > Requirements" in syms
+    assert "Guide > Usage" in syms
+    guide = next(c for c in chunks if c.symbol == "Guide")
+    assert guide.start_line == 1
+    assert ".. _guide:" in guide.text
+
+
+def test_rst_overline_heading_and_directive_prefix():
+    src = (
+        "########\n"
+        "Handbook\n"
+        "########\n\n"
+        "body\n\n"
+        ".. rst-class:: details\n\n"
+        "Details\n"
+        "=======\n\n"
+        "detail text\n"
+    )
+    chunks = chunk_file("handbook.rst", "rst", src)
+    syms = _symbols(chunks)
+    assert "Handbook" in syms
+    assert "Handbook > Details" in syms
+    details = next(c for c in chunks if c.symbol == "Handbook > Details")
+    assert details.text.startswith(".. rst-class:: details")
+
+
+def test_rst_transition_and_indented_literal_are_not_headings():
+    src = (
+        "Title\n=====\n\n"
+        "first paragraph\n\n"
+        "----\n\n"
+        "Example::\n\n"
+        "    Fake heading\n"
+        "    ------------\n\n"
+        "last paragraph\n"
+    )
+    chunks = chunk_file("safe.rst", "rst", src)
+    assert _symbols(chunks) == {"Title"}
+    assert "Fake heading" in chunks[0].text
+
+
 # --- module-level constants / assignments --------------------------------
 
 
@@ -346,5 +404,4 @@ def test_prose_oversized_section_splits_into_multiple_chunks():
     big = [c for c in chunks if (c.symbol or "").startswith("Big")]
     assert len(big) >= 2
     assert all(c.token_estimate <= config.PROSE_CHUNK_MAX_TOKENS + 5 for c in big)
-
 

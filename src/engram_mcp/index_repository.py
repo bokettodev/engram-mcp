@@ -1233,7 +1233,12 @@ def _incremental(
         )
 
     store = LanceStore(pdir / "lancedb", provider.dim, table=m.active_table)
-    row_work = len(rows) + len(touched) + len(deleted_paths)
+    # New files have no rows in the active table yet. Including them in the
+    # delete filter is redundant and can produce an enormous SQL expression
+    # when a large generated corpus is added in one incremental update.
+    replaced_paths = [rec.rel_path for rec, _, _ in touched if rec.rel_path in old_files]
+    paths_to_delete = replaced_paths + deleted_paths
+    row_work = len(rows) + len(paths_to_delete)
     _emit_progress(
         progress,
         "writing_table",
@@ -1252,7 +1257,7 @@ def _incremental(
             m=m,
             reason="incremental update mutating active table",
         )
-    store.delete_paths([rec.rel_path for rec, _, _ in touched] + deleted_paths)
+    store.delete_paths(paths_to_delete)
     store.add(rows)
     _emit_progress(
         progress,
@@ -1589,7 +1594,7 @@ def derive_chunk_role(
         return "test"
     if suffix in _TEMPLATE_EXTS or lang in {"html", "css"}:
         return "template"
-    if kind in {"comment", "prose", "section", "file"} or lang in {"markdown", "text"}:
+    if kind in {"comment", "prose", "section", "file"} or lang in {"markdown", "rst", "text"}:
         return "comment"
     if any(token in kind for token in _EXECUTABLE_KINDS):
         return "executable"

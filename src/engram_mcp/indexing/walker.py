@@ -52,9 +52,12 @@ def looks_generated(text: str, language: str | None = None) -> bool:
     The long-line check is skipped for prose (markdown/plain text), where a long
     unwrapped paragraph is normal and would otherwise drop the whole file."""
     head = "\n".join(text.split("\n", 8)[:8]).lower()
-    if any(m in head for m in _GENERATED_MARKERS):
+    # Generated RST is still authoritative documentation (for example Godot's
+    # API reference). Keep it searchable while retaining the generated-code
+    # guard for programming languages and other prose formats.
+    if language != "rst" and any(m in head for m in _GENERATED_MARKERS):
         return True
-    if language in ("markdown", "text"):
+    if language in ("markdown", "rst", "text"):
         return False
     for line in text.split("\n", 500)[:500]:
         if len(line) > 5000:  # minified / bundled blob

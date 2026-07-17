@@ -1,4 +1,4 @@
-"""Chunking: tree-sitter AST-aware for grammar languages, line-window fallback.
+"""Chunking: structure-aware for code and prose, line-window fallback.
 
 Strategy (AST path):
   * Walk top-level nodes. Consecutive non-definition nodes (imports, ...) are
@@ -108,6 +108,13 @@ def chunk_file(rel_path: str, language: str | None, text: str) -> list[Chunk]:
                 return chunks
         except Exception as exc:
             logger.debug("markdown chunking failed for %s: %r", rel_path, exc)
+    elif language == "rst":
+        try:
+            chunks = _rst_chunks(rel_path, language, text)
+            if chunks:
+                return chunks
+        except Exception as exc:
+            logger.debug("reStructuredText chunking failed for %s: %r", rel_path, exc)
     elif language in GRAMMAR_LANGS:
         parser = get_parser(language)
         if parser is not None:
@@ -118,7 +125,7 @@ def chunk_file(rel_path: str, language: str | None, text: str) -> list[Chunk]:
             except Exception as exc:
                 logger.debug("AST chunking failed for %s (%s): %r", rel_path, language, exc)
     elif language == "text":
-        # Plain text / reStructuredText: pack by paragraph, not raw lines.
+        # Plain text: pack by paragraph, not raw lines.
         chunks = _prose_chunks(rel_path, language, text.splitlines(), 1, None, "prose")
         if chunks:
             return chunks
@@ -126,12 +133,16 @@ def chunk_file(rel_path: str, language: str | None, text: str) -> list[Chunk]:
     return _line_window_chunks(rel_path, language, lines, 1, None, "file")
 
 
-# --- Prose / Markdown chunking ------------------------------------------------
+# --- Prose / Markdown / reStructuredText chunking -----------------------------
 # ATX heading (`# ...` to `###### ...`), up to 3 leading spaces per CommonMark,
 # with an optional trailing `#` run. Setext (underline) headings are not handled.
 _ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 # Fenced code block open/close marker (``` or ~~~), possibly indented.
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+# A reStructuredText section adornment is a run of one punctuation character.
+# Requiring column zero avoids headings embedded in indented literal/code blocks.
+_RST_ADORNMENT = re.compile(r"([^\w\s])\1{2,}")
+_RST_PREFIX = re.compile(r"(?:\.\.\s+\S.*|:[A-Za-z][\w-]*:\s*.*)")
 
 
 def _paragraphs(lines: list[str], base_line: int) -> list[tuple[int, int, str]]:
@@ -273,6 +284,131 @@ def _markdown_chunks(rel_path: str, language: str, text: str) -> list[Chunk]:
             )
         else:
             chunks.extend(_prose_chunks(rel_path, language, seg, idx + 1, breadcrumb, "section"))
+
+    chunks.sort(key=lambda c: (c.start_line, c.end_line))
+    return chunks
+
+
+def _rst_adornment(line: str) -> str | None:
+    """Return an RST adornment character for a column-zero line, if any."""
+    if line[:1].isspace():
+        return None
+    match = _RST_ADORNMENT.fullmatch(line.rstrip())
+    return match.group(1) if match else None
+
+
+def _rst_title(line: str) -> str | None:
+    """Return a plausible column-zero RST section title."""
+    title = line.strip()
+    if not title or line[:1].isspace() or _rst_adornment(line) is not None:
+        return None
+    if title.startswith(".. ") or _RST_PREFIX.fullmatch(title):
+        return None
+    return title
+
+
+def _rst_section_start(lines: list[str], title_start: int) -> int:
+    """Attach adjacent Sphinx targets/directives and metadata to a section.
+
+    Godot pages conventionally put ``.. _target:`` or ``.. rst-class::``
+    immediately before a heading. Keeping that prefix with the section avoids
+    thousands of tiny preamble chunks and preserves useful source anchors.
+    """
+    j = title_start - 1
+    while j >= 0 and not lines[j].strip():
+        j -= 1
+    if j < 0 or _RST_PREFIX.fullmatch(lines[j].strip()) is None:
+        return title_start
+
+    start = j
+    j -= 1
+    while j >= 0:
+        stripped = lines[j].strip()
+        if not stripped or _RST_PREFIX.fullmatch(stripped):
+            if stripped:
+                start = j
+            j -= 1
+            continue
+        break
+    return start
+
+
+def _rst_chunks(rel_path: str, language: str, text: str) -> list[Chunk]:
+    """Split reStructuredText by section adornments.
+
+    RST assigns hierarchy by adornment style in first-seen order within a
+    document. Both underline-only and overline-plus-underline headings are
+    supported. The resulting breadcrumb is stored as the chunk symbol, matching
+    the Markdown behavior used by semantic search and contextual headers.
+    """
+    lines = text.splitlines()
+    raw: list[tuple[int, tuple[str, bool], str]] = []
+    i = 0
+    while i < len(lines):
+        adornment = _rst_adornment(lines[i])
+        if adornment is None:
+            i += 1
+            continue
+
+        if i + 2 < len(lines):
+            title = _rst_title(lines[i + 1])
+            closing = _rst_adornment(lines[i + 2])
+            if title is not None and closing == adornment:
+                raw.append((i, (adornment, True), title))
+                i += 3
+                continue
+
+        if i > 0:
+            title = _rst_title(lines[i - 1])
+            if title is not None:
+                raw.append((i - 1, (adornment, False), title))
+        i += 1
+
+    if not raw:
+        return _prose_chunks(rel_path, language, lines, 1, None, "prose")
+
+    style_levels: dict[tuple[str, bool], int] = {}
+    headings: list[tuple[int, int, str]] = []
+    for title_start, style, title in raw:
+        if style not in style_levels:
+            style_levels[style] = len(style_levels) + 1
+        headings.append(
+            (_rst_section_start(lines, title_start), style_levels[style], title)
+        )
+
+    chunks: list[Chunk] = []
+    first = headings[0][0]
+    if first > 0 and "\n".join(lines[:first]).strip():
+        chunks.extend(_prose_chunks(rel_path, language, lines[:first], 1, None, "prose"))
+
+    stack: list[tuple[int, str]] = []
+    for hi, (idx, level, title) in enumerate(headings):
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, title))
+        breadcrumb = " > ".join(part for _, part in stack)
+        end = headings[hi + 1][0] if hi + 1 < len(headings) else len(lines)
+        segment = lines[idx:end]
+        segment_text = "\n".join(segment)
+        if not segment_text.strip():
+            continue
+        if _est_tokens(segment_text) <= config.PROSE_CHUNK_MAX_TOKENS:
+            chunks.append(
+                Chunk(
+                    rel_path,
+                    language,
+                    breadcrumb,
+                    "section",
+                    idx + 1,
+                    idx + len(segment),
+                    segment_text,
+                    _est_tokens(segment_text),
+                )
+            )
+        else:
+            chunks.extend(
+                _prose_chunks(rel_path, language, segment, idx + 1, breadcrumb, "section")
+            )
 
     chunks.sort(key=lambda c: (c.start_line, c.end_line))
     return chunks

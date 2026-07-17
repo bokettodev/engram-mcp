@@ -55,7 +55,7 @@ BINARY_EXTS = frozenset(
     }
 )
 
-MAX_FILE_BYTES = 1_000_000  # skip files larger than ~1 MB by default
+MAX_FILE_BYTES = 2_000_000  # includes large API reference pages; still rejects data blobs
 CHARS_PER_TOKEN = 4  # rough token estimate for chunk sizing only
 CHUNK_MAX_TOKENS = 480  # hard cap per chunk (small enough for any embedder's context)
 CHUNK_OVERLAP_TOKENS = 60  # overlap for the line-window fallback
@@ -77,7 +77,9 @@ PROSE_CHUNK_MAX_TOKENS = 480
 # chunk instead of being folded into the generic "module" bundle chunk --
 # changes chunk boundaries for files with such definitions, so old chunks
 # must not be served against v5-produced ones.
-CHUNKER_VERSION = "5"
+# v6: reStructuredText split by adornment-based heading sections with hierarchy;
+# the source-file cap also rises to 2 MB for large generated API reference pages.
+CHUNKER_VERSION = "6"
 
 # Bumped whenever the chunk_id derivation algorithm changes, so a strict
 # manifest load rejects an index built with a different scheme instead of

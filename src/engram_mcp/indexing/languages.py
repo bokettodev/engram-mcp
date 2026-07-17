@@ -20,7 +20,8 @@ EXT_TO_LANG: dict[str, str] = {
     ".rs": "rust",
     # indexed via line-window fallback (no bundled grammar yet):
     ".md": "markdown", ".markdown": "markdown", ".mdx": "markdown",
-    ".txt": "text", ".rst": "text",
+    ".rst": "rst",
+    ".txt": "text",
     ".json": "json", ".jsonc": "json",
     ".yaml": "yaml", ".yml": "yaml", ".toml": "toml", ".ini": "ini",
     ".html": "html", ".htm": "html", ".css": "css", ".scss": "css", ".less": "css",

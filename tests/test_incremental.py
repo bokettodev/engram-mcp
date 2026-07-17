@@ -13,6 +13,7 @@ def test_incremental_change_add_delete(tmp_path, monkeypatch, provider):
     (proj / "b.py").write_text("def subtract(a, b):\n    return a - b\n", encoding="utf-8")
 
     from engram_mcp.pipeline import index_project, search_project
+    from engram_mcp.store.lancedb_store import LanceStore
 
     index_project(proj, provider)
 
@@ -20,11 +21,21 @@ def test_incremental_change_add_delete(tmp_path, monkeypatch, provider):
     (proj / "c.py").write_text("def multiply(a, b):\n    return a * b\n", encoding="utf-8")
     (proj / "b.py").unlink()
 
+    deleted_batches: list[list[str]] = []
+    original_delete_paths = LanceStore.delete_paths
+
+    def record_delete_paths(self, rel_paths):
+        deleted_batches.append(list(rel_paths))
+        return original_delete_paths(self, rel_paths)
+
+    monkeypatch.setattr(LanceStore, "delete_paths", record_delete_paths)
     stats = index_project(proj, provider)
     assert stats.mode == "incremental"
     assert stats.changed == 1
     assert stats.added == 1
     assert stats.deleted == 1
+    assert deleted_batches == [["a.py", "b.py"]]
+    assert "c.py" not in deleted_batches[0]
 
     # deleted file's chunks are gone
     hits = search_project(proj, provider, "subtract two numbers", k=5)

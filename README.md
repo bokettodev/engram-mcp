@@ -499,7 +499,7 @@ returned as the `hint` on `E_MODEL_LOAD_FAILED`.
 
 ```
 walk (gitignore-aware, skips binary/generated)
-  → chunk by symbol (tree-sitter) · markdown heading section · prose paragraph (+ line-window fallback)
+  → chunk by symbol (tree-sitter) · Markdown/RST heading section · prose paragraph (+ line-window fallback)
   → embed each chunk locally, with a "path / symbol / language" header
   → store vectors + metadata in LanceDB (+ a full-text index for hybrid search)
 
@@ -686,7 +686,7 @@ plus LanceDB retrieval.
 | Runtime | Python 3.12 via [`uv`](https://docs.astral.sh/uv/) |
 | Embedder | Granite R2 97m via [FastEmbed](https://github.com/qdrant/fastembed) for CPU search/index; optional [sentence-transformers](https://www.sbert.net/) CUDA for index-only acceleration |
 | Vector store | [LanceDB](https://lancedb.com/) (embedded, on-disk, vector + full-text) |
-| Chunker | tree-sitter — 11 languages (py/js/ts/tsx/go/rust/java/c/cpp/ruby/c#) · markdown by heading section · plain text by paragraph · line-window fallback |
+| Chunker | tree-sitter — 11 languages (py/js/ts/tsx/go/rust/java/c/cpp/ruby/c#) · Markdown and reStructuredText by heading section · generated RST API references retained · plain text by paragraph · line-window fallback |
 | Server | MCP Python SDK (FastMCP, stdio) |
 
 ## Development

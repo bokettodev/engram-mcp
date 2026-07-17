@@ -174,7 +174,7 @@ def derive_file_kinds(rel_path: str, language: str | None = None) -> list[dict]:
         add("migration", "migration path segment")
     if name in _CONFIG_NAMES or suffix in _CONFIG_EXTS or ".config." in name or suffixes.endswith(".config.js"):
         add("config", "config filename or extension")
-    if suffix in _DOC_EXTS or (language or "").lower() in {"markdown", "text"}:
+    if suffix in _DOC_EXTS or (language or "").lower() in {"markdown", "rst", "text"}:
         add("doc", "documentation extension or language")
     return kinds
 
